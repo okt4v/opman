@@ -1,0 +1,728 @@
+#include "edit.hpp"
+#include "math.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <sstream>
+
+namespace om {
+
+// ---------- catalog ----------
+const std::map<std::string, unsigned> CATS = {
+    {"Structure", 0x7c5cff}, {"Calculus", 0xe0539a}, {"Operator", 0x3b82f6}, {"Relation", 0x0d9488}, {"Set", 0x16a34a},
+    {"Logic", 0xd97706}, {"Arrow", 0x64748b}, {"Greek", 0x9333ea}, {"Function", 0x2563eb}, {"Variable", 0x059669},
+    {"Constant", 0xc2410c}, {"Result", 0x16a34a}, {"Steps", 0x0891b2}, {"Decimal", 0x65a30d}, {"Algebra", 0xdb2777},
+    {"Solve", 0xea580c}, {"Units", 0x0d9488}};
+
+// name|keywords|symbol|latex|category  (single-character keywords like E, A are Corca-style ASCII shortcuts)
+static const char* SYMS = R"(Plus|plus add|+|+|Operator
+Minus|minus subtract|−|-|Operator
+Times|times multiply cross|×|\times|Operator
+Dot|dot multiply cdot|⋅|\cdot|Operator
+Division|divide division obelus|÷|\div|Operator
+Plus-minus|plusminus pm +-|±|\pm|Operator
+Minus-plus|minusplus mp -+|∓|\mp|Operator
+Equals|equals equal|=|=|Relation
+Not equal|notequal neq ne !=|≠|\neq|Relation
+Approximately|approx approximately ~=|≈|\approx|Relation
+Equivalent|equiv equivalent identical congruent ===|≡|\equiv|Relation
+Defined as|define definition coloneq :=|≔|\coloneqq|Relation
+Proportional to|proportional propto oc|∝|\propto|Relation
+Less than|less lt|<|<|Relation
+Greater than|greater gt|>|>|Relation
+Less or equal|leq le lessequal <=|≤|\leq|Relation
+Greater or equal|geq ge greaterequal >=|≥|\geq|Relation
+Much less|muchless ll <<|≪|\ll|Relation
+Much greater|muchgreater gg >>|≫|\gg|Relation
+Infinity|infinity infty oo|∞|\infty|Calculus
+Partial|partial derivative d|∂|\partial|Calculus
+Nabla|nabla gradient del|∇|\nabla|Calculus
+Element of|in element member E|∈|\in|Set
+Not element of|notin notelement E/|∉|\notin|Set
+Subset|subset|⊂|\subset|Set
+Subset or equal|subseteq subset|⊆|\subseteq|Set
+Superset|superset supset|⊃|\supset|Set
+Union|union cup U|∪|\cup|Set
+Intersection|intersection cap|∩|\cap|Set
+Set minus|setminus difference|∖|\setminus|Set
+Empty set|emptyset empty O/|∅|\emptyset|Set
+Real numbers|reals real R|ℝ|\mathbb{R}|Set
+Natural numbers|naturals natural N|ℕ|\mathbb{N}|Set
+Integers|integers integer Z|ℤ|\mathbb{Z}|Set
+Rationals|rationals rational Q|ℚ|\mathbb{Q}|Set
+Complex numbers|complex C|ℂ|\mathbb{C}|Set
+Aleph|aleph cardinal|ℵ|\aleph|Set
+For all|forall all A|∀|\forall|Logic
+Exists|exists E|∃|\exists|Logic
+Not|not neg|¬|\neg|Logic
+And|and wedge|∧|\land|Logic
+Or|or vee|∨|\lor|Logic
+Implies|implies then =>|⇒|\Rightarrow|Logic
+If and only if|iff equivalent <=>|⇔|\Leftrightarrow|Logic
+Therefore|therefore|∴|\therefore|Logic
+Because|because since|∵|\because|Logic
+Right arrow|to arrow right tends ->|→|\to|Arrow
+Left arrow|leftarrow gets arrow <-|←|\leftarrow|Arrow
+Left right arrow|leftrightarrow arrow <->|↔|\leftrightarrow|Arrow
+Maps to|mapsto maps|↦|\mapsto|Arrow
+Dots|dots ldots ellipsis ...|…|\ldots|Operator
+Centered dots|cdots dots|⋯|\cdots|Operator
+Perpendicular|perp perpendicular orthogonal|⊥|\perp|Relation
+Parallel|parallel|∥|\parallel|Relation
+Angle|angle|∠|\angle|Operator
+Degree|degree|°|^\circ|Operator
+Direct sum|oplus directsum|⊕|\oplus|Operator
+Tensor product|otimes tensor|⊗|\otimes|Operator
+Composition|compose composition circ ring|∘|\circ|Operator
+Dagger|dagger adjoint|†|^\dagger|Operator
+Prime|prime|′|'|Operator
+Reduced Planck|hbar planck|ℏ|\hbar|Constant)";
+
+static const char* FNS = "sin sine,cos cosine,tan tangent,cot cotangent,sec secant,csc cosecant,arcsin,arccos,arctan,sinh,cosh,tanh,"
+                         "log logarithm,ln natural logarithm,exp exponential,det determinant,dim dimension,ker kernel,max maximum,"
+                         "min minimum,sup supremum,inf infimum,gcd,arg argument";
+
+static std::vector<std::string> split(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    for (std::string x; std::getline(ss, x, sep);) out.push_back(x);
+    return out;
+}
+
+static std::vector<Entry> buildCatalog() {
+    std::vector<Entry> c;
+    auto add = [&](std::string name, std::string kw, Item make, std::string cat) {
+        c.push_back({std::move(name), split(kw, ' '), std::move(make), std::move(cat), std::nullopt});
+    };
+    auto two = [] { return std::vector<std::vector<Row>>{{{}, {}}, {{}, {}}}; };
+    add("Fraction", "fraction frac division over", node(T::Frac), "Structure");
+    add("Power", "power exponent superscript squared", node(T::Sup), "Structure");
+    add("Subscript", "subscript index", node(T::Sub), "Structure");
+    add("Square root", "sqrt root square", node(T::Sqrt), "Structure");
+    add("Parentheses", "parentheses paren brackets", paren("(", ")"), "Structure");
+    add("Square brackets", "brackets square", paren("[", "]"), "Structure");
+    add("Braces", "braces set curly", paren("{", "}"), "Structure");
+    add("Absolute value", "abs absolute modulus", paren("|", "|"), "Structure");
+    add("Norm", "norm", paren("‖", "‖"), "Structure");
+    add("Floor", "floor", paren("⌊", "⌋"), "Structure");
+    add("Ceiling", "ceiling ceil", paren("⌈", "⌉"), "Structure");
+    add("Summation", "sum summation sigma series S", big("∑", "\\sum", true), "Calculus");
+    add("Product", "product prod Pr", big("∏", "\\prod", true), "Calculus");
+    add("Integral", "integral int", big("∫", "\\int", false), "Calculus");
+    add("Double integral", "iint double integral", big("∬", "\\iint", false), "Calculus");
+    add("Triple integral", "iiint triple integral", big("∭", "\\iiint", false), "Calculus");
+    add("Contour integral", "oint contour integral", big("∮", "\\oint", false), "Calculus");
+    add("Big union", "bigcup union", big("⋃", "\\bigcup", true), "Set");
+    add("Big intersection", "bigcap intersection", big("⋂", "\\bigcap", true), "Set");
+    add("Limit", "limit lim", node(T::Lim), "Calculus");
+    add("Matrix", "matrix pmatrix", mat("(", ")", two()), "Structure");
+    add("Determinant", "determinant vmatrix", mat("|", "|", two()), "Structure");
+    for (auto& line : split(SYMS, '\n')) {
+        auto f = split(line, '|');
+        add(f[0], f[1], sym(f[2], f[3]), f[4]);
+    }
+    for (auto& f : split(FNS, ',')) {
+        auto v = split(f, ' ')[0];
+        add(v, f, named(T::Fn, v), "Function");
+    }
+    for (auto& [n, g] : GREEK) add(g + " " + n, n, named(T::Var, g), "Greek");
+    return c;
+}
+const std::vector<Entry> CATALOG = buildCatalog();
+
+static const Entry& entryNamed(const std::string& name) {
+    return *std::find_if(CATALOG.begin(), CATALOG.end(), [&](const Entry& e) { return e.name == name; });
+}
+
+static const std::map<std::string, std::string> SYM_TEX = [] {
+    std::map<std::string, std::string> m;
+    for (auto& e : CATALOG)
+        if (e.make.t == T::Sym) m[e.make.c] = e.make.l;
+    return m;
+}();
+
+// math words that convert on their own once you type past them (in math only): functions, greek names, sqrt, infty
+static const std::map<std::string, const Entry*> AUTO = [] {
+    std::map<std::string, const Entry*> m;
+    for (auto& e : CATALOG)
+        if (e.cat == "Function" || (e.cat == "Greek" && (e.kw[0].size() > 2 || e.kw[0] == "pi"))) m[e.kw[0]] = &e;
+    m["sqrt"] = &CATALOG[3];
+    m["infty"] = &entryNamed("Infinity");
+    return m;
+}();
+static const Entry* autoEntry(const std::string& w) {
+    auto f = AUTO.find(w);
+    return f == AUTO.end() ? nullptr : f->second;
+}
+
+// typed ASCII sequences that turn into one symbol in math
+static const std::map<std::string, std::string> COMBOS = {
+    {"->", "→"}, {"<-", "←"}, {"←>", "↔"}, {"<=", "≤"}, {">=", "≥"}, {"≤>", "⇔"}, {"=>", "⇒"}, {"!=", "≠"},
+    {"~=", "≈"}, {"+-", "±"}, {"-+", "∓"}, {"===", "≡"}, {"...", "…"}, {"<<", "≪"}, {">>", "≫"}, {":=", "≔"}};
+
+static std::string lower(std::string s) {
+    for (auto& c : s) c = char(std::tolower((unsigned char)c));
+    return s;
+}
+static bool isSubseq(const std::string& q, const std::string& s) {
+    size_t j = 0;
+    for (char c : s)
+        if (j < q.size() && c == q[j]) j++;
+    return j == q.size();
+}
+
+// ponytail: linear scan with prefix scoring; fine for a few hundred entries
+std::vector<Entry> Editor::search(const std::string& q) const {
+    std::string ql = lower(q);
+    std::vector<std::pair<int, const Entry*>> scored;
+    for (auto& e : CATALOG) {
+        int best = 0;
+        for (auto& k : e.kw) {
+            std::string kl = lower(k);
+            int s = k == q ? 100 : kl == ql ? 90 : kl.starts_with(ql) ? 60 - int(kl.size() - ql.size())
+                  : ql.size() > 1 && kl.find(ql) != std::string::npos ? 20 : ql.size() > 2 && isSubseq(ql, kl) ? 8 : 0;
+            best = std::max(best, s);
+        }
+        auto u = usage.find(e.name);
+        if (best) scored.push_back({best + std::min(u == usage.end() ? 0 : u->second, 10) * 2, &e});
+    }
+    std::stable_sort(scored.begin(), scored.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::vector<Entry> hits;
+    for (size_t k = 0; k < scored.size() && k < 7; k++) hits.push_back(*scored[k].second);
+    std::vector<Entry> vars = {{"Variable " + q, {}, named(T::Var, q), "Variable", std::nullopt},
+                               {"Constant " + q, {}, named(T::Const, q), "Constant", std::nullopt}};
+    if (q.size() == 1) { vars.insert(vars.end(), hits.begin(), hits.end()); return vars; }
+    hits.insert(hits.end(), vars.begin(), vars.end());
+    return hits;
+}
+
+// ---------- model ----------
+void Editor::reindex() {
+    parents.clear();
+    auto walk = [&](auto& self, Row& row) -> void {
+        for (auto& n : row)
+            for (int s = 0; s < int(n.s.size()); s++) {
+                parents[&n.s[s]] = {&n, &row, s};
+                self(self, n.s[s]);
+            }
+    };
+    for (auto& r : doc) walk(walk, r);
+}
+
+static int idxIn(const Row* row, const Item* n) { return int(n - row->data()); }
+
+Row* Editor::topOf(Row* row) const {
+    for (auto f = parents.find(row); f != parents.end(); f = parents.find(row)) row = f->second.row;
+    return row;
+}
+int Editor::lineOf(const Row* row) const {
+    return row >= doc.data() && row < doc.data() + doc.size() ? int(row - doc.data()) : -1;
+}
+
+Path Editor::curPath() const {
+    Path p;
+    const Row* r = cur.row;
+    for (auto f = parents.find(r); f != parents.end(); f = parents.find(r)) {
+        p.p.insert(p.p.begin(), {idxIn(f->second.row, f->second.node), f->second.slot});
+        r = f->second.row;
+    }
+    p.k = lineOf(r);
+    p.i = cur.i;
+    return p;
+}
+
+void Editor::setPath(const Path& p) {
+    cur = {&doc[0], 0};
+    if (p.k < 0 || p.k >= int(doc.size())) return;
+    Row* r = &doc[p.k];
+    for (auto [j, s] : p.p) {
+        if (j < 0 || j >= int(r->size()) || s < 0 || s >= int((*r)[j].s.size())) return;
+        r = &(*r)[j].s[s];
+    }
+    cur = {r, std::clamp(p.i, 0, int(r->size()))};
+}
+
+void Editor::load(Doc d, const Path& p) {
+    doc = d.empty() ? Doc{Row{}} : std::move(d);
+    range.reset();
+    reindex();
+    setPath(p);
+}
+
+static double nowMs() {
+    using namespace std::chrono;
+    return double(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+// kind "char": consecutive letters/digits typed within a second share one undo step (undo works per word)
+void Editor::snap(const std::string& kind) {
+    double now = nowMs();
+    bool merge = kind == "char" && lastSnapKind == "char" && now - lastSnapAt < 1000;
+    lastSnapKind = kind;
+    lastSnapAt = now;
+    redoStack.clear();
+    if (merge) return;
+    undoStack.push_back({doc, curPath()});
+    if (undoStack.size() > 500) undoStack.erase(undoStack.begin());
+}
+
+void Editor::undo() {
+    if (undoStack.empty()) return;
+    Snap s = std::move(undoStack.back());
+    undoStack.pop_back();
+    redoStack.push_back({doc, curPath()});
+    load(std::move(s.doc), s.path);
+    lastSnapKind = "";
+    lastSnapAt = -1e9;
+}
+
+void Editor::redo() {
+    if (redoStack.empty()) return;
+    Snap s = std::move(redoStack.back());
+    redoStack.pop_back();
+    undoStack.push_back({doc, curPath()});
+    load(std::move(s.doc), s.path);
+    lastSnapKind = "";
+    lastSnapAt = -1e9;
+}
+
+// ---------- completion ----------
+std::string Editor::pendingWord() const {
+    const Row& row = *cur.row;
+    int j = cur.i;
+    while (j > 0 && row[j - 1].t == T::Ch && isLetter(row[j - 1].c)) j--;
+    std::string w;
+    for (int k = j; k < cur.i; k++) w += row[k].c;
+    return w;
+}
+
+std::string Editor::popupKey() const { return nlohmann::json::array({pathJson(curPath()), pendingWord()}).dump(); }
+
+std::vector<Entry> Editor::suggestions() {
+    if (popupKey() == dismissed) return {};
+    std::string w = pendingWord();
+    if (w.empty()) return evalSuggestions(*this);
+    auto hits = search(w);
+    // a plain text word with nothing to offer but "Variable notes" gets no popup, so Enter still makes a new line
+    bool textWord = w.size() > 1 && !(*cur.row)[cur.i - 1].m;
+    bool onlyVars = std::all_of(hits.begin(), hits.end(), [](auto& e) { return e.cat == "Variable" || e.cat == "Constant"; });
+    return textWord && onlyVars ? std::vector<Entry>{} : hits;
+}
+
+void Editor::insertNode(Item n) {
+    Row* row = cur.row;
+    int i = cur.i;
+    row->insert(row->begin() + i, std::move(n));
+    reindex();
+    Item& placed = (*row)[i];
+    cur = placed.s.empty() ? Cur{row, i + 1} : Cur{&placed.s[0], 0};
+}
+
+void Editor::applySuggestion(const Entry& e) {
+    int n = int(pendingWord().size());  // the word is ASCII letters: bytes = items
+    cur.row->erase(cur.row->begin() + (cur.i - n), cur.row->begin() + cur.i);
+    cur.i -= n;
+    usage[e.name]++;
+    if (!e.insert) return insertNode(e.make);
+    cur.row->insert(cur.row->begin() + cur.i, e.insert->begin(), e.insert->end());
+    cur.i += int(e.insert->size());
+    reindex();
+}
+
+// a math word you typed past (e.g. "sin" then "(") becomes its node; returns the created node if it has slots
+Item* Editor::autoConvert() {
+    std::string w = pendingWord();
+    const Entry* e = autoEntry(w);
+    if (!e || !(*cur.row)[cur.i - 1].m) return nullptr;
+    applySuggestion(*e);
+    if (e->make.s.empty()) return nullptr;
+    return parents.at(cur.row).node;
+}
+
+static const std::map<std::string, std::string> FROM_SUP = {{"⁰", "0"}, {"¹", "1"}, {"²", "2"}, {"³", "3"}, {"⁴", "4"},
+                                                            {"⁵", "5"}, {"⁶", "6"}, {"⁷", "7"}, {"⁸", "8"}, {"⁹", "9"},
+                                                            {"⁻", "-"}, {"ⁿ", "n"}};
+
+static bool in(const char* set, const std::string& c) { return !c.empty() && std::string(set).find(c) != std::string::npos; }
+static bool alnum(const std::string& c) { return isLetter(c) || isDigit(c); }
+// corca reads `.c` off any item: the char of a ch, the closing delimiter of a paren/matrix
+static std::string jsC(const Item& it) { return it.t == T::Ch ? it.c : (it.t == T::Paren || it.t == T::Mat) ? it.cl : ""; }
+
+void Editor::insertChar(std::string c) {
+    if (c == "(" && !inSlot()) {
+        const Entry* e = autoEntry(pendingWord());
+        if (e && e->cat == "Function")  // "det(" or "sin(" typed as text turns into the function
+            for (int k = cur.i - int(pendingWord().size()); k < cur.i; k++) (*cur.row)[k].m = true;
+    }
+    if (!isLetter(c)) {
+        Item* n = autoConvert();
+        if (n && c == "(") return;  // sqrt( : already inside the root
+    }
+    // typed superscripts (², ³ from compose or AltGr) are exponents
+    if (auto f = FROM_SUP.find(c); f != FROM_SUP.end()) {
+        auto q = parents.find(cur.row);
+        if (q == parents.end() || q->second.node->t != T::Sup) {
+            insertChar("^");
+            insertChar(f->second);
+            exitSlot();
+            return;
+        }
+        c = f->second;
+    }
+    // a few characters leave a filled slot at its end, where they can't belong inside it (repeats outwards)
+    for (;;) {
+        auto q = parents.find(cur.row);
+        if (q == parents.end()) break;
+        const Parent& p = q->second;
+        bool limDone = false;
+        if (p.node->t == T::Lim) {
+            const Row& a = p.node->s[0];
+            for (size_t k = 0; k + 1 < a.size(); k++)
+                if (a[k].t == T::Sym && a[k].c == "→") limDone = true;
+        }
+        const char* leaves = p.node->t == T::Sup || p.node->t == T::Sub ? "+-*/=<>, "
+                           : (p.node->t == T::Frac && p.slot == 1) || p.node->t == T::Sqrt ? "=<>,"
+                           : (p.node->t == T::Big && p.slot == 1) || limDone ? " " : "";
+        if (!(*leaves && !cur.row->empty() && cur.i == int(cur.row->size()) && in(leaves, c))) break;
+        exitSlot();
+    }
+    Row& row = *cur.row;
+    int i = cur.i;
+    bool top = !inSlot() && !mathMode;
+    if (top && in("+-*/=^_(<>", c)) {
+        // a one-letter word followed by an operator is math: "f(2) =", "n = 5", "x^2"
+        int j = i - 1;
+        while (j >= 0 && isSpace(row[j])) j--;
+        if (j >= 0 && row[j].t == T::Ch && !row[j].m && isLetter(row[j].c) && (j == 0 || isSpace(row[j - 1]))) row[j].m = true;
+    }
+    const Item* prev = i > 0 ? &row[i - 1] : nullptr;
+    const Item* prevNS = prevNonSpace(row, i);
+    bool mathCtx = !top || (prevNS && isMath(*prevNS));
+    auto pf = parents.find(&row);
+    const Parent* p = pf == parents.end() ? nullptr : &pf->second;
+    if (c == "^" && p && p->node->t == T::Big && p->slot == 0) { cur = {&p->node->s[1], 0}; return; }
+    if (mathCtx && (c == "^" || c == "_")) return insertNode(node(c == "^" ? T::Sup : T::Sub));
+    if (mathCtx && c == "(") return insertNode(paren("(", ")"));
+    if (c == ")" && p && (p->node->o == "(" || p->node->t == T::Sqrt) && i == int(row.size())) return exitSlot();
+    if (c == "|" && p && p->node->o == "|" && i == int(row.size())) return exitSlot();
+    if (mathCtx && c == "'") return insertNode(sym("′", "'"));
+    if (mathCtx && c == "|" && !(prev && prev->t == T::Ch && prev->c == "|")) return insertNode(paren("|", "|"));
+    if (mathCtx && c == "/") {
+        // numerator = the run of math items right before the cursor, stopping at operators and spaces
+        int j = i;
+        while (j > 0 && isMath(row[j - 1]) && !isSpace(row[j - 1]) && !isOp(&row[j - 1]) && row[j - 1].t != T::Big && row[j - 1].t != T::Lim) j--;
+        Item n = node(T::Frac);
+        n.s[0].assign(std::make_move_iterator(row.begin() + j), std::make_move_iterator(row.begin() + i));
+        row.erase(row.begin() + j, row.begin() + i);
+        bool filled = !n.s[0].empty();
+        cur.i = j;
+        insertNode(std::move(n));
+        if (filled) cur = {&row[j].s[1], 0};
+        return;
+    }
+    // at the top level a char joins the math when it continues an expression, otherwise it is text
+    bool glued = prev && !isSpace(*prev) && isMath(*prev);
+    bool m;
+    if (!top) m = true;
+    else if (isLetter(c)) {
+        bool unitStart = prev && isSpace(*prev) && prevNS && prevNS->t == T::Ch && prevNS->m && isDigit(prevNS->c) && unitStartsWith(c);
+        m = (glued && !isOp(prev) && (prev->t != T::Ch || alnum(prev->c))) || isOp(prevNS) ||
+            (prevNS && (prevNS->t == T::Big || prevNS->t == T::Lim || prevNS->t == T::Fn)) || (c == "d" && openIntegral(row, i)) || unitStart;
+    } else if (isDigit(c)) m = !prev || isSpace(*prev) || isMath(*prev);
+    else if (c == " ") m = false;
+    else m = mathCtx;
+    // everything after "plot " at the start of a line is math
+    bool plotLine = false;
+    if (top && i >= 5) {
+        std::string s;
+        for (int k = 0; k < 5; k++) s += jsC(row[k]);
+        plotLine = lower(s) == "plot ";
+    }
+    row.insert(row.begin() + i, ch(c, m || (plotLine && c != " ")));
+    cur.i++;
+    if (row[i].m) combine();
+}
+
+// is there an integral to the left in this math run still waiting for its "dx"?
+bool Editor::openIntegral(const Row& row, int i) const {
+    for (int j = i - 1; j >= 0 && (isMath(row[j]) || isSpace(row[j])); j--) {
+        if (row[j].t == T::Ch && row[j].c == "d") return false;
+        if (row[j].t == T::Big && row[j].c == "∫") return true;
+    }
+    return false;
+}
+
+void Editor::combine() {
+    Row& row = *cur.row;
+    int i = cur.i;
+    for (int n : {3, 2}) {
+        if (i < n) continue;
+        std::string key;
+        bool ok = true;
+        for (int k = i - n; k < i; k++) {
+            if (!((row[k].t == T::Ch && row[k].m) || row[k].t == T::Sym)) ok = false;
+            key += row[k].c;
+        }
+        auto f = COMBOS.find(key);
+        if (!ok || f == COMBOS.end()) continue;
+        auto t = SYM_TEX.find(f->second);
+        row.erase(row.begin() + (i - n), row.begin() + i);
+        row.insert(row.begin() + (i - n), sym(f->second, t == SYM_TEX.end() ? "" : t->second));
+        cur.i -= n - 1;
+        return;
+    }
+}
+
+// leave the current slot: go to the next slot of the node, or after the node
+void Editor::exitSlot() {
+    auto f = parents.find(cur.row);
+    if (f == parents.end()) return;
+    Parent p = f->second;
+    cur = p.slot < int(p.node->s.size()) - 1 ? Cur{&p.node->s[p.slot + 1], 0} : Cur{p.row, idxIn(p.row, p.node) + 1};
+}
+
+void Editor::right() {
+    Row* row = cur.row;
+    int i = cur.i;
+    if (i < int(row->size())) {
+        auto& s = (*row)[i].s;
+        cur = s.empty() ? Cur{row, i + 1} : Cur{&s[0], 0};
+    } else if (inSlot()) exitSlot();
+    else if (int k = lineOf(row); k < int(doc.size()) - 1) cur = {&doc[k + 1], 0};
+}
+
+void Editor::left() {
+    Row* row = cur.row;
+    int i = cur.i;
+    if (i > 0) {
+        auto& s = (*row)[i - 1].s;
+        cur = s.empty() ? Cur{row, i - 1} : Cur{&s.back(), int(s.back().size())};
+        return;
+    }
+    if (auto f = parents.find(row); f != parents.end()) {
+        Parent p = f->second;
+        cur = p.slot > 0 ? Cur{&p.node->s[p.slot - 1], int(p.node->s[p.slot - 1].size())} : Cur{p.row, idxIn(p.row, p.node)};
+        return;
+    }
+    if (int k = lineOf(row); k > 0) cur = {&doc[k - 1], int(doc[k - 1].size())};
+}
+
+// ↑/↓ move between stacked slots (numerator/denominator, upper/lower limit, matrix rows, exponent/base),
+// otherwise between lines
+void Editor::vertical(int d) {
+    for (Row* r = cur.row; parents.count(r); r = parents.at(r).row) {
+        Parent p = parents.at(r);
+        auto& s = p.node->s;
+        Row* target = nullptr;
+        if (p.node->t == T::Frac) target = d < 0 ? (p.slot == 1 ? &s[0] : nullptr) : (p.slot == 0 ? &s[1] : nullptr);
+        else if (p.node->t == T::Big) target = d < 0 ? (p.slot == 0 ? &s[1] : nullptr) : (p.slot == 1 ? &s[0] : nullptr);
+        else if (p.node->t == T::Mat) {
+            int t = p.slot + d * p.node->cols;
+            target = t >= 0 && t < int(s.size()) ? &s[t] : nullptr;
+        } else if (p.node->t == T::Sup && d > 0) { cur = {p.row, idxIn(p.row, p.node)}; return; }
+        if (target) {
+            int len = int(target->size());
+            cur = {target, std::min(cur.row == r ? cur.i : len, len)};
+            return;
+        }
+    }
+    if (d < 0 && cur.i < int(cur.row->size()) && (*cur.row)[cur.i].t == T::Sup) {
+        Row* a = &(*cur.row)[cur.i].s[0];
+        cur = {a, int(a->size())};
+        return;
+    }
+    Row* top = topOf(cur.row);
+    int k = lineOf(top) + d;
+    if (k >= 0 && k < int(doc.size())) cur = {&doc[k], std::min(top == cur.row ? cur.i : 0, int(doc[k].size()))};
+}
+
+void Editor::backspace() {
+    Row* row = cur.row;
+    int i = cur.i;
+    if (i > 0) {
+        auto& s = (*row)[i - 1].s;
+        if (std::any_of(s.begin(), s.end(), [](const Row& r) { return !r.empty(); })) cur = {&s.back(), int(s.back().size())};
+        else { row->erase(row->begin() + i - 1); cur.i--; reindex(); }
+        return;
+    }
+    if (auto f = parents.find(row); f != parents.end()) {
+        Parent p = f->second;
+        if (p.node->t == T::Mat) return matrixBackspace(p);
+        // backspace at the start of a slot unwraps the node, keeping its contents
+        int idx = idxIn(p.row, p.node), before = 0;
+        for (int k = 0; k < p.slot; k++) before += int(p.node->s[k].size());
+        Row flat;
+        for (auto& r : p.node->s)
+            for (auto& x : r) flat.push_back(std::move(x));
+        p.row->erase(p.row->begin() + idx);
+        p.row->insert(p.row->begin() + idx, std::make_move_iterator(flat.begin()), std::make_move_iterator(flat.end()));
+        cur = {p.row, idx + before};
+        reindex();
+        return;
+    }
+    if (int k = lineOf(row); k > 0) {
+        Row* prev = &doc[k - 1];
+        int len = int(prev->size());
+        prev->insert(prev->end(), std::make_move_iterator(row->begin()), std::make_move_iterator(row->end()));
+        doc.erase(doc.begin() + k);
+        cur = {prev, len};
+        reindex();
+    }
+}
+
+void Editor::enter() {
+    if (inSlot()) return exitSlot();
+    int k = lineOf(cur.row);
+    Row rest(std::make_move_iterator(cur.row->begin() + cur.i), std::make_move_iterator(cur.row->end()));
+    cur.row->erase(cur.row->begin() + cur.i, cur.row->end());
+    doc.insert(doc.begin() + k + 1, std::move(rest));
+    cur = {&doc[k + 1], 0};
+    reindex();
+}
+
+void Editor::home(bool end) { cur.i = end ? int(cur.row->size()) : 0; }
+
+// ---------- matrices: Shift+Enter adds a row, Shift+Space a column; inside (…) they turn it into a matrix ----------
+std::optional<std::tuple<Item*, int, int>> Editor::matrixCell() {
+    auto f = parents.find(cur.row);
+    if (f == parents.end()) return std::nullopt;
+    Parent p = f->second;
+    if (p.node->t == T::Mat) return std::tuple{p.node, p.slot / p.node->cols, p.slot % p.node->cols};
+    if (p.node->t != T::Paren) return std::nullopt;
+    Item m = mat(p.node->o, p.node->cl, {{std::move(p.node->s[0])}});
+    *p.node = std::move(m);
+    reindex();
+    return std::tuple{p.node, 0, 0};
+}
+
+bool Editor::addMatrixRow() {
+    auto m = matrixCell();
+    if (!m) return false;
+    auto [n, r, c] = *m;
+    n->s.insert(n->s.begin() + (r + 1) * n->cols, n->cols, Row{});
+    reindex();
+    cur = {&n->s[(r + 1) * n->cols], 0};
+    return true;
+}
+
+bool Editor::addMatrixCol() {
+    auto m = matrixCell();
+    if (!m) return false;
+    auto [n, r, c] = *m;
+    for (int k = matRows(*n) - 1; k >= 0; k--) n->s.insert(n->s.begin() + k * n->cols + c + 1, Row{});
+    n->cols++;
+    reindex();
+    cur = {&n->s[r * n->cols + c + 1], 0};
+    return true;
+}
+
+// at the start of a cell: drop an empty row/column, otherwise step back a cell; a 1×1 matrix turns back into (…)
+void Editor::matrixBackspace(const Parent& p) {
+    Item& m = *p.node;
+    int cols = m.cols, rows = matRows(m), r = p.slot / cols, c = p.slot % cols;
+    auto cell = [&](int i, int j) -> Row& { return m.s[i * cols + j]; };
+    bool rowEmpty = true, colEmpty = true;
+    for (int j = 0; j < cols; j++) rowEmpty = rowEmpty && cell(r, j).empty();
+    for (int i = 0; i < rows; i++) colEmpty = colEmpty && cell(i, c).empty();
+    if (rows > 1 && rowEmpty) m.s.erase(m.s.begin() + r * cols, m.s.begin() + (r + 1) * cols);
+    else if (cols > 1 && colEmpty) {
+        for (int i = rows - 1; i >= 0; i--) m.s.erase(m.s.begin() + i * cols + c);
+        m.cols--;
+    } else if (p.slot > 0) return left();
+    else return;
+    if (m.s.size() == 1) {
+        m = paren(m.o.empty() ? "(" : m.o, m.cl.empty() ? ")" : m.cl, std::move(m.s[0]));
+        reindex();
+        cur = {&m.s[0], int(m.s[0].size())};
+        return;
+    }
+    reindex();
+    Row& to = m.s[std::min(std::max(p.slot - 1, 0), int(m.s.size()) - 1)];
+    cur = {&to, int(to.size())};
+}
+
+// ---------- selection: always a range of one row (the deepest row containing both ends) ----------
+std::optional<std::pair<int, int>> Editor::selRange() const {
+    if (!range) return std::nullopt;
+    return std::pair{std::min(range->a, range->b), std::max(range->a, range->b)};
+}
+
+namespace {
+struct Link {
+    Row* row;
+    int i;
+    bool inside;
+};
+}  // namespace
+
+void Editor::selectBetween(Cur A, Cur B) {
+    auto chain = [&](Cur pos) {
+        std::vector<Link> out = {{pos.row, pos.i, false}};
+        for (Row* r = pos.row; parents.count(r);) {
+            Parent q = parents.at(r);
+            out.push_back({q.row, idxIn(q.row, q.node), true});
+            r = q.row;
+        }
+        return out;
+    };
+    auto ca = chain(A), cb = chain(B);
+    std::optional<Link> ea, eb;
+    for (auto& x : ca) {
+        auto y = std::find_if(cb.begin(), cb.end(), [&](auto& z) { return z.row == x.row; });
+        if (y != cb.end()) { ea = x; eb = *y; break; }
+    }
+    if (!ea) {
+        // ponytail: selections stay within one line; dragging onto another line selects to this line's start/end
+        ea = ca.back();
+        bool forward = lineOf(topOf(B.row)) > lineOf(ea->row);
+        eb = Link{ea->row, forward ? int(ea->row->size()) : 0, false};
+    }
+    bool forward = ea->i < eb->i || (ea->i == eb->i && !ea->inside && eb->inside);
+    int a = ea->i, b = eb->i;
+    if (forward && eb->inside) b++;
+    if (!forward && ea->inside) a++;
+    if (a == b) range.reset();
+    else range = Range{ea->row, a, b};
+    cur = {ea->row, b};
+}
+
+void Editor::extendSelection(int d) {
+    if (!range || range->row != cur.row) range = Range{cur.row, cur.i, cur.i};
+    range->b = std::clamp(range->b + d, 0, int(cur.row->size()));
+    cur.i = range->b;
+    if (range->a == range->b) range.reset();
+}
+
+void Editor::selectAll() {
+    if (cur.row->empty()) range.reset();
+    else range = Range{cur.row, 0, int(cur.row->size())};
+    cur.i = int(cur.row->size());
+}
+
+Row Editor::selectedItems() const {
+    auto r = selRange();
+    return r ? Row(range->row->begin() + r->first, range->row->begin() + r->second) : Row{};
+}
+
+bool Editor::deleteSelection() {
+    auto r = selRange();
+    if (!r) return false;
+    range->row->erase(range->row->begin() + r->first, range->row->begin() + r->second);
+    cur = {range->row, r->first};
+    range.reset();
+    reindex();
+    return true;
+}
+
+// insert items at the cursor; inside a slot everything typed counts as math
+void Editor::insertItems(const Row& items) {
+    Row copy = items;
+    if (inSlot())
+        for (auto& it : copy)
+            if (it.t == T::Ch) it.m = true;
+    cur.row->insert(cur.row->begin() + cur.i, copy.begin(), copy.end());
+    cur.i += int(copy.size());
+    reindex();
+}
+
+}  // namespace om

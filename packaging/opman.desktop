@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=opman
+GenericName=Math Notes
+Comment=Write math notes that calculate as you type
+Exec=opman
+Icon=opman
+Terminal=false
+Categories=Education;Science;Math;
+Keywords=math;notes;calculator;latex;
+StartupWMClass=opman
