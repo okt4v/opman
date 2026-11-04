@@ -38,6 +38,7 @@ struct Editor {
     Doc doc{Row{}};
     Cur cur{&doc[0], 0};
     std::optional<Range> range;
+    uint8_t style = 0;      // Fmt bits given to typed text (Insert mode: Ctrl-b/i/u, toolbar)
     bool mathMode = false;  // Ctrl-m: everything typed is math, so "(a+b)/2" at a line start isn't text
     std::unordered_map<const Row*, Parent> parents;
     struct Snap {
@@ -79,6 +80,10 @@ struct Editor {
     void vertical(int d);
     void backspace();
     void enter();
+    // formatting
+    void setLine(Row& line, Line kind, int num = 1);           // replace a top-level line's Markdown prefix
+    void toggleFmt(Row& row, int a, int b, uint8_t flag);       // on text chars in [a,b): set, or clear if all have it; 0 clears all
+    bool listEnter();                                          // Enter on a list line: continue the list, or end it when empty
     void home(bool end);
     bool addMatrixRow();
     bool addMatrixCol();

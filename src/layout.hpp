@@ -26,6 +26,8 @@ struct Stop {
 struct Layout {
     ImFont* text = nullptr;
     ImFont* math = nullptr;
+    ImFont* bold = nullptr;  // bold text, headings
+    ImFont* mono = nullptr;  // inline code
     float textSize = 18, mathSize = 20.7f;  // corca: 18px body, math at 1.15em
     const Palette* pal = &DARK;
     const Editor* ed = nullptr;  // selection and active-slot highlight; null for previews
@@ -40,7 +42,7 @@ struct Layout {
     void drawMath(const Row& row, float x, float base, float size, ImU32 col = 0);
     // plain text at the text size
     float textWidth(const std::string& s, float size);
-    void drawText(const std::string& s, float x, float base, float size, ImU32 col, ImFont* f = nullptr);
+    void drawText(const std::string& s, float x, float base, float size, ImU32 col, ImFont* f = nullptr, bool slant = false);
 };
 
 ImU32 varColor(const std::string& v, float lightness);

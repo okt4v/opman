@@ -1,6 +1,7 @@
 #include "vi.hpp"
 #include "math.hpp"
 #include <algorithm>
+#include <map>
 
 namespace om {
 
@@ -48,6 +49,7 @@ std::vector<Key> Vi::parse(const std::string& s) {
             else if (t == "CR") k.sp = Key::Enter;
             else if (t == "S-CR") k.sp = Key::Enter, k.shift = true;
             else if (t == "S-Space") k.ch = " ", k.shift = true;
+            else if (t == "Space") k.ch = " ";
             else if (t == "Tab") k.sp = Key::Tab;
             else if (t == "BS") k.sp = Key::Backspace;
             else if (t.starts_with("C-")) k.ctrl = true, k.ch = t.substr(2);
@@ -67,6 +69,74 @@ void Vi::toInsert(Editor& ed, bool snapped) {
     if (!snapped) ed.snap();
     mode = Mode::Insert;
     ed.range.reset();
+    const Row& r = *ed.cur.row;  // keep typing in the style of the text before the cursor
+    int i = ed.cur.i;
+    ed.style = i > 0 && r[i - 1].t == T::Ch && !r[i - 1].m && !isSpace(r[i - 1]) ? r[i - 1].f : 0;
+}
+
+// ---------- formatting ----------
+std::pair<int, int> Vi::lines(const Editor& ed) const {
+    if (auto v = visualLines(ed)) return *v;
+    int k = ed.range ? ed.lineOf(ed.topOf(ed.range->row)) : lineIdx(ed);
+    return {k, k};
+}
+
+void Vi::format(Editor& ed, uint8_t flag) {
+    auto done = [&] {
+        if (mode == Mode::Visual || mode == Mode::VisualLine) mode = Mode::Normal, ed.range.reset();
+    };
+    if (mode == Mode::VisualLine) {
+        auto [a, b] = lines(ed);
+        ed.snap();
+        for (int k = a; k <= b; k++) ed.toggleFmt(ed.doc[k], lineStyle(ed.doc[k]).len, int(ed.doc[k].size()), flag);
+        return done();
+    }
+    if (auto s = ed.selRange()) {
+        ed.snap();
+        ed.toggleFmt(*ed.range->row, s->first, s->second, flag);
+        return done();
+    }
+    if (mode == Mode::Insert) {
+        ed.style = flag ? ed.style ^ flag : 0;
+        return;
+    }
+    Row& r = *ed.cur.row;  // Normal: the word under the cursor
+    int i = ed.cur.i, n = len(&r), a = i, b = i;
+    if (i >= n || isSpace(r[i])) { message = "No word under the cursor"; return; }
+    while (a > 0 && !isSpace(r[a - 1])) a--;
+    while (b < n && !isSpace(r[b])) b++;
+    ed.snap();
+    ed.toggleFmt(r, a, b, flag);
+}
+
+void Vi::setLine(Editor& ed, Line kind) {
+    auto [a, b] = lines(ed);
+    auto same = [&](Line l) { return l == kind || (kind == Line::Todo && l == Line::Done); };
+    bool all = true;
+    for (int k = a; k <= b; k++) all = all && same(lineStyle(ed.doc[k]).kind);
+    ed.snap();
+    for (int k = a, num = 1; k <= b; k++) ed.setLine(ed.doc[k], all ? Line::Text : kind, num++);
+    if (mode == Mode::Visual || mode == Mode::VisualLine) mode = Mode::Normal, ed.range.reset();
+}
+
+void Vi::toggleDone(Editor& ed) {
+    auto [a, b] = lines(ed);
+    ed.snap();
+    for (int k = a; k <= b; k++) ed.setLine(ed.doc[k], lineStyle(ed.doc[k]).kind == Line::Todo ? Line::Done : Line::Todo);
+    if (mode == Mode::Visual || mode == Mode::VisualLine) mode = Mode::Normal, ed.range.reset();
+}
+
+void Vi::leaderKey(Editor& ed, const std::string& c) {
+    static const std::map<std::string, uint8_t> FMT = {{"b", Bold}, {"i", Italic}, {"u", Underline}, {"s", Strike},
+                                                       {"c", Code}, {"h", Mark}, {"r", 0}};
+    static const std::map<std::string, Line> LINE = {{"0", Line::Text}, {"1", Line::H1}, {"2", Line::H2}, {"3", Line::H3},
+                                                     {"-", Line::Bullet}, {"n", Line::Number}, {">", Line::Quote}, {"t", Line::Todo}};
+    if (auto f = FMT.find(c); f != FMT.end()) format(ed, f->second);
+    else if (auto l = LINE.find(c); l != LINE.end()) setLine(ed, l->second);
+    else if (c == "x") toggleDone(ed);
+    else if (c == "m") ed.mathMode = !ed.mathMode;
+    else if (c == "e") cmds.push_back("sidebar");
+    else message = "Space " + c + " is not mapped";
 }
 
 // charwise Visual includes the item under the cursor, like vim
@@ -81,7 +151,9 @@ void Vi::visualSelect(Editor& ed) {
 
 void Vi::key(Editor& ed, const Key& k) {
     message.clear();
-    if (k.ctrl && k.ch == "b") cmds.push_back("sidebar");
+    if (k.ctrl && k.ch == "\\") cmds.push_back("sidebar");
+    else if (k.ctrl && (k.ch == "b" || k.ch == "i" || k.ch == "u") && mode != Mode::Command)
+        format(ed, k.ch == "b" ? Bold : k.ch == "i" ? Italic : Underline);
     else if (k.ctrl && k.ch == "s") cmds.push_back("w");
     else if (k.ctrl && k.ch == "m") ed.mathMode = !ed.mathMode;
     else if (mode == Mode::Insert) insertKey(ed, k);
@@ -130,7 +202,7 @@ void Vi::insertKey(Editor& ed, const Key& k) {
     case Key::Enter:
         if (k.shift) { if (!ed.addMatrixRow()) ed.enter(); }
         else if (n && !items[0].insert) pickItem(ed, ed.pick);
-        else { ed.deleteSelection(); ed.enter(); }
+        else { ed.deleteSelection(); if (!ed.listEnter()) ed.enter(); }
         return;
     case Key::Tab:
         if (n && items[0].insert) pickItem(ed, ed.pick);
@@ -242,6 +314,8 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         return;
     }
     if (c.empty()) return;
+    if (leader()) { pending.clear(); return leaderKey(ed, c); }
+    if (c == " " && pending.empty()) { pending = " "; return; }
     // r<c>: replace the item under the cursor by typing c there
     if (pending.ends_with("r")) {
         pending.clear();
@@ -339,6 +413,8 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         ed.doc.insert(ed.doc.begin() + at, Row{});
         ed.cur = {&ed.doc[at], 0};
         ed.reindex();
+        LineStyle s = lineStyle(ed.doc[k0 + (m == "O")]);
+        if (m == "o" && s.kind >= Line::Bullet) ed.setLine(ed.doc[at], s.kind == Line::Done ? Line::Todo : s.kind, s.num + 1);
         return toInsert(ed, true);
     }
     if (m == "x" || m == "s" || m == "X") {
@@ -422,6 +498,8 @@ void Vi::visualKey(Editor& ed, const std::string& c, const Key& k) {
         return;
     }
     if (c.empty()) return;
+    if (leader()) { pending.clear(); return leaderKey(ed, c); }
+    if (c == " " && pending.empty()) { pending = " "; return; }
     if (pending == "g" && c != "g") pending.clear();
     if (c == "g" && pending.empty()) { pending = "g"; return; }
     std::string m = c == "g" ? "gg" : c;

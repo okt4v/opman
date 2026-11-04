@@ -130,6 +130,19 @@ static std::string utf8(unsigned cp) {
 }
 
 static void onKey(GLFWwindow*, int key, int scancode, int action, int mods) {
+    if (key == GLFW_KEY_CAPS_LOCK) {
+        // xkb "caps:escape" (sway, GNOME, KDE) remaps the keysym, but GLFW reports the physical key. A real CapsLock
+        // flips the lock state, which shows in the mods of its press (turning off) or release (turning on); a key
+        // that never touches the lock is an Escape. Fires on release, which is not noticeable.
+        static bool wasLocked = false;
+        if (action == GLFW_PRESS) wasLocked = mods & GLFW_MOD_CAPS_LOCK;
+        else if (action == GLFW_RELEASE && !wasLocked && !(mods & GLFW_MOD_CAPS_LOCK)) {
+            Key k;
+            k.sp = Key::Esc;
+            g_keys.push_back(k);
+        }
+        return;
+    }
     if (action == GLFW_RELEASE) return;
     bool ctrl = mods & GLFW_MOD_CONTROL, alt = mods & GLFW_MOD_ALT;
 #ifdef __APPLE__
@@ -463,6 +476,8 @@ struct App {
         for (size_t k = 0; k < ed.doc.size(); k++) {
             const Row& row = ed.doc[k];
             Box b = L.measureLine(row);
+            Line kind = lineStyle(row).kind;
+            y += L.textSize * (k == 0 ? 0 : kind == Line::H1 ? 0.9f : kind == Line::H2 ? 0.6f : kind == Line::H3 ? 0.35f : 0);
             float h = std::max(L.textSize * 1.7f, b.asc + b.desc + 10);
             float base = std::round(y + (h - b.asc - b.desc) / 2 + b.asc);
             if (vl && int(k) >= vl->first && int(k) <= vl->second) dl->AddRectFilled({x0 - 6, y}, {x0 + colW - 58, y + h}, p.sel);
@@ -502,6 +517,10 @@ struct App {
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) {
             sideFocus = false;
             vi.mouse(ed, hit(ImGui::GetMousePos()), false);
+            Line kind = lineStyle(*ed.cur.row).kind;  // a click on a checkbox ticks it
+            if ((kind == Line::Todo || kind == Line::Done) && ed.topOf(ed.cur.row) == ed.cur.row &&
+                ImGui::GetMousePos().x < x0 + 1.3f * L.textSize && ImGui::GetMousePos().x > x0)
+                vi.toggleDone(ed);
             dragging = true;
             changed();
         } else if (dragging && ImGui::IsMouseDragging(0, 3)) {
@@ -636,6 +655,122 @@ struct App {
         ImGui::PopFont();
     }
 
+    // formatting at the cursor, for the toolbar's pressed state
+    uint8_t fmtHere() const {
+        if (vi.mode == Mode::Insert && !ed.range) return ed.style;
+        const Row& r = ed.range ? *ed.range->row : *ed.cur.row;
+        int i = ed.range ? std::min(ed.range->a, ed.range->b) : ed.cur.i;
+        return i < int(r.size()) && r[i].t == T::Ch ? r[i].f : 0;
+    }
+
+    void drawToolbar(float h) {
+        const Palette& p = pal();
+        ImDrawList* dl = L.dl = ImGui::GetWindowDrawList();
+        ImVec2 o = ImGui::GetCursorScreenPos();
+        float W = ImGui::GetContentRegionAvail().x, x = o.x + 8, cy = o.y + h / 2;
+        dl->AddLine({o.x, o.y + h - 1}, {o.x + W, o.y + h - 1}, p.line);
+        uint8_t f = fmtHere();
+        Line kind = lineStyle(*ed.topOf(ed.cur.row)).kind;
+        bool act = false;
+        auto btn = [&](const char* id, const char* tip, bool on, auto icon, float w = 30) {
+            ImGui::SetCursorScreenPos({x, o.y + 5});
+            bool click = ImGui::InvisibleButton(id, {w, h - 10});
+            bool hov = ImGui::IsItemHovered();
+            if (on || hov) dl->AddRectFilled({x, o.y + 5}, {x + w, o.y + h - 5}, on ? alpha(p.fn, 0.2f) : p.line, 6);
+            icon(ImVec2{x + w / 2, cy}, on ? p.fn : p.fg);
+            if (hov) ImGui::SetTooltip("%s", tip);
+            x += w + 2;
+            act = act || click;
+            return click;
+        };
+        auto sep = [&] {
+            x += 5;
+            dl->AddLine({x, o.y + 11}, {x, o.y + h - 11}, p.line);
+            x += 7;
+        };
+        auto text = [&](const char* t, ImFont* fo, float size, bool slant = false) {
+            return [=, this](ImVec2 c, ImU32 col) {
+                float w = fo->CalcTextSizeA(size, FLT_MAX, 0, t).x;
+                L.drawText(t, c.x - w / 2, c.y + size * 0.36f, size, col, fo, slant);
+            };
+        };
+        auto lines = [&](ImVec2 c, ImU32 col, float x0) {
+            for (int i = -1; i <= 1; i++) dl->AddLine({c.x + x0, c.y + i * 5.f}, {c.x + 8, c.y + i * 5.f}, col, 1.5f);
+        };
+        // sidebar
+        if (btn("side", "Sidebar  (Ctrl-\\ · Space e)", sidebar, [&](ImVec2 c, ImU32 col) {
+                dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 3, 0, 1.5f);
+                dl->AddRectFilled({c.x - 8, c.y - 7}, {c.x - 3, c.y + 7}, col, 3);
+            }))
+            run("sidebar");
+        sep();
+        if (btn("undo", "Undo  (u)", false, text("↶", L.math, 20))) ed.undo();
+        if (btn("redo", "Redo  (Ctrl-r)", false, text("↷", L.math, 20))) ed.redo();
+        sep();
+        if (btn("b", "Bold  (Ctrl-b · Space b)", f & Bold, text("B", bold, 16))) vi.format(ed, Bold);
+        if (btn("i", "Italic  (Ctrl-i · Space i)", f & Italic, text("I", ui, 16, true))) vi.format(ed, Italic);
+        if (btn("u", "Underline  (Ctrl-u · Space u)", f & Underline, [&](ImVec2 c, ImU32 col) {
+                text("U", ui, 16)(c, col);
+                dl->AddLine({c.x - 6, c.y + 9}, {c.x + 6, c.y + 9}, col, 1.5f);
+            }))
+            vi.format(ed, Underline);
+        if (btn("s", "Strikethrough  (Space s)", f & Strike, [&](ImVec2 c, ImU32 col) {
+                text("S", ui, 16)(c, col);
+                dl->AddLine({c.x - 7, c.y}, {c.x + 7, c.y}, col, 1.5f);
+            }))
+            vi.format(ed, Strike);
+        if (btn("c", "Inline code  (Space c)", f & Code, text("</>", L.mono, 12), 34)) vi.format(ed, Code);
+        if (btn("h", "Highlight  (Space h)", f & Mark, [&](ImVec2 c, ImU32 col) {
+                dl->AddRectFilled({c.x - 9, c.y - 8}, {c.x + 9, c.y + 8}, IM_COL32(250, 204, 21, 110), 3);
+                text("A", bold, 14)(c, col);
+            }))
+            vi.format(ed, Mark);
+        if (btn("r", "Clear formatting  (Space r)", false, [&](ImVec2 c, ImU32 col) {
+                text("T", ui, 16)(c, col);
+                dl->AddLine({c.x - 7, c.y + 7}, {c.x + 7, c.y - 7}, col, 1.5f);
+            }))
+            vi.format(ed, 0);
+        sep();
+        if (btn("h1", "Heading 1  (Space 1)", kind == Line::H1, text("H1", bold, 13))) vi.setLine(ed, Line::H1);
+        if (btn("h2", "Heading 2  (Space 2)", kind == Line::H2, text("H2", bold, 13))) vi.setLine(ed, Line::H2);
+        if (btn("h3", "Heading 3  (Space 3)", kind == Line::H3, text("H3", bold, 13))) vi.setLine(ed, Line::H3);
+        if (btn("ul", "Bullet list  (Space -)", kind == Line::Bullet, [&](ImVec2 c, ImU32 col) {
+                for (int i = -1; i <= 1; i++) dl->AddCircleFilled({c.x - 7, c.y + i * 5.f}, 1.7f, col);
+                lines(c, col, -3);
+            }))
+            vi.setLine(ed, Line::Bullet);
+        if (btn("ol", "Numbered list  (Space n)", kind == Line::Number, [&](ImVec2 c, ImU32 col) {
+                L.drawText("1", c.x - 10, c.y - 1, 9, col, bold);
+                L.drawText("2", c.x - 10, c.y + 8, 9, col, bold);
+                dl->AddLine({c.x - 2, c.y - 4}, {c.x + 8, c.y - 4}, col, 1.5f);
+                dl->AddLine({c.x - 2, c.y + 4}, {c.x + 8, c.y + 4}, col, 1.5f);
+            }))
+            vi.setLine(ed, Line::Number);
+        if (btn("q", "Quote  (Space >)", kind == Line::Quote, [&](ImVec2 c, ImU32 col) {
+                dl->AddRectFilled({c.x - 8, c.y - 7}, {c.x - 5.5f, c.y + 7}, col, 1);
+                lines(c, col, -2);
+            }))
+            vi.setLine(ed, Line::Quote);
+        if (btn("t", "Checklist  (Space t · Space x or click the box to tick)", kind == Line::Todo || kind == Line::Done,
+                [&](ImVec2 c, ImU32 col) {
+                    dl->AddRect({c.x - 7, c.y - 7}, {c.x + 7, c.y + 7}, col, 3, 0, 1.5f);
+                    ImVec2 ck[] = {{c.x - 4, c.y}, {c.x - 1, c.y + 3}, {c.x + 4, c.y - 3}};
+                    dl->AddPolyline(ck, 3, col, 0, 1.5f);
+                }))
+            vi.setLine(ed, Line::Todo);
+        sep();
+        if (btn("m", "Math mode: everything typed is math  (Ctrl-m · Space m)", ed.mathMode, text("∑", L.math, 18))) ed.mathMode = !ed.mathMode;
+        // theme, at the right edge
+        x = std::max(x, o.x + W - 40);
+        if (btn("theme", dark ? "Light theme  (:set light)" : "Dark theme  (:set dark)", false, [&](ImVec2 c, ImU32 col) {
+                dl->AddCircle(c, 7, col, 0, 1.5f);
+                dl->PathArcTo(c, 7, -IM_PI / 2, IM_PI / 2);
+                dl->PathFillConvex(col);
+            }))
+            run(dark ? "set light" : "set dark");
+        if (act) changed();
+    }
+
     void drawStatus(float h) {
         const Palette& p = pal();
         ImDrawList* dl = L.dl = ImGui::GetWindowDrawList();
@@ -663,9 +798,13 @@ struct App {
             x += 10;
         }
         std::string msg = !vi.message.empty() ? vi.message : message;
-        if (!msg.empty()) L.drawText(msg, x + 16, base, 14, p.muted, ui);
+        if (vi.leader())
+            L.drawText("SPACE   b bold · i italic · u underline · s strike · c code · h highlight · r clear · 1 2 3 heading · 0 text · "
+                       "- bullets · n numbers · > quote · t checklist · x tick · m math · e sidebar",
+                       x + 4, base, 12, p.fg, ui);
+        else if (!msg.empty()) L.drawText(msg, x + 16, base, 14, p.muted, ui);
         else if (left.empty())
-            L.drawText("i insert · Esc normal · Ctrl-m math · :w save · :e find · :new · Ctrl-b sidebar · Ctrl-w files", x + 4, base, 12, alpha(p.muted, 0.8f), ui);
+            L.drawText("i insert · Esc normal · Space formatting · Ctrl-m math · :w save · :e find · :new · Ctrl-w files", x + 4, base, 12, alpha(p.muted, 0.8f), ui);
         int k = ed.lineOf(ed.topOf(ed.cur.row)) + 1;
         std::string right = titleOf(meta) + (docJson(ed.doc).dump() == savedJson ? "" : " [+]") + "   " + std::to_string(k) + "/" +
                             std::to_string(ed.doc.size());
@@ -698,9 +837,15 @@ struct App {
             ImGui::GetWindowDrawList()->AddLine({b.x, a.y}, {b.x, b.y}, pal().line);
             ImGui::SameLine(0, 0);
         }
+        ImGui::BeginGroup();
+        float toolH = 40;
+        ImGui::BeginChild("tools", {0, toolH}, 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawToolbar(toolH);
+        ImGui::EndChild();
         ImGui::BeginChild("doc", {0, -statusH}, 0, ImGuiWindowFlags_HorizontalScrollbar);
         drawDoc();
         ImGui::EndChild();
+        ImGui::EndGroup();
         drawStatus(statusH);
         ImGui::End();
         ImGui::PopStyleVar(2);
@@ -744,9 +889,10 @@ int main(int argc, char** argv) {
     GLFWwindow* win = glfwCreateWindow(1280, 820, "opman", nullptr, nullptr);
     if (!win) return 1;
     glfwMakeContextCurrent(win);
-    glfwSwapInterval(1);
+    glfwSwapInterval(shot ? 0 : 1);  // Wayland blocks vsync'd swaps of a hidden window; screenshots must not wait
     glfwSetKeyCallback(win, onKey);  // before ImGui's, which chain to these
     glfwSetCharCallback(win, onChar);
+    glfwSetInputMode(win, GLFW_LOCK_KEY_MODS, GLFW_TRUE);  // CapsLock state in mods: see onKey
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -768,6 +914,9 @@ int main(int argc, char** argv) {
     }
     io.FontDefault = app.ui;
     app.L.text = app.ui;
+    app.L.bold = app.bold;
+    app.L.mono = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14);
+    if (!app.L.mono) app.L.mono = app.ui;
     app.loadCfg();
     app.files = listDocs(app.dir);
     app.openMostRecent();

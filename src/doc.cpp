@@ -240,9 +240,42 @@ std::string plain(const Row& row) {
     return out;
 }
 
+LineStyle lineStyle(const Row& row) {
+    std::string s;  // the leading plain characters, enough for the longest prefix
+    for (size_t i = 0; i < row.size() && i < 12 && row[i].t == T::Ch; i++) s += row[i].c;
+    auto is = [&](const char* p) { return s.starts_with(p); };
+    auto n = [](const char* p) { return int(std::string(p).size()); };
+    if (is("- [ ] ")) return {Line::Todo, 6};
+    if (is("- [x] ") || is("- [X] ")) return {Line::Done, 6};
+    if (is("### ")) return {Line::H3, 4};
+    if (is("## ")) return {Line::H2, 3};
+    if (is("# ")) return {Line::H1, 2};
+    if (is("- ")) return {Line::Bullet, 2};
+    if (is("> ")) return {Line::Quote, 2};
+    size_t d = 0;
+    while (d < s.size() && d < 4 && std::isdigit((unsigned char)s[d])) d++;
+    if (d && s.compare(d, 2, ". ") == 0) return {Line::Number, n("1. ") + int(d) - 1, std::stoi(s.substr(0, d))};
+    return {};
+}
+
+std::string linePrefix(Line kind, int num) {
+    switch (kind) {
+    case Line::Text: return "";
+    case Line::H1: return "# ";
+    case Line::H2: return "## ";
+    case Line::H3: return "### ";
+    case Line::Bullet: return "- ";
+    case Line::Number: return std::to_string(num) + ". ";
+    case Line::Quote: return "> ";
+    case Line::Todo: return "- [ ] ";
+    case Line::Done: return "- [x] ";
+    }
+    return "";
+}
+
 std::string docTitle(const Doc& doc) {
     for (auto& r : doc) {
-        auto cps = codepoints(trimSpaces(plain(r)));
+        auto cps = codepoints(trimSpaces(plain(Row(r.begin() + lineStyle(r).len, r.end()))));
         if (cps.empty()) continue;
         std::string s;
         for (size_t i = 0; i < cps.size() && i < 80; i++) s += cps[i];
@@ -258,7 +291,7 @@ static const char* TNAME[] = {"ch", "var", "const", "unit", "sym", "fn", "frac",
 static json itemJson(const Item& it) {
     json j = {{"t", TNAME[int(it.t)]}};
     switch (it.t) {
-    case T::Ch: j["c"] = it.c; j["m"] = it.m; break;
+    case T::Ch: j["c"] = it.c; j["m"] = it.m; if (it.f) j["f"] = it.f; break;
     case T::Var: case T::Const: case T::Unit: case T::Fn: j["v"] = it.c; break;
     case T::Sym: j["s"] = it.c; j["l"] = it.l; break;
     case T::Frac: j["a"] = toJson(it.s[0]); j["b"] = toJson(it.s[1]); break;
@@ -314,7 +347,9 @@ static Item itemFromJson(const json& j) {
         n.s = {slot("lo"), slot("hi")};
         return n;
     }
-    return ch(str(j, "c"), j.value("m", false));
+    Item c = ch(str(j, "c"), j.value("m", false));
+    if (j.contains("f") && j["f"].is_number_unsigned()) c.f = uint8_t(j["f"].get<unsigned>() & 63);
+    return c;
 }
 
 Row rowFromJson(const json& j) {

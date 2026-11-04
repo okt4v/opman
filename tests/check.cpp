@@ -257,6 +257,45 @@ static void checkVi() {
         CHECK(!e2.mathMode);
     }
 
+    // formatting: Space leader, Ctrl-b, line prefixes, list continuation, JSON round trip
+    {
+        Editor e;
+        Vi v;
+        auto flags = [&](int k) { std::string s; for (auto& it : e.doc[k]) s += char('0' + it.f); return s; };
+        keys(e, v, "ihello big world<Esc>0w<Space>b");
+        CHECK_EQ(flags(0), "000000111000000");
+        keys(e, v, "<Space>b");
+        CHECK_EQ(flags(0), "000000000000000");
+        keys(e, v, "0vll<Space>i");
+        CHECK_EQ(flags(0), "222000000000000");
+        CHECK(v.mode == Mode::Normal);
+        keys(e, v, "A <C-b>bold<C-b> x<Esc>");
+        CHECK_EQ(flags(0).substr(15), "0111100");
+        keys(e, v, "<Space>1");
+        CHECK_EQ(plain(e.doc[0]).substr(0, 8), "# hello ");
+        CHECK(lineStyle(e.doc[0]).kind == Line::H1);
+        keys(e, v, "<Space>2");
+        CHECK(lineStyle(e.doc[0]).kind == Line::H2 && plain(e.doc[0]).starts_with("## hello"));
+        keys(e, v, "<Space>2");
+        CHECK(plain(e.doc[0]).starts_with("hello"));
+        keys(e, v, "u");
+        CHECK(lineStyle(e.doc[0]).kind == Line::H2);
+        CHECK_EQ(docTitle(e.doc), "hello big world bold x");
+        keys(e, v, "o<Esc><Space>tAmilk<CR>eggs<CR><CR>after<Esc>");
+        CHECK_EQ(plain(e.doc[1]), "- [ ] milk");
+        CHECK_EQ(plain(e.doc[2]), "- [ ] eggs");
+        CHECK_EQ(plain(e.doc[3]), "after");
+        keys(e, v, "kk<Space>x");
+        CHECK(lineStyle(e.doc[1]).kind == Line::Done);
+        keys(e, v, "Go<Esc><Space>nAone<Esc>otwo<Esc>");
+        CHECK_EQ(plain(e.doc[5]), "2. two");
+        keys(e, v, "Vk<Space>-");
+        CHECK_EQ(plain(e.doc[4]), "- one");
+        CHECK_EQ(plain(e.doc[5]), "- two");
+        Doc back = docFromJson(docJson(e.doc));
+        CHECK(back == e.doc);
+    }
+
     // insert, define, evaluate with Tab from the popup
     keys(ed, vi, "if(x) = x^2+1<Esc>");
     CHECK(vi.mode == Mode::Normal);

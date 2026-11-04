@@ -24,8 +24,23 @@ struct Item {
     std::string o, cl;   // Paren/Mat: delimiters
     int cols = 0;        // Mat: columns; cells are the slots, row-major
     std::vector<Row> s;  // slots: frac [a,b], big [lo,hi], mat cells, sup/sub/sqrt/paren/lim [a]
+    uint8_t f = 0;       // Ch text: Fmt bits ("f" in JSON; corca ignores the key)
     bool operator==(const Item&) const = default;
 };
+
+// inline text formatting
+enum Fmt : uint8_t { Bold = 1, Italic = 2, Underline = 4, Strike = 8, Code = 16, Mark = 32 };
+
+// line formatting is a Markdown prefix typed into the line itself ("# ", "- ", "1. ", "> ", "- [ ] "), so notes stay
+// plain corca documents; the renderer draws the prefix as a heading size, bullet, number, quote bar or checkbox
+enum class Line : uint8_t { Text, H1, H2, H3, Bullet, Number, Quote, Todo, Done };
+struct LineStyle {
+    Line kind = Line::Text;
+    int len = 0;  // items in the prefix
+    int num = 0;  // Number: the number typed
+};
+LineStyle lineStyle(const Row& row);
+std::string linePrefix(Line kind, int num = 1);
 
 // constructors
 Item ch(std::string c, bool m);

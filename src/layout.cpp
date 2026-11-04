@@ -94,10 +94,42 @@ struct Impl {
     Box glyphBox(ImFont* f, float size, const std::string& s) {
         return {f->CalcTextSizeA(size, FLT_MAX, 0, s.c_str()).x, 0.72f * size, 0.24f * size};
     }
-    void glyph(ImFont* f, float size, const std::string& s, float x, float base, ImU32 col) {
+    void glyph(ImFont* f, float size, const std::string& s, float x, float base, ImU32 col, bool slant = false) {
         if (!L.dl) return;
+        int v0 = L.dl->VtxBuffer.Size;
         L.dl->AddText(f, size, {x, base - f->GetFontBaked(size)->Ascent}, col, s.c_str());
+        if (slant)  // ponytail: synthetic italic (shear), no italic font file shipped
+            for (int v = v0; v < L.dl->VtxBuffer.Size; v++) L.dl->VtxBuffer[v].pos.x += (base - L.dl->VtxBuffer[v].pos.y) * 0.2f;
     }
+
+    // ---------- top-level line style ----------
+    struct Top {
+        LineStyle ls;
+        float ts, scale = 1;  // text size, heading scale
+        bool heading = false;
+    };
+    Top top(const Row& row) {
+        Top t{lineStyle(row), L.textSize};
+        t.heading = t.ls.kind >= Line::H1 && t.ls.kind <= Line::H3;
+        t.scale = t.ls.kind == Line::H1 ? 1.75f : t.ls.kind == Line::H2 ? 1.4f : t.ls.kind == Line::H3 ? 1.18f : 1;
+        t.ts = L.textSize * t.scale;
+        return t;
+    }
+    ImFont* textFont(const Item& it, const Top& t) const {
+        return it.f & Code ? L.mono : (it.f & Bold) || t.heading ? L.bold : L.text;
+    }
+    float textSize(const Item& it, const Top& t) const { return it.f & Code ? t.ts * 0.88f : t.ts; }
+    // width of the drawn prefix: bullet, number, quote bar, checkbox; headings show theirs in the margin
+    float decoWidth(const Top& t) {
+        switch (t.ls.kind) {
+        case Line::Bullet: return 1.25f * t.ts;
+        case Line::Number: return textWidth(std::string(std::to_string(t.ls.num).size(), '0') + ".", t.ts) + 0.5f * t.ts;
+        case Line::Quote: return 1.0f * t.ts;
+        case Line::Todo: case Line::Done: return 1.45f * t.ts;
+        default: return 0;
+        }
+    }
+    float textWidth(const std::string& s, float size) { return L.text->CalcTextSizeA(size, FLT_MAX, 0, s.c_str()).x; }
     struct Ink {
         float adv, top, bottom;  // advance, ink above / below the baseline
     };
@@ -119,17 +151,22 @@ struct Impl {
         r.xs.resize(n + 1);
         r.lsp.resize(n);
         r.boxes.resize(n);
-        Ctx mc = c.top ? Ctx{L.mathSize, true, false, c.col} : c;
+        Top t = c.top ? top(row) : Top{};
+        Ctx mc = c.top ? Ctx{L.mathSize * t.scale, true, false, c.col} : c;
         float x = 0;
         Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
-        r.total = {0, c.top ? 0.75f * L.textSize : 0, c.top ? 0.25f * L.textSize : 0};
+        r.total = {0, c.top ? 0.75f * t.ts : 0, c.top ? 0.25f * t.ts : 0};
         for (size_t j = 0; j < n; j++) {
             r.xs[j] = x;
             const Item& it = row[j];
             Box b;
             float w;
-            if (!r.mask[j]) {
-                b = glyphBox(L.text, L.textSize, it.c);
+            if (int(j) < t.ls.len) {  // the Markdown prefix: drawn as one decoration in its last item's place
+                w = int(j) == t.ls.len - 1 ? decoWidth(t) : 0;
+                b = {w, 0.72f * t.ts, 0.24f * t.ts};
+            } else if (!r.mask[j]) {
+                b = glyphBox(textFont(it, t), textSize(it, t), it.c);
+                b.asc = std::max(b.asc, 0.72f * t.ts);
                 w = b.w;
             } else if (isSpace(it)) {
                 b = {};  // spaces inside math are not drawn (MathML ignores them)
@@ -199,14 +236,58 @@ struct Impl {
             glyph(L.math, c.size, "⬚", x, base, (m & 0x00FFFFFF) | (0x80u << IM_COL32_A_SHIFT));
             return;
         }
-        Ctx mc = c.top ? Ctx{L.mathSize, true, false, c.col} : c;
-        Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
-        for (size_t j = 0; j < row.size(); j++) {
+        Top t = c.top ? top(row) : Top{};
+        Ctx mc = c.top ? Ctx{L.mathSize * t.scale, true, false, c.col} : c;
+        if (c.top && L.dl) decorate(row, t, r, x, base, y0, y1);
+        bool done = t.ls.kind == Line::Done;
+        // text backgrounds (code, highlight) first, so they never cover a neighbouring glyph
+        for (size_t j = t.ls.len; j < row.size() && L.dl; j++) {
             const Item& it = row[j];
-            if (!r.mask[j]) glyph(L.text, L.textSize, it.c, x + r.xs[j], base, col(c, L.pal->fg));
-            else if (!isSpace(it)) item(it, mc, prev, true, x + r.xs[j] + r.lsp[j], base);
+            if (r.mask[j] || !(it.f & (Code | Mark))) continue;
+            ImU32 bg = it.f & Mark ? IM_COL32(250, 204, 21, 90) : L.pal->line;
+            L.dl->AddRectFilled({x + r.xs[j], base - 0.8f * t.ts}, {x + r.xs[j + 1], base + 0.3f * t.ts}, bg);
+        }
+        Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
+        for (size_t j = t.ls.len; j < row.size(); j++) {
+            const Item& it = row[j];
+            if (!r.mask[j]) {
+                float gx = x + r.xs[j], gw = r.xs[j + 1] - r.xs[j], th = std::max(1.f, 0.065f * t.ts);
+                ImU32 tc = col(c, done ? L.pal->muted : it.f & Code ? L.pal->constant : L.pal->fg);
+                glyph(textFont(it, t), textSize(it, t), it.c, gx, base, tc, it.f & Italic);
+                if (L.dl && (it.f & Underline)) L.dl->AddRectFilled({gx, base + 0.1f * t.ts}, {gx + gw, base + 0.1f * t.ts + th}, tc);
+                if (L.dl && ((it.f & Strike) || done)) L.dl->AddRectFilled({gx, base - 0.3f * t.ts}, {gx + gw, base - 0.3f * t.ts + th}, tc);
+            } else if (!isSpace(it)) item(it, mc, prev, true, x + r.xs[j] + r.lsp[j], base);
             if (!isSpace(it)) prev = r.boxes[j];
         }
+    }
+
+    void decorate(const Row& row, const Top& t, const RowLay& r, float x, float base, float y0, float y1) {
+        const Palette& p = *L.pal;
+        float s = t.ts;
+        switch (t.ls.kind) {
+        case Line::H1: case Line::H2: case Line::H3: {
+            // the "#" marks live in the left margin, shown while the cursor is on the line
+            if (!L.ed || L.ed->topOf(L.ed->cur.row) != &row) break;
+            std::string h = t.ls.kind == Line::H1 ? "H1" : t.ls.kind == Line::H2 ? "H2" : "H3";
+            float fs = L.textSize * 0.75f;
+            glyph(L.text, fs, h, x - textWidth(h, fs) - 10, base, p.muted);
+            break;
+        }
+        case Line::Bullet: glyph(L.text, s, "•", x + 0.35f * s, base, p.muted); break;
+        case Line::Number: glyph(L.text, s, std::to_string(t.ls.num) + ".", x + 0.1f * s, base, p.muted); break;
+        case Line::Quote: L.dl->AddRectFilled({x + 0.2f * s, y0}, {x + 0.2f * s + 3, y1}, p.line, 1.5f); break;
+        case Line::Todo: case Line::Done: {
+            float b = 0.8f * s, bx = x + 0.15f * s, by = base - 0.72f * s;
+            if (t.ls.kind == Line::Done) {
+                L.dl->AddRectFilled({bx, by}, {bx + b, by + b}, p.fn, 4);
+                ImVec2 ck[] = {{bx + 0.22f * b, by + 0.52f * b}, {bx + 0.42f * b, by + 0.72f * b}, {bx + 0.78f * b, by + 0.3f * b}};
+                L.dl->AddPolyline(ck, 3, p.bg, 0, std::max(1.5f, 0.1f * b));
+            } else L.dl->AddRect({bx, by}, {bx + b, by + b}, p.muted, 4, 0, 1.5f);
+            break;
+        }
+        default: break;
+        }
+        (void)r;
     }
 
     // ---------- delimiters ----------
@@ -413,9 +494,8 @@ void Layout::drawLine(const Row& row, float x, float base) { Impl{*this}.drawRow
 Box Layout::measureMath(const Row& row, float size) { return Impl{*this}.rowBox(row, {size, true, false, 0}); }
 void Layout::drawMath(const Row& row, float x, float base, float size, ImU32 c) { Impl{*this}.drawRow(row, {size, true, false, c}, x, base); }
 float Layout::textWidth(const std::string& s, float size) { return text->CalcTextSizeA(size, FLT_MAX, 0, s.c_str()).x; }
-void Layout::drawText(const std::string& s, float x, float base, float size, ImU32 col, ImFont* f) {
-    f = f ? f : text;
-    dl->AddText(f, size, {x, base - f->GetFontBaked(size)->Ascent}, col, s.c_str());
+void Layout::drawText(const std::string& s, float x, float base, float size, ImU32 col, ImFont* f, bool slant) {
+    Impl{*this}.glyph(f ? f : text, size, s, x, base, col, slant);
 }
 
 }  // namespace om

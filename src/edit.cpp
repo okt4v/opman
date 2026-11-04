@@ -439,6 +439,7 @@ void Editor::insertChar(std::string c) {
         plotLine = lower(s) == "plot ";
     }
     row.insert(row.begin() + i, ch(c, m || (plotLine && c != " ")));
+    if (!row[i].m) row[i].f = style;
     cur.i++;
     if (row[i].m) combine();
 }
@@ -723,6 +724,43 @@ void Editor::insertItems(const Row& items) {
     cur.row->insert(cur.row->begin() + cur.i, copy.begin(), copy.end());
     cur.i += int(copy.size());
     reindex();
+}
+
+// ---------- formatting ----------
+void Editor::setLine(Row& line, Line kind, int num) {
+    int old = lineStyle(line).len;
+    std::string p = linePrefix(kind, num);
+    Row pre;
+    for (char c : p) pre.push_back(ch(std::string(1, c), false));
+    line.erase(line.begin(), line.begin() + old);
+    line.insert(line.begin(), pre.begin(), pre.end());
+    int n = int(pre.size());
+    if (cur.row == &line) cur.i = std::max(n, cur.i - old + n);
+    if (range && range->row == &line) range.reset();
+    reindex();
+}
+
+void Editor::toggleFmt(Row& row, int a, int b, uint8_t flag) {
+    bool all = true, any = false;
+    for (int j = a; j < b; j++)
+        if (row[j].t == T::Ch && !row[j].m && !isSpace(row[j])) any = true, all = all && (row[j].f & flag);
+    if (!any) return;
+    for (int j = a; j < b; j++)
+        if (row[j].t == T::Ch && !row[j].m) row[j].f = !flag ? 0 : all ? row[j].f & ~flag : row[j].f | flag;
+}
+
+bool Editor::listEnter() {
+    if (inSlot()) return false;
+    Row& line = *cur.row;
+    LineStyle s = lineStyle(line);
+    if (s.kind < Line::Bullet || cur.i < s.len) return false;
+    if (int(line.size()) == s.len) {  // an empty item ends the list
+        setLine(line, Line::Text);
+        return true;
+    }
+    enter();
+    setLine(*cur.row, s.kind == Line::Done ? Line::Todo : s.kind, s.num + 1);
+    return true;
 }
 
 }  // namespace om
