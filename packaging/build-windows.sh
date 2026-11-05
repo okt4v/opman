@@ -10,7 +10,7 @@ if [ -z "${OPMAN_WIN_SHELL:-}" ]; then
 fi
 
 build=${BUILD_DIR:-build-win}
-version=$(sed -n 's/^project(opman VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+version=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true); version=${version#v}; version=${version:-0.1.0}
 cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$root/packaging/mingw-w64.cmake" "$@"
 cmake --build "$build" --target opman ${JOBS:+-j "$JOBS"}
 

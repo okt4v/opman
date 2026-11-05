@@ -64,9 +64,27 @@ set(CPACK_PACKAGE_INSTALL_DIRECTORY opman)
 set(CPACK_PACKAGE_EXECUTABLES opman opman)
 set(CPACK_INSTALL_CMAKE_PROJECTS "${CMAKE_BINARY_DIR};opman;opman;/")
 string(TOLOWER "${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}" _plat)
-set(CPACK_PACKAGE_FILE_NAME opman-${PROJECT_VERSION}-${_plat})
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+  string(REPLACE ";" "-" _arch "${CMAKE_OSX_ARCHITECTURES}")
+  set(_plat darwin-${_arch})
+endif()
+set(CPACK_PACKAGE_FILE_NAME opman-${OPMAN_VERSION_STRING}-${_plat})
 if(WIN32)
   set(CPACK_GENERATOR ZIP)
+  # cmake --build <build> --config Release --target installer -> <build>/opman-<version>-windows-<arch>-setup.exe, made
+  # from the install tree (the zip's contents: opman.exe, assets, LICENSE, MSVC runtime DLLs)
+  find_program(OPMAN_MAKENSIS makensis)
+  if(OPMAN_MAKENSIS)
+    set(_stage ${CMAKE_BINARY_DIR}/installer-stage)
+    file(TO_NATIVE_PATH ${_stage} _stage_native)
+    add_custom_target(installer
+      COMMAND ${CMAKE_COMMAND} -E rm -rf ${_stage}
+      COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --config $<CONFIG> --component opman --prefix ${_stage}
+      COMMAND ${OPMAN_MAKENSIS} -V2 -DVERSION=${OPMAN_VERSION_STRING} -DNUMVERSION=${PROJECT_VERSION} -DSTAGE=${_stage_native}
+              -DOUTFILE=${CMAKE_BINARY_DIR}/${CPACK_PACKAGE_FILE_NAME}-setup.exe ${OPMAN_PKG}/opman.nsi
+      VERBATIM)
+    add_dependencies(installer opman)
+  endif()
 elseif(APPLE)
   set(CPACK_GENERATOR DragNDrop)
   set(CPACK_DMG_VOLUME_NAME opman)

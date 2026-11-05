@@ -10,6 +10,9 @@
 !if ! /FileExists "${STAGE}\opman.exe"
   !error "${STAGE}\opman.exe not found"
 !endif
+!ifndef NUMVERSION  ; the file version must be numeric: pass it when VERSION has a pre-release suffix
+  !define NUMVERSION "${VERSION}"
+!endif
 
 Unicode true
 SetCompressor /SOLID lzma
@@ -25,10 +28,10 @@ InstallDir "$LOCALAPPDATA\Programs\${APP}"
 InstallDirRegKey HKCU "Software\${APP}" "InstallDir"
 BrandingText "${APP} ${VERSION}"
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${NUMVERSION}.0"
 VIAddVersionKey "ProductName" "${APP}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
-VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "FileVersion" "${NUMVERSION}"
 VIAddVersionKey "FileDescription" "${APP} installer"
 VIAddVersionKey "LegalCopyright" "GPL-3.0-or-later"
 

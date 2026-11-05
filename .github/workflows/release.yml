@@ -1,0 +1,151 @@
+# Builds Windows (installer + portable zip), macOS (.dmg, arm64 and x86_64) and Linux (.tar.gz), runs the self-checks,
+# and uploads the packages as artifacts. Every push to main builds and checks; a version tag (v*) also publishes a
+# GitHub Release with the packages: tags with a "-" (v0.3.0-beta.1) are pre-releases.
+# Release: `git tag v0.2.0 && git push origin v0.2.0`. Only the built-in GITHUB_TOKEN is used; no secrets to set up.
+name: release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x86_64, os: windows-latest }
+          - { name: macos-arm64, os: macos-15, arch: arm64 }
+          - { name: macos-x86_64, os: macos-15-intel, arch: x86_64 }
+          - { name: linux-x86_64, os: ubuntu-24.04 }
+    runs-on: ${{ matrix.os }}
+    env:
+      # the tag (v0.2.0) on tag builds; other builds are <newest tag>-dev
+      OPMAN_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags, for the version
+
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libgl-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev
+
+      - name: NSIS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
+      # no -G: the newest installed Visual Studio
+      - name: Configure (Windows, MSVC)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64 -DOPMAN_VERSION="${{ env.OPMAN_VERSION }}"
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DOPMAN_VERSION="$OPMAN_VERSION"
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOPMAN_VERSION="$OPMAN_VERSION"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Self-checks
+        shell: bash
+        run: |
+          if [ -f build/Release/opman_check.exe ]; then build/Release/opman_check.exe; else build/opman_check; fi
+
+      - name: Package
+        working-directory: build
+        run: cpack -C Release
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --target installer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opman-${{ matrix.name }}
+          path: |
+            build/opman-*.exe
+            build/opman-*.zip
+            build/opman-*.dmg
+            build/opman-*.tar.gz
+          if-no-files-found: error
+
+  nix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: nix build (runs the self-checks too)
+        run: nix build -L .#opman
+
+  release:
+    needs: [build, nix]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: src
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # "What's new": commit subjects since the previous release tag (CI / test-only commits left out)
+      - name: Changelog
+        run: |
+          cd src
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          range=${prev:+$prev..}$GITHUB_REF_NAME
+          { echo "## What's new"; echo
+            git log --no-merges --pretty='- %s' "$range" | grep -vE '^- (CI|Tests?)[:(]' | head -n 60 || true
+            echo; } > ../changes.md
+          cat ../changes.md
+      - name: Name the downloads
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          mkdir out
+          for f in dist/*; do
+            case "$f" in
+              *windows*.exe) n="opman-$v-windows-setup.exe" ;;
+              *windows*.zip) n="opman-$v-windows-portable.zip" ;;
+              *darwin-arm64*.dmg) n="opman-$v-macos-apple-silicon.dmg" ;;
+              *darwin-x86_64*.dmg) n="opman-$v-macos-intel.dmg" ;;
+              *linux*.tar.gz) n="opman-$v-linux-x86_64.tar.gz" ;;
+              *) echo "unexpected package: $f"; exit 1 ;;
+            esac
+            mv "$f" "out/$n"
+          done
+          ls -l out
+          cat > notes.md <<EOF
+          ## Download
+
+          | System | File |
+          |---|---|
+          | Windows 10/11 | [opman-$v-windows-setup.exe](https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/opman-$v-windows-setup.exe) (installer), or the portable [.zip](https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/opman-$v-windows-portable.zip) |
+          | macOS, Apple silicon (M1 and later) | [opman-$v-macos-apple-silicon.dmg](https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/opman-$v-macos-apple-silicon.dmg) |
+          | macOS, Intel | [opman-$v-macos-intel.dmg](https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/opman-$v-macos-intel.dmg) |
+          | Linux x86_64 | [opman-$v-linux-x86_64.tar.gz](https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/opman-$v-linux-x86_64.tar.gz) (unpack and run bin/opman), or Nix: \`nix run github:$GITHUB_REPOSITORY\` |
+
+          The apps aren't signed: on Windows click "More info > Run anyway", on macOS right-click the app > Open the first time.
+          PDF export needs a TeX installation (pdflatex); everything else works without one.
+          EOF
+          sed -i 's/^          //' notes.md
+          cat changes.md notes.md > body.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          body_path: body.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
