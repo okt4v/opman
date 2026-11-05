@@ -38,7 +38,7 @@ struct Editor {
     Doc doc{Row{}};
     Cur cur{&doc[0], 0};
     std::optional<Range> range;
-    uint8_t style = 0;      // Fmt bits given to typed text (Insert mode: Ctrl-b/i/u, toolbar)
+    uint16_t style = 0;     // Fmt bits given to typed text (Insert mode: Ctrl-b/i/u, toolbar)
     bool mathMode = false;  // Ctrl-m: everything typed is math, so "(a+b)/2" at a line start isn't text
     std::unordered_map<const Row*, Parent> parents;
     struct Snap {
@@ -46,6 +46,7 @@ struct Editor {
         Path path;
     };
     std::vector<Snap> undoStack, redoStack;
+    int changes = 0;  // bumped by every snap(), so callers can tell whether a command changed the doc
     std::string lastSnapKind;
     double lastSnapAt = -1e9;
     std::string dismissed;  // popupKey() the popup was dismissed at
@@ -82,8 +83,9 @@ struct Editor {
     void enter();
     // formatting
     void setLine(Row& line, Line kind, int num = 1);           // replace a top-level line's Markdown prefix
-    void toggleFmt(Row& row, int a, int b, uint8_t flag);       // on text chars in [a,b): set, or clear if all have it; 0 clears all
-    bool listEnter();                                          // Enter on a list line: continue the list, or end it when empty
+    void toggleFmt(Row& row, int a, int b, uint16_t flag);       // on text chars in [a,b): set, or clear if all have it; 0 clears all
+    bool listEnter();
+    void tableRow(const Row& from, Row& to);  // an empty row with from's cells, cursor in the first                                          // Enter on a list line: continue the list, or end it when empty
     void home(bool end);
     bool addMatrixRow();
     bool addMatrixCol();

@@ -2,7 +2,24 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0 CACHE STRING "Minimum macOS version")
 endif()
-project(opman VERSION 0.1.0 LANGUAGES C CXX)
+# OPMAN_VERSION: the release tag without "v" (CI passes it); local builds are <newest tag>-dev
+set(OPMAN_VERSION "" CACHE STRING "Version baked into the packages, e.g. 0.2.0 or 0.3.0-beta.1")
+string(REGEX REPLACE "^v" "" OPMAN_VERSION "${OPMAN_VERSION}")  # a tag name works too
+set(_opman_numeric 0.1.0)
+execute_process(COMMAND git describe --tags --abbrev=0 --match "v[0-9]*" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                OUTPUT_VARIABLE _opman_tag OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(_opman_tag MATCHES "^v([0-9]+\\.[0-9]+\\.[0-9]+)$")
+  set(_opman_numeric ${CMAKE_MATCH_1})
+endif()
+if(OPMAN_VERSION MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+  set(_opman_numeric ${CMAKE_MATCH_1})
+endif()
+project(opman VERSION ${_opman_numeric} LANGUAGES C CXX)
+if(OPMAN_VERSION)
+  set(OPMAN_VERSION_STRING ${OPMAN_VERSION})
+else()
+  set(OPMAN_VERSION_STRING ${PROJECT_VERSION}-dev)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +35,8 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui GIT_TAG v1.93.0-docking GIT_SHALLOW ON SOURCE_SUBDIR none)
 FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz)
-FetchContent_MakeAvailable(imgui json)
+FetchContent_Declare(stb GIT_REPOSITORY https://github.com/nothings/stb GIT_TAG 003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5 SOURCE_SUBDIR none)
+FetchContent_MakeAvailable(imgui json stb)
 
 # ponytail: system glfw on Linux (nix), fetched elsewhere
 find_package(glfw3 3.4 QUIET)
@@ -40,12 +58,13 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)  # math italic letters live above U+FFFF
 
 # core = everything but the window; shared by the app and the self-checks
-add_library(opman_core STATIC src/doc.cpp src/edit.cpp src/math.cpp src/vi.cpp)
+add_library(opman_core STATIC src/doc.cpp src/edit.cpp src/math.cpp src/vi.cpp src/export.cpp)
 target_include_directories(opman_core PUBLIC src)
 target_link_libraries(opman_core PUBLIC nlohmann_json::nlohmann_json)
 
 add_executable(opman src/main.cpp src/layout.cpp)
 target_link_libraries(opman PRIVATE opman_core imgui)
+target_include_directories(opman PRIVATE ${stb_SOURCE_DIR})  # stb_image: pictures in notes
 
 add_executable(opman_check tests/check.cpp)
 target_link_libraries(opman_check PRIVATE opman_core)

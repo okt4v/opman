@@ -365,6 +365,220 @@ static void checkVi() {
     CHECK(vi.message.starts_with("Not an editor command"));
     CHECK(vi.mode == Mode::Normal);
 
+    // . repeats the last change; f/t/;/, find in the line; / ? n N search
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "ia,b,c,d<Esc>0x");
+        CHECK_EQ(lineTex(e.doc[0]), ",b,c,d");
+        keys(e, v, ".");
+        CHECK_EQ(lineTex(e.doc[0]), "b,c,d");
+        keys(e, v, "0df,");
+        CHECK_EQ(lineTex(e.doc[0]), "c,d");
+        keys(e, v, "u0f,;");  // ; with nothing after: stays
+        CHECK(e.cur.i == 3);
+        keys(e, v, "0dt,");
+        CHECK_EQ(lineTex(e.doc[0]), ",c,d");
+        keys(e, v, "$F,D");
+        CHECK_EQ(lineTex(e.doc[0]), ",c");
+        keys(e, v, "Aend<Esc>o<Esc>.");  // o<Esc> was the last change
+        CHECK_EQ(int(e.doc.size()), 3);
+        keys(e, v, "ggcwone<Esc>j.");
+        CHECK_EQ(lineTex(e.doc[0]), "one");
+        keys(e, v, "ggccalpha beta<Esc>oBeta gamma<Esc>gg");
+        keys(e, v, "/beta<CR>");
+        CHECK(e.cur.row == &e.doc[0] && e.cur.i == 6);
+        keys(e, v, "n");  // smartcase: lowercase matches Beta too
+        CHECK(e.cur.row == &e.doc[1] && e.cur.i == 0);
+        keys(e, v, "n");
+        CHECK(e.cur.row == &e.doc[0] && v.message.starts_with("search hit BOTTOM"));
+        keys(e, v, "N");
+        CHECK(e.cur.row == &e.doc[1]);
+        keys(e, v, "/Beta<CR>");
+        CHECK(e.cur.row == &e.doc[1] && e.cur.i == 0);
+        keys(e, v, "?zzz<CR>");
+        CHECK(v.message.starts_with("Pattern not found"));
+        CHECK(v.prompt == ':');
+    }
+
+    // clipboard: yanks go out as Markdown, p pastes what another app copied
+    {
+        Editor e;
+        Vi v;
+        std::string clip;
+        v.setClip = [&](const std::string& s) { clip = s; };
+        v.getClip = [&] { return clip; };
+        keys(e, v, "i<C-b>big<C-b> x = a/b<Esc>yy");
+        CHECK_EQ(noSpaces(clip), "**big**$x=\\frac{a}{b}$");
+        keys(e, v, "p");  // our own yank: the line register
+        CHECK_EQ(int(e.doc.size()), 2);
+        clip = "from\nelsewhere";
+        keys(e, v, "Go<Esc>p");
+        CHECK_EQ(int(e.doc.size()), 4);
+        CHECK_EQ(plain(e.doc[2]), "from");
+        CHECK_EQ(plain(e.doc[3]), "elsewhere");
+        keys(e, v, "o<C-v><Esc>");
+        CHECK_EQ(int(e.doc.size()), 6);
+        CHECK_EQ(plain(e.doc[5]), "elsewhere");
+    }
+
+    // Markdown export: prefixes, lists together, paragraphs apart
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "iTitle<Esc><Space>1o<Esc><Space>-Aone<Esc>otwo<Esc>o<Esc><Space>-Atext <C-b>bold<C-b> end<Esc>");
+        CHECK_EQ(markdown(e.doc), "# Title\n\n- one\n- two\n\ntext **bold** end\n");
+    }
+
+    // blocks: divider, image, plot, table; | in a table line is a cell border, Enter adds a row
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i---<Esc>o![a cat](media/cat.png)<Esc>o| x^2 | b |<Esc>A<CR>7<Esc>");
+        CHECK(lineStyle(e.doc[0]).kind == Line::Rule);
+        std::string alt, path;
+        CHECK(imageRef(e.doc[1], alt, path) && alt == "a cat" && path == "media/cat.png");
+        CHECK(lineStyle(e.doc[2]).kind == Line::Table);
+        CHECK_EQ(int(tableCells(e.doc[2]).size()), 2);
+        CHECK_EQ(lineTex(e.doc[2]), "| $x^{2}$ | b |");  // the pipe after x^2 is a border, not |…| (abs)
+        CHECK_EQ(plain(e.doc[3]), "| 7 |  |");
+        keys(e, v, "A<CR><CR>after<Esc>");  // Enter on an empty row ends the table
+        CHECK_EQ(plain(e.doc[4]), "after");
+        CHECK_EQ(markdown(Doc(e.doc.begin() + 2, e.doc.begin() + 4)), "| $x^{2}$ | b |\n|---|---|\n| $7$ |  |\n");
+        keys(e, v, "oplot<Tab>x^2, -1 < x < 2<Esc>");
+        Plot pl = plot(e, e.doc.back());
+        CHECK(pl.x0 == -1 && pl.x1 == 2 && pl.series.size() == 1 && pl.error.empty());
+        CHECK(std::fabs(pl.series[0].pts.back().second - 4) < 1e-9);
+        CHECK(pl.y0 < 0 && pl.y1 > 4);
+        std::string t = latex(e, "/notes");
+        CHECK(t.find("\\rule{\\linewidth}") != std::string::npos);
+        CHECK(t.find("{/notes/media/cat.png}") != std::string::npos);
+        CHECK(t.find("\\begin{tabular}{|l|l|}") != std::string::npos);
+        CHECK(t.find("\\addplot") != std::string::npos);
+    }
+
+    // superscript/subscript and the colours exclude each other; LaTeX escapes text
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "iab 50%<Esc>0<Space>^<Space>_");
+        CHECK(e.doc[0][0].f == Sub);
+        keys(e, v, "<Space>R<Space>B");
+        CHECK(e.doc[0][0].f == (Sub | Blue));
+        keys(e, v, "<Space>B");
+        CHECK(e.doc[0][0].f == Sub);
+        CHECK_EQ(latexText(e.doc[0], 0, int(e.doc[0].size())), "\\textsubscript{ab} $50\\%$");
+    }
+
+    // sections: each === starts a fresh set of definitions, so two exercises can both use x
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "ix = 3<Esc>ox + 1<Esc>o=== Exercise 2<Esc>ox = 10<Esc>ox + 1<Esc>o=== Exercise 3<Esc>ox + 1<Esc>");
+        CHECK(lineStyle(e.doc[2]).kind == Line::Section);
+        CHECK_EQ(sectionTitle(e.doc[2]), "Exercise 2");
+        CHECK_EQ(ghost(e, e.doc[1])->text, "= 4");
+        CHECK_EQ(ghost(e, e.doc[4])->text, "= 11");
+        CHECK(!ghost(e, e.doc[6]));  // x is undefined in the third section
+        CHECK(sectionOf(e.doc, 4) == std::pair(2, 5));
+        // a number written after = is already the answer: no faint "= 4" after "x + 1 = 4"
+        keys(e, v, "ggjA = 4<Esc>");
+        CHECK(!ghost(e, e.doc[1]));
+    }
+
+    // Enter after a text word starts a new line even with the popup open; a math word or ↓ makes Enter pick
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i- one");
+        bool popup = !v.items.empty();
+        keys(e, v, "<CR>two<Esc>");
+        CHECK_EQ(plain(e.doc[0]), "- one");
+        CHECK_EQ(plain(e.doc[1]), "- two");
+        (void)popup;
+    }
+
+    // Tab walks table cells; past the last one it adds a row
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i| a | b |<Esc>0");
+        keys(e, v, "a<Tab>X<Tab>Y<Tab>Z<Esc>");
+        CHECK_EQ(plain(e.doc[0]), "| a | Xb |");
+        CHECK_EQ(plain(e.doc[1]), "| Y | Z |");
+    }
+
+    // search: all matches for highlighting; :noh and Esc turn it off
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "ione two one<Esc>oone<Esc>gg/one<CR>");
+        auto m = Vi::matches(e, v.highlight());
+        CHECK_EQ(int(m.size()), 3);
+        CHECK(m[1].line == 0 && m[1].a == 8 && m[1].b == 11);
+        keys(e, v, ":noh<CR>");
+        CHECK(v.highlight().empty());
+        keys(e, v, "/tw");
+        CHECK_EQ(v.highlight(), "tw");  // as you type
+        keys(e, v, "<Esc>");
+    }
+
+    // [[links]]: Enter or gf on one asks the app to open it; Ctrl-o goes back
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "isee [[Other note]] here<Esc>");
+        CHECK((linkSpans(e.doc[0]) == std::vector<std::pair<int, int>>{{4, 18}}));
+        keys(e, v, "0fO<CR>");
+        CHECK(!v.cmds.empty() && v.cmds.back() == "link Other note");
+        v.cmds.clear();
+        keys(e, v, "0gf");
+        CHECK(v.cmds.empty() && v.message.starts_with("No [[link]]"));
+        keys(e, v, "fOgf<C-o>");
+        CHECK(v.cmds.size() == 2 && v.cmds[0] == "link Other note" && v.cmds[1] == "back");
+    }
+
+    // plots: a table's columns as points, a y range, a view override; HTML and Markdown export
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i| t | h |<Esc>o<Esc>cc| 1 | 5 |<Esc>o<Esc>cc| 2 | 9 |<Esc>o<Esc>ccplot<Tab>table, x^2, -1 < y < 1<Esc>");
+        Plot pl = plot(e, e.doc[3]);
+        CHECK(pl.series.size() == 2 && pl.series[0].points && pl.series[0].label == "h" && pl.series[0].pts.size() == 2);
+        CHECK(pl.series[0].pts[1] == std::pair(2.0, 9.0));
+        CHECK(pl.y0 == -1 && pl.y1 == 1);
+        CHECK(pl.x0 < 1 && pl.x1 > 2 && pl.x1 < 3);  // fitted to the data
+        double view[4] = {0, 10, -5, 5};
+        Plot zoomed = plot(e, e.doc[3], view);
+        CHECK(zoomed.x0 == 0 && zoomed.x1 == 10 && zoomed.series[1].pts.back().first == 10);
+        keys(e, v, "o![pic](media/p.png)<Esc>o=== Part 2<Esc>");
+        std::string h = html(e, "/n", "T");
+        CHECK(h.find("<th>t</th>") != std::string::npos && h.find("<svg") != std::string::npos);
+        CHECK(h.find("Image not found: media/p.png") != std::string::npos && h.find("class=section>Part 2") != std::string::npos);
+        std::string md = markdown(e.doc, "/n");
+        CHECK(md.find("![pic](/n/media/p.png)") != std::string::npos && md.find("**Part 2**") != std::string::npos);
+    }
+
+    // program functions: plot/table/section/divider come from the popup for a word alone on its line; the word "plot"
+    // in a sentence is just text
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "iplot twist<Esc>oplot");
+        CHECK(lineStyle(e.doc[0]).kind == Line::Text);
+        CHECK(!v.items.empty() && v.items[0].name == "plot" && v.items[0].cat == "Program");
+        keys(e, v, "<Tab>sin(x)<Esc>");
+        CHECK(lineStyle(e.doc[1]).kind == Line::Plot && plot(e, e.doc[1]).series.size() == 1);
+        keys(e, v, "osection<Tab>x = 1<Esc>odivider<Tab><Esc>otable<Tab>a<Tab>b<Esc>");
+        CHECK_EQ(sectionTitle(e.doc[2]), "Exercise 1");
+        CHECK_EQ(plain(e.doc[3]), "x = 1");
+        CHECK(lineStyle(e.doc[4]).kind == Line::Rule);
+        CHECK_EQ(plain(e.doc[5]), "");  // the divider leaves you on a new line
+        CHECK_EQ(plain(e.doc[6]), "| a | b |");
+        keys(e, v, "o<Esc>cca plot<Esc>");  // not at the line start: no program functions offered
+        CHECK(lineStyle(e.doc.back()).kind == Line::Text);
+    }
+
     // matrices in insert mode: Shift+Space grows a column, Shift+Enter a row
     keys(ed, vi, "oA = (1<S-Space>2<S-CR>3<Tab>4<Esc>");
     CHECK(lineTex(ed.doc.back()).find("\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}") != std::string::npos);

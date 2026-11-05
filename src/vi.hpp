@@ -2,6 +2,7 @@
 // slots, j/k between numerator/denominator and lines); Insert mode is corca's typing model unchanged.
 #pragma once
 #include "edit.hpp"
+#include <functional>
 
 namespace om {
 
@@ -15,11 +16,18 @@ struct Key {
 
 struct Vi {
     Mode mode = Mode::Normal;
-    std::string cmdline;              // text after ":" in Command mode
+    std::string cmdline;              // text after the prompt in Command mode
+    char prompt = ':';                // Command mode: ':' ex command, '/' or '?' search
     std::string message;              // shown in the status line until the next key
     std::vector<std::string> cmds;    // ex commands for the app to run (w, q, wq, e <name>, new, rename <t>, trash, sidebar)
     // Space is the leader in Normal/Visual: see leaderKey in vi.cpp and LEADER_HELP
     std::vector<Entry> items;         // the completion popup (Insert mode only)
+    bool navigated = false;           // the popup's selection was moved (arrows, Ctrl-n/p): Enter and Tab take it
+    bool hlsearch = false;            // highlight the last search's matches (until Esc or :noh)
+    // system clipboard, set by the app (empty in tests): yanks and deletes are copied out as Markdown; p/P and
+    // Insert Ctrl-v paste text that was copied elsewhere
+    std::function<std::string()> getClip;
+    std::function<void(const std::string&)> setClip;
 
     void key(Editor& ed, const Key& k);
     void refresh(Editor& ed);         // recompute the popup after the document or cursor changed
@@ -27,12 +35,18 @@ struct Vi {
     void pickItem(Editor& ed, size_t j);  // take popup entry j
     // formatting, for the keys and the toolbar: the selection, else the word under the cursor (Normal), else the
     // style of what is typed next (Insert)
-    void format(Editor& ed, uint8_t flag);  // 0 clears
+    void format(Editor& ed, uint16_t flag);  // 0 clears
     void setLine(Editor& ed, Line kind);    // toggles the line style of the current/selected lines
     void toggleDone(Editor& ed);
     bool leader() const { return pending == " "; }
     static std::vector<Key> parse(const std::string& s);  // "if(x)<Esc>dd": chars, <Esc> <CR> <Tab> <BS> <S-CR> <C-r>
     std::optional<std::pair<int, int>> visualLines(const Editor& ed) const;  // VisualLine: first, last line
+    bool enterPicks(const Editor& ed) const;  // Enter takes the popup's entry: after navigating, or for a math word
+    std::string highlight() const;            // the pattern to highlight: typed after "/", or the last search
+    struct Match {
+        int line, a, b;  // items [a, b) of a top-level line
+    };
+    static std::vector<Match> matches(const Editor& ed, const std::string& pattern);  // smartcase
 
 private:
     std::string pending;  // count, operator, g/r prefixes
@@ -44,7 +58,19 @@ private:
         Doc doc;
         Row items;
     } reg;
+    std::string copied;               // what we last put on the clipboard, so p knows whether it came from elsewhere
+    std::vector<Key> rec, last;       // keys of the command being typed, and of the last one that changed the doc (.)
+    int recFrom = 0;
+    bool replaying = false;
+    std::string lastFind;             // f/t/F/T and its target, for ; and ,
+    std::string lastSearch;
+    bool lastBack = false;            // last search was ?
 
+    void yanked();
+    void pasteText(Editor& ed, const std::string& s);
+    void searchNext(Editor& ed, bool reverse);
+
+    void key1(Editor& ed, const Key& k);
     void insertKey(Editor& ed, const Key& k);
     void normalKey(Editor& ed, const std::string& c, const Key& k);
     void visualKey(Editor& ed, const std::string& c, const Key& k);

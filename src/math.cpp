@@ -970,11 +970,15 @@ void defsIn(const Row& run) {
     }
 }
 
-// definitions from every line; on line `exclude` only the part before index `upto` counts
-// ("v = 90 km/h and v * 2 h =" sees v, but a line never defines itself)
+// definitions from every line of exclude's section (=== lines separate exercises; null: the whole doc); on line
+// `exclude` only the part before index `upto` counts ("v = 90 km/h and v * 2 h =" sees v, but a line never defines itself)
 void collectDefs(const Row* exclude, int upto = 0) {
     DEFS.clear();
-    for (auto& whole : ED->doc) {
+    int k = exclude ? ED->lineOf(exclude) : -1;
+    auto [a, b] = k >= 0 ? sectionOf(ED->doc, k) : std::pair{0, int(ED->doc.size())};
+    for (int n = a; n < b; n++) {
+        const Row& whole = ED->doc[n];
+        if (lineStyle(whole).kind == Line::Plot) continue;  // "plot y = x^2" doesn't define y
         Row line = &whole == exclude ? Row(whole.begin(), whole.begin() + std::min(upto, int(whole.size()))) : whole;
         auto mask = mathMask(line, true);
         for (size_t j = 0; j < line.size();) {
@@ -1386,6 +1390,13 @@ std::optional<Ghost> ghost(Editor& ed, const Row& row) {
     try {
         collectDefs(&row, end - int(seg.size()));
         Ast ast = parse(seg);
+        // "h(2) = 1019/50": a number written after "=" is already the answer
+        std::function<bool(const Ast&)> named = [&](const Ast& x) {
+            return x.k == Ast::Var || x.k == Ast::Call || x.k == Ast::Deriv || std::any_of(x.a.begin(), x.a.end(), named);
+        };
+        int s0 = end - int(seg.size());
+        while (s0 > 0 && isSpace(row[s0 - 1])) s0--;
+        if (s0 > 0 && row[s0 - 1].c == "=" && !named(ast)) return std::nullopt;
         // already a plain number or a matrix of numbers: nothing to compute
         if (ast.k == Ast::Num || (ast.k == Ast::Neg && ast.a[0].k == Ast::Num) ||
             (ast.k == Ast::Mat && std::all_of(ast.a.begin(), ast.a.end(), [](auto& x) { return x.k == Ast::Num; })))
@@ -1402,6 +1413,125 @@ std::optional<Ghost> ghost(Editor& ed, const Row& row) {
             return std::nullopt;
         }
     }
+}
+
+// "plot table": the nearest table above in the section; column 1 is x, every other column a series of points
+static void tableSeries(Editor& ed, const Row& row, Plot& out) {
+    int k = ed.lineOf(&row), top = sectionOf(ed.doc, k).first, end = k;
+    while (end > top && lineStyle(ed.doc[end - 1]).kind != Line::Table) end--;
+    int start = end;
+    while (start > top && lineStyle(ed.doc[start - 1]).kind == Line::Table) start--;
+    if (start == end) { out.error = "No table above to plot"; return; }
+    auto cellRow = [](const Row& r, std::pair<int, int> c) {
+        Row q;
+        for (int j = c.first; j < c.second; j++)
+            if (!isSpace(r[j])) {
+                Item it = r[j];
+                if (it.t == T::Ch) it.m = true;
+                q.push_back(it);
+            }
+        return q;
+    };
+    auto head = tableCells(ed.doc[start]);
+    for (size_t c = 1; c < head.size(); c++) {
+        Row h = cellRow(ed.doc[start], head[c]);
+        out.series.push_back({tex(h), plain(h), {}, true});
+    }
+    for (int r = start + 1; r < end; r++) {
+        auto cells = tableCells(ed.doc[r]);
+        double x = NAN;
+        for (size_t c = 0; c < cells.size() && c <= out.series.size(); c++) {
+            double v = NAN;
+            try { v = val(evaluate(parse(cellRow(ed.doc[r], cells[c])))); } catch (...) {}
+            if (c == 0) x = v;
+            else if (std::isfinite(x)) out.series[out.series.size() - head.size() + c].pts.push_back({x, v});
+        }
+    }
+}
+
+Plot plot(Editor& ed, const Row& row, const double* view) {
+    ED = &ed;
+    Plot out;
+    bool domain = false, yFixed = false;
+    collectDefs(&row, 0);
+    std::vector<Row> parts(1);  // split at top-level commas, without spaces; text letters count as math here
+    for (size_t j = 1; j < row.size(); j++) {  // after the plot function
+        Item it = row[j];
+        if (it.t == T::Ch && it.c == ",") parts.emplace_back();
+        else if (!isSpace(it)) {
+            if (it.t == T::Ch) it.m = true;
+            parts.back().push_back(it);
+        }
+    }
+    std::vector<Ast> fns;
+    for (auto& q : parts) {
+        if (q.empty()) continue;
+        if (plain(q) == "table") {
+            tableSeries(ed, row, out);
+            continue;
+        }
+        std::vector<int> rel, eq;
+        for (int j = 0; j < int(q.size()); j++) {
+            if (q[j].c == "<" || q[j].c == "≤") rel.push_back(j);
+            if (q[j].c == "=") eq.push_back(j);
+        }
+        try {
+            if (rel.size() == 2) {  // a < x < b, or a < y < b for the visible y range
+                double lo = val(evaluate(parse(Row(q.begin(), q.begin() + rel[0]))));
+                double hi = val(evaluate(parse(Row(q.begin() + rel[1] + 1, q.end()))));
+                bool y = rel[1] - rel[0] == 2 && q[rel[0] + 1].c == "y";
+                (y ? out.y0 : out.x0) = lo, (y ? out.y1 : out.x1) = hi;
+                (y ? yFixed : domain) = true;
+                continue;
+            }
+            Row e = eq.empty() ? q : Row(q.begin() + eq.back() + 1, q.end());  // y = …: the right side
+            fns.push_back(parse(e));
+            out.series.push_back({tex(e), plain(e), {}});
+        } catch (...) {
+            out.error = "Can't plot " + plain(q);
+        }
+    }
+    std::vector<double> ys;
+    if (!domain) {  // no domain given: fit the table data, if any
+        double lo = INFINITY, hi = -INFINITY;
+        for (auto& s : out.series)
+            for (auto& [x, y] : s.pts) lo = std::min(lo, x), hi = std::max(hi, x);
+        if (lo < hi) out.x0 = lo - 0.05 * (hi - lo), out.x1 = hi + 0.05 * (hi - lo);
+    }
+    for (auto& s : out.series)
+        for (auto& [x, y] : s.pts)
+            if (std::isfinite(y)) ys.push_back(y);
+    if (view) out.x0 = view[0], out.x1 = view[1], out.y0 = view[2], out.y1 = view[3], yFixed = true;
+    if (!(out.x1 > out.x0)) std::swap(out.x0, out.x1);
+    if (out.x0 == out.x1) out.x1 = out.x0 + 1;
+    const int N = 400;
+    size_t first = out.series.size() - fns.size();  // table series come first
+    for (size_t f = 0; f < fns.size(); f++) {
+        size_t s = first + f;
+        bool any = false;
+        for (int i = 0; i < N; i++) {
+            double x = out.x0 + (out.x1 - out.x0) * i / (N - 1), y = NAN;
+            try {
+                Value v = evaluate(fns[f], {{"x", Fl(x)}});
+                if (!isMat(v)) y = val(v);
+            } catch (...) {}
+            if (!std::isfinite(y)) y = NAN;
+            else ys.push_back(y), any = true;
+            out.series[s].pts.push_back({x, y});
+        }
+        if (!any && out.error.empty()) out.error = "Can't plot " + out.series[s].label + " (is x the only unknown?)";
+    }
+    // ponytail: y range from the 2nd to 98th percentile plus a margin, so asymptotes don't flatten everything else
+    if (!ys.empty() && !yFixed) {
+        std::sort(ys.begin(), ys.end());
+        double lo = ys[size_t(0.02 * (ys.size() - 1))], hi = ys[size_t(0.98 * (ys.size() - 1))];
+        if (ys.front() > lo - 0.1 * (hi - lo)) lo = ys.front();
+        if (ys.back() < hi + 0.1 * (hi - lo)) hi = ys.back();
+        if (hi - lo < 1e-9) lo -= 1, hi += 1;
+        double pad = 0.08 * (hi - lo);
+        out.y0 = lo - pad, out.y1 = hi + pad;
+    }
+    return out;
 }
 
 std::vector<std::string> definedNames(Editor& ed) {

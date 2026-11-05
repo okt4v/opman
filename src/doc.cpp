@@ -142,12 +142,13 @@ static std::string texItem(const Item& it) {
         if (it.c == "*") return "\\cdot ";
         if (it.c == " ") return "";
         if (it.c == "−") return "-";
+        if (it.c == "%" || it.c == "#" || it.c == "&" || it.c == "$") return "\\" + it.c;  // TeX specials ("50%")
         return it.c;
     case T::Var: return texName(it.c, "\\mathit") + " ";
     case T::Const: return (isLetter(it.c) ? "\\mathrm{" + it.c + "}" : texName(it.c, "\\mathrm")) + " ";
     case T::Unit: return "\\,\\mathrm{" + it.c + "}";
     case T::Sym: return it.l + " ";
-    case T::Fn: return "\\" + it.c + " ";
+    case T::Fn: return it.c == "plot" ? "\\operatorname{plot} " : "\\" + it.c + " ";
     case T::Frac: return "\\frac{" + tex(it.s[0]) + "}{" + tex(it.s[1]) + "}";
     case T::Sup: return "^{" + tex(it.s[0]) + "}";
     case T::Sub: return "_{" + tex(it.s[0]) + "}";
@@ -200,6 +201,94 @@ std::string lineTex(const Row& row, bool top) {
     return out;
 }
 
+namespace {
+struct Mk {
+    uint16_t f;
+    const char *open, *close;
+};
+// text formatting as markers around runs, math as $…$; spaces keep only the markers the next word continues
+// ("**a b**", not "**a **b"). ponytail: closes and reopens every marker on a change, so "**a*****b***" can happen
+template <size_t N>
+std::string styled(const Row& row, int a, int b, const Mk (&mk)[N], std::string (*esc)(const std::string&)) {
+    auto mask = mathMask(row, true);
+    std::string out;
+    uint16_t on = 0;
+    auto set = [&](uint16_t f) {
+        if (f == on) return;
+        for (int m = int(N) - 1; m >= 0; m--) if (on & mk[m].f) out += mk[m].close;
+        for (auto& m : mk) if (f & m.f) out += m.open;
+        on = f;
+    };
+    for (int j = a; j < b;) {
+        int k = j;
+        while (k < b && mask[k] == mask[j]) k++;
+        if (mask[j]) {
+            set(0);
+            std::string t = tex(Row(row.begin() + j, row.begin() + k));
+            if (!t.empty()) out += "$" + t + "$";
+        } else
+            for (int i = j; i < k; i++) {
+                uint16_t f = row[i].f;
+                if (isSpace(row[i])) {
+                    int n = i;
+                    while (n < k && isSpace(row[n])) n++;
+                    f = on & (n < k ? row[n].f : 0);
+                }
+                set(f);
+                out += esc(row[i].c);
+            }
+        j = k;
+    }
+    set(0);
+    return out;
+}
+std::string same(const std::string& c) { return c; }
+std::string texEsc(const std::string& c) {
+    static const std::map<std::string, std::string> E = {{"\\", "\\textbackslash{}"}, {"{", "\\{"}, {"}", "\\}"}, {"$", "\\$"},
+        {"&", "\\&"}, {"#", "\\#"}, {"%", "\\%"}, {"_", "\\_"}, {"~", "\\textasciitilde{}"}, {"^", "\\textasciicircum{}"},
+        {"<", "\\textless{}"}, {">", "\\textgreater{}"}, {"|", "\\textbar{}"}};
+    auto f = E.find(c);
+    return f == E.end() ? c : f->second;
+}
+}  // namespace
+
+std::string markdown(const Row& row) {
+    static const Mk MK[] = {{Bold, "**", "**"}, {Italic, "*", "*"}, {Strike, "~~", "~~"}, {Mark, "==", "=="},
+                            {Underline, "<u>", "</u>"}, {Red, "<span style=\"color:red\">", "</span>"},
+                            {Green, "<span style=\"color:green\">", "</span>"}, {Blue, "<span style=\"color:blue\">", "</span>"},
+                            {Sup, "<sup>", "</sup>"}, {Sub, "<sub>", "</sub>"}, {Code, "`", "`"}};
+    return styled(row, 0, int(row.size()), MK, same);
+}
+
+std::string latexText(const Row& row, int a, int b) {
+    static const Mk MK[] = {{Mark, "\\hl{", "}"}, {Underline, "\\uline{", "}"}, {Strike, "\\sout{", "}"}, {Bold, "\\textbf{", "}"},
+                            {Italic, "\\textit{", "}"}, {Red, "\\textcolor{red}{", "}"}, {Green, "\\textcolor{green!50!black}{", "}"},
+                            {Blue, "\\textcolor{blue}{", "}"}, {Sup, "\\textsuperscript{", "}"}, {Sub, "\\textsubscript{", "}"},
+                            {Code, "\\texttt{", "}"}};
+    return styled(row, a, b, MK, texEsc);
+}
+
+std::string markdown(const Doc& doc, const std::filesystem::path& base) {
+    auto group = [](const Row& r) {  // consecutive list items or quote lines stay together; others are paragraphs
+        Line l = lineStyle(r).kind;
+        return l == Line::Quote ? 2 : isList(l) ? 1 : l == Line::Table ? 3 : 0;
+    };
+    std::string out;
+    for (size_t k = 0; k < doc.size(); k++) {
+        if (k) out += group(doc[k]) && group(doc[k]) == group(doc[k - 1]) ? "\n" : "\n\n";
+        std::string alt, path;
+        if (lineStyle(doc[k]).kind == Line::Section) out += "---\n\n**" + sectionTitle(doc[k]) + "**";
+        else if (!base.empty() && imageRef(doc[k], alt, path) && std::filesystem::path(path).is_relative())
+            out += "![" + alt + "](" + (base / path).generic_string() + ")";
+        else out += markdown(doc[k]);
+        if (group(doc[k]) == 3 && (!k || group(doc[k - 1]) != 3)) {  // a table's first row is its header
+            out += "\n|";
+            for (size_t c = 0; c < std::max<size_t>(1, tableCells(doc[k]).size()); c++) out += "---|";
+        }
+    }
+    return out + "\n";
+}
+
 std::string plain(const Row& row) {
     static const std::map<std::string, std::string> SUPS = {{"0", "⁰"}, {"1", "¹"}, {"2", "²"}, {"3", "³"}, {"4", "⁴"},
                                                             {"5", "⁵"}, {"6", "⁶"}, {"7", "⁷"}, {"8", "⁸"}, {"9", "⁹"},
@@ -240,11 +329,83 @@ std::string plain(const Row& row) {
     return out;
 }
 
+uint16_t fmtGroup(uint16_t flag) { return flag & Script ? Script : flag & Colors ? Colors : flag; }
+
+bool imageRef(const Row& row, std::string& alt, std::string& path) {
+    std::string s;
+    for (auto& it : row) {
+        if (it.t != T::Ch) return false;
+        s += it.c;
+    }
+    size_t mid = s.find("](");
+    if (!s.starts_with("![") || !s.ends_with(")") || mid == std::string::npos) return false;
+    alt = s.substr(2, mid - 2);
+    path = s.substr(mid + 2, s.size() - mid - 3);
+    return !path.empty();
+}
+
+// ponytail: a pipe inside math stays an absolute value, so only text pipes split cells
+std::vector<std::pair<int, int>> tableCells(const Row& row) {
+    std::vector<int> pipes;
+    for (int j = 0; j < int(row.size()); j++)
+        if (row[j].t == T::Ch && !row[j].m && row[j].c == "|") pipes.push_back(j);
+    std::vector<std::pair<int, int>> out;
+    for (size_t k = 0; k + 1 < pipes.size(); k++) out.push_back({pipes[k] + 1, pipes[k + 1]});
+    if (!pipes.empty() && pipes.back() + 1 < int(row.size())) {  // text after the last pipe is a cell too
+        int a = pipes.back() + 1;
+        bool blank = std::all_of(row.begin() + a, row.end(), [](auto& x) { return isSpace(x); });
+        if (!blank) out.push_back({a, int(row.size())});
+    }
+    return out;
+}
+
+std::string sectionTitle(const Row& row) {
+    std::string s;
+    for (size_t j = 3; j < row.size(); j++) s += row[j].t == T::Ch ? row[j].c : plain(Row{row[j]});
+    size_t a = s.find_first_not_of(" =");
+    return a == std::string::npos ? "" : s.substr(a, s.find_last_not_of(' ') - a + 1);
+}
+
+std::pair<int, int> sectionOf(const Doc& doc, int k) {
+    int a = k, b = k + 1, n = int(doc.size());
+    while (a > 0 && lineStyle(doc[a]).kind != Line::Section) a--;
+    while (b < n && lineStyle(doc[b]).kind != Line::Section) b++;
+    return {a, b};
+}
+
+std::vector<std::pair<int, int>> linkSpans(const Row& row) {
+    std::vector<std::pair<int, int>> out;
+    auto at = [&](int j, const char* c) { return j < int(row.size()) && row[j].t == T::Ch && !row[j].m && row[j].c == c; };
+    for (int j = 0; j + 1 < int(row.size()); j++) {
+        if (!(at(j, "[") && at(j + 1, "["))) continue;
+        for (int e = j + 2; e + 1 < int(row.size()); e++) {
+            if (row[e].t != T::Ch || row[e].m) break;  // ponytail: a link's title is plain text
+            if (at(e, "]") && at(e + 1, "]")) {
+                if (e > j + 2) out.push_back({j, e + 2});
+                j = e + 1;
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+std::string linkTitle(const Row& row, std::pair<int, int> span) {
+    std::string s;
+    for (int j = span.first + 2; j < span.second - 2; j++) s += row[j].c;
+    return s;
+}
+
 LineStyle lineStyle(const Row& row) {
     std::string s;  // the leading plain characters, enough for the longest prefix
     for (size_t i = 0; i < row.size() && i < 12 && row[i].t == T::Ch; i++) s += row[i].c;
     auto is = [&](const char* p) { return s.starts_with(p); };
     auto n = [](const char* p) { return int(std::string(p).size()); };
+    if (row.size() == 3 && s == "---") return {Line::Rule};
+    if (is("===")) return {Line::Section};
+    if (is("|")) return {Line::Table};
+    if (!row.empty() && row[0].t == T::Fn && row[0].c == "plot") return {Line::Plot};  // the program function, not the word
+    if (std::string alt, path; is("![") && imageRef(row, alt, path)) return {Line::Image};
     if (is("- [ ] ")) return {Line::Todo, 6};
     if (is("- [x] ") || is("- [X] ")) return {Line::Done, 6};
     if (is("### ")) return {Line::H3, 4};
@@ -269,6 +430,7 @@ std::string linePrefix(Line kind, int num) {
     case Line::Quote: return "> ";
     case Line::Todo: return "- [ ] ";
     case Line::Done: return "- [x] ";
+    default: break;
     }
     return "";
 }
@@ -348,7 +510,7 @@ static Item itemFromJson(const json& j) {
         return n;
     }
     Item c = ch(str(j, "c"), j.value("m", false));
-    if (j.contains("f") && j["f"].is_number_unsigned()) c.f = uint8_t(j["f"].get<unsigned>() & 63);
+    if (j.contains("f") && j["f"].is_number_unsigned()) c.f = uint16_t(j["f"].get<unsigned>() & AllFmt);
     return c;
 }
 

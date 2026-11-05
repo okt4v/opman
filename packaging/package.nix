@@ -6,6 +6,7 @@
 let
   deps = {
     IMGUI = fetchFromGitHub { owner = "ocornut"; repo = "imgui"; rev = "v1.93.0-docking"; hash = "sha256-NCD0li4ECPSFhhU0egSWMiYNBKSJDoB80rSOUiRAQ6c="; };
+    STB = fetchFromGitHub { owner = "nothings"; repo = "stb"; rev = "003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5"; hash = "sha256-tvt5gGQjeYNaoYzKgN6dPDtfN1Ylmqae5tYGYNsoi1M="; };
     JSON = fetchzip { url = "https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz"; hash = "sha256-tOInM4YYi/cbHCWP2R0jlFzlaTN0ZVgHFMWagz9Wnvk="; };
   };
   # GLFW dlopens wayland/x11/GL

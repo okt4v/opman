@@ -33,10 +33,13 @@ struct Layout {
     const Editor* ed = nullptr;  // selection and active-slot highlight; null for previews
     ImDrawList* dl = nullptr;
     std::vector<Stop> stops;     // filled by draw calls
+    std::vector<float> tabs;     // table lines: x of each cell border, relative to the line (empty: natural widths)
+    bool tableHeader = false;    // the table line being drawn is its table's first (bold)
 
     // a top-level line: text with math runs
     Box measureLine(const Row& row);
     void drawLine(const Row& row, float x, float base);
+    std::vector<float> pipeXs(const Row& row);  // a table line's cell borders at natural width
     // a row that is all math (popup previews)
     Box measureMath(const Row& row, float size);
     void drawMath(const Row& row, float x, float base, float size, ImU32 col = 0);

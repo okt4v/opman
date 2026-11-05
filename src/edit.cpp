@@ -12,7 +12,7 @@ const std::map<std::string, unsigned> CATS = {
     {"Structure", 0x7c5cff}, {"Calculus", 0xe0539a}, {"Operator", 0x3b82f6}, {"Relation", 0x0d9488}, {"Set", 0x16a34a},
     {"Logic", 0xd97706}, {"Arrow", 0x64748b}, {"Greek", 0x9333ea}, {"Function", 0x2563eb}, {"Variable", 0x059669},
     {"Constant", 0xc2410c}, {"Result", 0x16a34a}, {"Steps", 0x0891b2}, {"Decimal", 0x65a30d}, {"Algebra", 0xdb2777},
-    {"Solve", 0xea580c}, {"Units", 0x0d9488}};
+    {"Solve", 0xea580c}, {"Units", 0x0d9488}, {"Program", 0x0f766e}};
 
 // name|keywords|symbol|latex|category  (single-character keywords like E, A are Corca-style ASCII shortcuts)
 static const char* SYMS = R"(Plus|plus add|+|+|Operator
@@ -126,6 +126,11 @@ static std::vector<Entry> buildCatalog() {
         add(v, f, named(T::Fn, v), "Function");
     }
     for (auto& [n, g] : GREEK) add(g + " " + n, n, named(T::Var, g), "Greek");
+    // program functions: blocks for a whole line, offered only for a word alone at the start of a line (see suggestions)
+    add("plot", "plot graph chart", named(T::Fn, "plot"), "Program");
+    add("table", "table grid", Item{}, "Program");
+    add("section", "section exercise", Item{}, "Program");
+    add("divider", "divider rule line hr", Item{}, "Program");
     return c;
 }
 const std::vector<Entry> CATALOG = buildCatalog();
@@ -256,6 +261,7 @@ static double nowMs() {
 
 // kind "char": consecutive letters/digits typed within a second share one undo step (undo works per word)
 void Editor::snap(const std::string& kind) {
+    changes++;
     double now = nowMs();
     bool merge = kind == "char" && lastSnapKind == "char" && now - lastSnapAt < 1000;
     lastSnapKind = kind;
@@ -303,6 +309,9 @@ std::vector<Entry> Editor::suggestions() {
     std::string w = pendingWord();
     if (w.empty()) return evalSuggestions(*this);
     auto hits = search(w);
+    // program functions only for a word alone at the start of a top-level line, so "plot" in a sentence stays text
+    bool alone = !inSlot() && cur.i == int(w.size()) && cur.i == int(cur.row->size());
+    if (!alone) std::erase_if(hits, [](auto& e) { return e.cat == "Program"; });
     // a plain text word with nothing to offer but "Variable notes" gets no popup, so Enter still makes a new line
     bool textWord = w.size() > 1 && !(*cur.row)[cur.i - 1].m;
     bool onlyVars = std::all_of(hits.begin(), hits.end(), [](auto& e) { return e.cat == "Variable" || e.cat == "Constant"; });
@@ -323,6 +332,21 @@ void Editor::applySuggestion(const Entry& e) {
     cur.row->erase(cur.row->begin() + (cur.i - n), cur.row->begin() + cur.i);
     cur.i -= n;
     usage[e.name]++;
+    if (e.cat == "Program" && e.name != "plot") {  // a whole-line block in place of the word
+        Row& line = *cur.row;
+        int sections = 1;
+        for (auto& r : doc) sections += lineStyle(r).kind == Line::Section;
+        line.clear();
+        if (e.name == "table") return tableRow(Row{ch("|", false), ch("|", false), ch("|", false)}, line);
+        for (char c : e.name == "divider" ? std::string("---") : "=== Exercise " + std::to_string(sections)) line.push_back(ch(std::string(1, c), false));
+        cur.i = int(line.size());
+        enter();  // keep writing below it
+        return;
+    }
+    if (e.name == "plot") {
+        insertNode(e.make);
+        return insertChar(" ");
+    }
     if (!e.insert) return insertNode(e.make);
     cur.row->insert(cur.row->begin() + cur.i, e.insert->begin(), e.insert->end());
     cur.i += int(e.insert->size());
@@ -406,6 +430,11 @@ void Editor::insertChar(std::string c) {
     if (c == ")" && p && (p->node->o == "(" || p->node->t == T::Sqrt) && i == int(row.size())) return exitSlot();
     if (c == "|" && p && p->node->o == "|" && i == int(row.size())) return exitSlot();
     if (mathCtx && c == "'") return insertNode(sym("′", "'"));
+    if (c == "|" && !inSlot() && lineStyle(row).kind == Line::Table) {
+        row.insert(row.begin() + i, ch("|", false));
+        cur.i++;
+        return;
+    }
     if (mathCtx && c == "|" && !(prev && prev->t == T::Ch && prev->c == "|")) return insertNode(paren("|", "|"));
     if (mathCtx && c == "/") {
         // numerator = the run of math items right before the cursor, stopping at operators and spaces
@@ -740,20 +769,39 @@ void Editor::setLine(Row& line, Line kind, int num) {
     reindex();
 }
 
-void Editor::toggleFmt(Row& row, int a, int b, uint8_t flag) {
+void Editor::toggleFmt(Row& row, int a, int b, uint16_t flag) {
     bool all = true, any = false;
     for (int j = a; j < b; j++)
         if (row[j].t == T::Ch && !row[j].m && !isSpace(row[j])) any = true, all = all && (row[j].f & flag);
     if (!any) return;
     for (int j = a; j < b; j++)
-        if (row[j].t == T::Ch && !row[j].m) row[j].f = !flag ? 0 : all ? row[j].f & ~flag : row[j].f | flag;
+        if (row[j].t == T::Ch && !row[j].m) row[j].f = !flag ? 0 : all ? row[j].f & ~flag : (row[j].f & ~fmtGroup(flag)) | flag;
+}
+
+void Editor::tableRow(const Row& from, Row& to) {
+    int cells = std::max(1, int(tableCells(from).size()));
+    to = {ch("|", false)};
+    for (int k = 0; k < cells; k++) to.insert(to.end(), {ch(" ", false), ch(" ", false), ch("|", false)});  // "|  |  |"
+    cur = {&to, 2};
+    reindex();
 }
 
 bool Editor::listEnter() {
     if (inSlot()) return false;
     Row& line = *cur.row;
     LineStyle s = lineStyle(line);
-    if (s.kind < Line::Bullet || cur.i < s.len) return false;
+    if (s.kind == Line::Table) {  // Enter at the end of a table row starts the next one; on an empty row, ends the table
+        if (std::all_of(line.begin(), line.end(), [](auto& x) { return x.t == T::Ch && (x.c == "|" || x.c == " "); })) {
+            line.clear();
+            cur.i = 0;
+            return true;
+        }
+        if (cur.i < int(line.size())) return false;
+        enter();
+        tableRow(doc[lineOf(cur.row) - 1], *cur.row);
+        return true;
+    }
+    if (!isList(s.kind) || cur.i < s.len) return false;
     if (int(line.size()) == s.len) {  // an empty item ends the list
         setLine(line, Line::Text);
         return true;

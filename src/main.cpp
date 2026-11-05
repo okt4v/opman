@@ -15,8 +15,16 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <array>
 #include <fstream>
+#include <future>
+#include <map>
+#include <unordered_map>
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_WINDOWS_UTF8
+#include <stb_image.h>
 #ifdef _WIN32
 #include <windows.h>
 #elif defined(__APPLE__)
@@ -180,6 +188,11 @@ static void onKey(GLFWwindow*, int key, int scancode, int action, int mods) {
     g_keys.push_back(k);
 }
 
+static std::vector<std::string> g_drops;  // files dropped on the window
+static void onDrop(GLFWwindow*, int n, const char** paths) {
+    for (int i = 0; i < n; i++) g_drops.push_back(paths[i]);
+}
+
 static void onChar(GLFWwindow* w, unsigned cp) {
     if (cp < 32 || cp == 127) return;
     Key k;
@@ -201,6 +214,27 @@ struct App {
     json meta = json::object();
     std::string savedJson, lastJson, message;
     std::vector<std::optional<Ghost>> ghosts;
+    std::vector<std::optional<Plot>> plots;  // per line, recomputed on edits like the ghosts
+    struct Tex {
+        ImTextureID id = 0;
+        int w = 0, h = 0;
+    };
+    std::map<std::string, Tex> texs;  // ponytail: images are loaded once and kept for the session
+    struct LineCache {
+        std::optional<Ghost> ghost;
+        std::optional<Plot> plot;
+    };
+    std::unordered_map<size_t, LineCache> lineCache;  // by (section content, line): an edit recomputes only its section
+    std::map<int, std::array<double, 4>> views;       // panned/zoomed plots by line: x0 x1 y0 y1 (ponytail: by index)
+    std::map<int, Plot> viewPlots;
+    std::future<int> pdfJob;                          // pdflatex in the background
+    fs::path pdfOut, pdfTmp;
+    std::vector<std::string> history;                 // notes opened before, for Ctrl-o
+    bool goingBack = false;
+    mutable std::map<std::string, std::pair<fs::file_time_type, std::string>> texts;  // lowercase text per note
+    std::vector<FileInfo> backlinks;                  // notes with a [[link]] to the open one
+    double sliderV0 = 0;
+    float sliderX0 = 0;
     double changedAt = -1;
     bool sidebar = true, sideFocus = false, focusFilter = false, dark = true, quit = false, noSave = false;
     bool scrollToCaret = true, dragging = false;
@@ -241,13 +275,36 @@ struct App {
         std::vector<FileInfo> out;
         std::string q = lower(filter);
         for (auto& f : files)
-            if (lower(titleOf(f.meta)).find(q) != std::string::npos) out.push_back(f);
+            if (lower(titleOf(f.meta)).find(q) != std::string::npos || (!q.empty() && noteText(f.name).find(q) != std::string::npos))
+                out.push_back(f);
         std::stable_sort(out.begin(), out.end(), [&](auto& a, auto& b) {
             if (sort == 2) return lower(titleOf(a.meta)) < lower(titleOf(b.meta));
             const char* k = sort == 1 ? "created" : "edited";
             return str(a.meta, k) > str(b.meta, k);
         });
         return out;
+    }
+
+    // a note's plain text, lowercase, read again when the file changes (search, backlinks)
+    const std::string& noteText(const std::string& name) const {
+        std::error_code ec;
+        auto t = fs::last_write_time(dir / name, ec);
+        auto& e = texts[name];
+        if (e.first != t || e.second.empty()) {
+            json d;
+            std::string s;
+            if (readFile(dir / name, d) && d.is_object())
+                for (auto& r : docFromJson(d.value("doc", json::array()))) s += plain(r) + "\n";
+            e = {t, lower(s)};
+        }
+        return e.second;
+    }
+
+    void findBacklinks() {
+        backlinks.clear();
+        std::string want = "[[" + lower(titleOf(meta)) + "]]";
+        for (auto& f : files)
+            if (f.name != current && noteText(f.name).find(want) != std::string::npos) backlinks.push_back(f);
     }
 
     json stats() {
@@ -289,6 +346,10 @@ struct App {
 
     void openDoc(const std::string& name) {
         saveNow();
+        if (!current.empty() && current != name && !goingBack) {
+            history.push_back(current);
+            if (history.size() > 50) history.erase(history.begin());
+        }
         json d;
         if (!readFile(dir / name, d) || !d.is_object()) {
             message = "Could not read " + name;
@@ -303,7 +364,9 @@ struct App {
         cfg["lastDoc"] = name;
         saveCfg();
         vi.mode = Mode::Normal;
+        views.clear();
         changed(true);
+        findBacklinks();
     }
 
     void newDoc(const std::string& title = "") {
@@ -359,10 +422,38 @@ struct App {
             else meta["title"] = arg;
             savedJson.clear();
             saveNow();
+            findBacklinks();
         } else if (name == "trash") { if (!current.empty()) trash(current); }
         else if (name == "set") {
             if (arg == "dark" || arg == "light") { dark = arg == "dark"; saveCfg(); }
             else message = "Unknown option: " + arg + " (dark, light)";
+        } else if (name == "export") exportTo(arg);
+        else if (name == "image") addImage(arg);
+        else if (name == "rule") insertLines({"---"}, 0);
+        else if (name == "section") {  // :section [title]; the default numbers the exercises
+            int n = 1;
+            for (auto& r : ed.doc) n += lineStyle(r).kind == Line::Section;
+            insertLines({"=== " + (arg.empty() ? "Exercise " + std::to_string(n) : arg), ""}, 0);
+            ed.cur = {&ed.doc[ed.lineOf(ed.cur.row) + 1], 0};  // ready to write the exercise; k edits the title
+        } else if (name == "link") {  // [[title]]: open the note with that title, or start it
+            for (auto& f : files)
+                if (lower(titleOf(f.meta)) == lower(arg)) return openDoc(f.name);
+            newDoc(arg);
+            message = "New note \"" + arg + "\" (Ctrl-o goes back)";
+        } else if (name == "back") {
+            if (history.empty()) { message = "No earlier note"; return; }
+            std::string to = history.back();
+            history.pop_back();
+            goingBack = true;
+            openDoc(to);
+            goingBack = false;
+        }
+        else if (name == "table") {  // :table [rows] [cols]
+            int r = 3, c = 2;
+            std::sscanf(arg.c_str(), "%d %d", &r, &c);
+            std::string line = "|";
+            for (int k = 0; k < std::clamp(c, 1, 20); k++) line += "  |";
+            insertLines(std::vector<std::string>(std::clamp(r, 1, 100), line), 2);
         } else if (name == "e") {
             std::string q = lower(arg);
             for (auto& f : sortedFiles())
@@ -371,13 +462,130 @@ struct App {
         }
     }
 
+    // new text lines below the cursor's line; the cursor goes to item `at` of the first
+    void insertLines(const std::vector<std::string>& lines, int at) {
+        ed.snap();
+        int k = ed.lineOf(ed.topOf(ed.cur.row)) + 1;
+        if (ed.doc[k - 1].empty()) ed.doc.erase(ed.doc.begin() + --k);  // replace an empty line
+        for (size_t n = 0; n < lines.size(); n++) {
+            Row r;
+            for (auto& c : Vi::parse(lines[n])) r.push_back(ch(c.ch, false));
+            ed.doc.insert(ed.doc.begin() + k + n, r);
+        }
+        ed.cur = {&ed.doc[k], std::min(at, int(ed.doc[k].size()))};
+        ed.reindex();
+        changed();
+    }
+
+    // an image file: copied into the documents folder's media/, so notes stay self-contained
+    void addImage(std::string src) {
+        if (src.starts_with("~/")) src = (home() / src.substr(2)).string();
+        std::string ext = lower(fs::path(src).extension().string());
+        if (ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".gif" && ext != ".bmp") {
+            message = "Not an image (png, jpg, gif, bmp): " + src;
+            return;
+        }
+        std::error_code ec;
+        fs::create_directories(dir / "media", ec);
+        std::string stem = fs::path(src).stem().string();
+        for (auto& c : stem) if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') c = '-';  // LaTeX-safe file names
+        fs::path to = dir / "media" / (stem + ext);
+        for (int n = 2; fs::exists(to) && !fs::equivalent(src, to, ec); n++) to = dir / "media" / (stem + "-" + std::to_string(n) + ext);
+        if (!fs::exists(to)) fs::copy_file(src, to, ec);
+        if (ec) { message = "Could not copy " + src + ": " + ec.message(); return; }
+        insertLines({"![](media/" + to.filename().string() + ")"}, 2);
+    }
+
+    // :export [file.md|file.tex|file.pdf|md|tex|pdf]; PDF goes through pdflatex
+    void exportTo(std::string arg) {
+        std::string t = titleOf(meta);
+        for (auto& c : t) if (std::strchr("/\\:*?\"<>| ", c)) c = '-';
+        if (arg.empty()) arg = "md";
+        if (arg == "md" || arg == "tex" || arg == "pdf" || arg == "html") arg = (home() / (t + "." + arg)).string();
+        fs::path out = arg.starts_with("~/") ? home() / arg.substr(2) : fs::path(arg);
+        std::string ext = lower(out.extension().string());
+        if (ext != ".tex" && ext != ".pdf") {
+            std::ofstream f(out, std::ios::binary);
+            bool ok = ext == ".html" || ext == ".htm" ? bool(f << html(ed, dir, titleOf(meta))) : bool(f << markdown(ed.doc, dir));
+            message = ok ? "Exported to " + out.string() : "Could not write " + out.string();
+            return;
+        }
+        if (pdfJob.valid()) { message = "A PDF export is still running"; return; }
+        std::string tex = latex(ed, dir);
+        fs::path file = out;
+        std::error_code ec;
+        fs::path tmp = fs::temp_directory_path(ec) / "opman-export";
+        if (ext == ".pdf") fs::create_directories(tmp, ec), file = tmp / "note.tex";
+        if (!(std::ofstream(file, std::ios::binary) << tex)) { message = "Could not write " + file.string(); return; }
+        if (ext == ".tex") { message = "Exported to " + out.string(); return; }
+        fs::remove(tmp / "note.pdf", ec);
+        std::string q = "\"", cmd = "pdflatex -interaction=nonstopmode -halt-on-error -output-directory " + q + tmp.string() + q + " " + q +
+                                    file.string() + q + " > " + q + (tmp / "out.txt").string() + q + " 2>&1";
+#ifdef _WIN32
+        cmd = "\"" + cmd + "\"";  // cmd.exe strips the outer quotes
+#endif
+        pdfOut = out, pdfTmp = tmp;
+        pdfJob = std::async(std::launch::async, [cmd] { return std::system(cmd.c_str()); });
+        message = "Exporting PDF…";
+    }
+
+    void pdfDone() {  // polled each frame; the PDF's existence is the result
+        if (!pdfJob.valid() || pdfJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        pdfJob.get();
+        std::error_code ec;
+        if (!fs::exists(pdfTmp / "note.pdf")) { message = "pdflatex failed, see " + (pdfTmp / "note.log").string(); return; }
+        fs::copy_file(pdfTmp / "note.pdf", pdfOut, fs::copy_options::overwrite_existing, ec);
+        message = ec ? "Could not write " + pdfOut.string() : "Exported to " + pdfOut.string();
+    }
+
+    Tex& texture(const std::string& path) {
+        auto [it, fresh] = texs.try_emplace(path);
+        if (!fresh) return it->second;
+        int w, h, n;
+        fs::path p = fs::path(path).is_relative() ? dir / path : fs::path(path);
+        if (unsigned char* px = stbi_load(p.string().c_str(), &w, &h, &n, 4)) {
+            GLuint t;
+            glGenTextures(1, &t);
+            glBindTexture(GL_TEXTURE_2D, t);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            stbi_image_free(px);
+            it->second = {ImTextureID(intptr_t(t)), w, h};
+        }
+        return it->second;
+    }
+
     // after any edit or cursor move: live results, autosave timer, keep the caret in view
     void changed(bool force = false) {
         std::string j = docJson(ed.doc).dump();
         if (force || j != lastJson) {
             lastJson = j;
-            ghosts.clear();
-            for (auto& r : ed.doc) ghosts.push_back(ghost(ed, r));  // ponytail: every line on every edit; cache per line if docs get long
+            int n = int(ed.doc.size());
+            ghosts.assign(n, std::nullopt);
+            plots.assign(n, std::nullopt);
+            viewPlots.clear();
+            std::unordered_map<size_t, LineCache> next;
+            for (int a = 0; a < n;) {  // results only depend on their section, so a key per section and line
+                int b = sectionOf(ed.doc, a).second;
+                std::string sec;
+                for (int k = a; k < b; k++) sec += toJson(ed.doc[k]).dump() + "\n";
+                size_t h = std::hash<std::string>{}(sec);
+                for (int k = a; k < b; k++) {
+                    size_t key = h ^ (size_t(k - a + 1) * 0x9e3779b97f4a7c15ull);
+                    auto f = lineCache.find(key);
+                    LineCache c;
+                    if (f != lineCache.end()) c = std::move(f->second);
+                    else if (lineStyle(ed.doc[k]).kind == Line::Plot) c.plot = plot(ed, ed.doc[k]);
+                    else c.ghost = ghost(ed, ed.doc[k]);
+                    ghosts[k] = c.ghost;
+                    plots[k] = c.plot;
+                    next[key] = std::move(c);
+                }
+                a = b;
+            }
+            lineCache = std::move(next);
             vi.refresh(ed);
         }
         if (j != savedJson && changedAt < 0) changedAt = nowSec();
@@ -400,6 +608,7 @@ struct App {
     }
 
     void input() {
+        for (auto& d : std::exchange(g_drops, {})) run("image " + d);
         if (g_keys.empty()) return;
         auto keys = std::move(g_keys);
         g_keys.clear();
@@ -463,6 +672,187 @@ struct App {
         return {const_cast<Row*>(best->row), best->i};
     }
 
+    // column stops for the table starting at line k: each column as wide as its widest cell
+    void tableTabs(size_t k) {
+        std::vector<float> width;
+        for (size_t j = k; j < ed.doc.size() && lineStyle(ed.doc[j]).kind == Line::Table; j++) {
+            auto xs = L.pipeXs(ed.doc[j]);
+            for (size_t c = 0; c + 1 < xs.size(); c++) {
+                if (width.size() <= c) width.push_back(0);
+                width[c] = std::max(width[c], xs[c + 1] - xs[c]);
+            }
+        }
+        L.tabs = {0};
+        for (float w : width) L.tabs.push_back(L.tabs.back() + std::max(w, 2.5f * L.textSize));
+    }
+
+    // returns the height; draw=false only measures
+    float drawImage(const Row& row, float x, float y, float maxW, bool draw) {
+        std::string alt, path;
+        imageRef(row, alt, path);
+        Tex& t = texture(path);
+        const Palette& p = pal();
+        if (!t.id) {
+            if (draw) L.drawText("Image not found: " + path, x, y + L.textSize, L.textSize * 0.85f, p.muted, ui);
+            return L.textSize * 1.4f;
+        }
+        float s = std::min({1.f, maxW / t.w, 420.f / t.h});
+        float h = t.h * s, capH = alt.empty() ? 0 : L.textSize * 1.4f;
+        if (draw) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddImageRounded(t.id, {x, y}, {x + t.w * s, y + h}, {0, 0}, {1, 1}, IM_COL32_WHITE, 6);
+            if (!alt.empty()) L.drawText(alt, x, y + h + L.textSize * 1.1f, L.textSize * 0.82f, p.muted, ui);
+        }
+        return h + capH;
+    }
+
+    // "a = 2" (a name, =, a number): a drag handle after the line; dragging rewrites the number, and every result and
+    // plot using a follows. Returns whether the doc changed.
+    bool slider(Row& row, float x, float base, int k) {
+        std::vector<int> v;
+        for (int j = 0; j < int(row.size()); j++)
+            if (!isSpace(row[j])) v.push_back(j);
+        if (v.size() < 3 || !(row[v[0]].t == T::Var || (row[v[0]].t == T::Ch && row[v[0]].m && isLetter(row[v[0]].c))) ||
+            row[v[1]].t != T::Ch || row[v[1]].c != "=")
+            return false;
+        std::string num;
+        for (size_t j = 2; j < v.size(); j++) {
+            const Item& it = row[v[j]];
+            if (it.t != T::Ch || !(isDigit(it.c) || it.c == "." || ((it.c == "-" || it.c == "−") && j == 2))) return false;
+            num += it.c == "−" ? "-" : it.c;
+        }
+        double val;
+        try { val = std::stod(num); } catch (...) { return false; }
+        const Palette& p = pal();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float w = 110, cy = base - L.textSize * 0.3f;
+        ImGui::SetCursorScreenPos({x, cy - 10});
+        ImGui::PushID(k);
+        ImGui::InvisibleButton("slider", {w, 20});
+        ImGui::PopID();
+        bool active = ImGui::IsItemActive(), hov = ImGui::IsItemHovered();
+        if (hov || active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (hov && !active) ImGui::SetTooltip("Drag to change %s", plain(Row{row[v[0]]}).c_str());
+        if (ImGui::IsItemActivated()) ed.snap(), sliderV0 = val, sliderX0 = ImGui::GetMousePos().x;
+        float knob = x + w / 2;
+        bool changedNum = false;
+        if (active) {
+            // ponytail: half the track is the value's own size; integers step by whole numbers
+            double r = std::max(std::fabs(sliderV0), 1.0), dx = ImGui::GetMousePos().x - sliderX0;
+            bool integer = num.find('.') == std::string::npos;
+            double step = integer ? std::max(1.0, std::pow(10, std::floor(std::log10(r)) - 1)) : std::pow(10, std::floor(std::log10(r)) - 2);
+            double nv = std::round((sliderV0 + dx / (w / 2) * r) / step) * step;
+            knob = std::clamp(x + w / 2 + float(dx), x, x + w);
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "%.*f", std::max(0, int(-std::floor(std::log10(step) + 1e-9))), nv);
+            std::string s = buf;
+            if (s != num) {
+                row.erase(row.begin() + v[1] + 1, row.end());
+                row.push_back(M(" "));
+                for (char c : s) row.push_back(M(c == '-' ? "−" : std::string(1, c)));
+                if (ed.cur.row == &row) ed.cur.i = std::min(ed.cur.i, int(row.size()));
+                changedNum = true;
+            }
+        }
+        ImU32 c = active || hov ? p.fn : alpha(p.muted, 0.6f);
+        dl->AddLine({x, cy}, {x + w, cy}, alpha(c, 0.5f), 2);
+        for (int t = 0; t <= 4; t++) dl->AddLine({x + w * t / 4, cy - 3}, {x + w * t / 4, cy + 3}, alpha(c, 0.5f), 1);
+        dl->AddCircleFilled({knob, cy}, active ? 7.f : 5.5f, c);
+        return changedNum;
+    }
+
+    static double niceStep(double span) {
+        double raw = span / 6, mag = std::pow(10, std::floor(std::log10(raw))), f = raw / mag;
+        return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * mag;
+    }
+
+    // drag pans, the wheel zooms around the mouse, a double-click goes back to the line's own ranges
+    float drawPlot(const Plot& pl, float x, float y, float w, int k) {
+        const Palette& p = pal();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float h = std::min(320.f, w * 0.55f), padL = 44, padB = 22, padT = 8, padR = 10;
+        ImVec2 a{x + padL, y + padT}, b{x + w - padR, y + h - padB};
+        ImGui::SetCursorScreenPos(a);
+        ImGui::PushID(k);
+        ImGui::InvisibleButton("plot", {b.x - a.x, b.y - a.y});
+        ImGui::PopID();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);  // the wheel zooms the plot, not the page
+            std::array<double, 4> v{pl.x0, pl.x1, pl.y0, pl.y1};
+            ImGuiIO& io = ImGui::GetIO();
+            bool moved = false;
+            if (io.MouseWheel != 0) {
+                double f = std::pow(0.85, io.MouseWheel);
+                double mx = pl.x0 + (io.MousePos.x - a.x) / (b.x - a.x) * (pl.x1 - pl.x0);
+                double my = pl.y0 + (b.y - io.MousePos.y) / (b.y - a.y) * (pl.y1 - pl.y0);
+                v = {mx + (v[0] - mx) * f, mx + (v[1] - mx) * f, my + (v[2] - my) * f, my + (v[3] - my) * f};
+                moved = true;
+            }
+            if (ImGui::IsItemActive() && (io.MouseDelta.x || io.MouseDelta.y)) {
+                double dx = io.MouseDelta.x / (b.x - a.x) * (pl.x1 - pl.x0), dy = io.MouseDelta.y / (b.y - a.y) * (pl.y1 - pl.y0);
+                v = {v[0] - dx, v[1] - dx, v[2] + dy, v[3] + dy};
+                moved = true;
+            }
+            if (ImGui::IsMouseDoubleClicked(0)) views.erase(k), viewPlots.erase(k);
+            else if (moved) views[k] = v, viewPlots[k] = plot(ed, ed.doc[k], v.data());
+            if (!ImGui::IsItemActive()) ImGui::SetTooltip("Drag to pan · wheel to zoom · double-click to reset");
+        }
+        dl->AddRectFilled({x, y}, {x + w, y + h}, p.side, 8);
+        auto X = [&](double v) { return float(a.x + (v - pl.x0) / (pl.x1 - pl.x0) * (b.x - a.x)); };
+        auto Y = [&](double v) { return float(b.y - (v - pl.y0) / (pl.y1 - pl.y0) * (b.y - a.y)); };
+        auto label = [](double v) {
+            char s[32];
+            std::snprintf(s, sizeof s, "%g", std::fabs(v) < 1e-12 ? 0.0 : v);
+            return std::string(s);
+        };
+        float fs = 12;
+        double sx = niceStep(pl.x1 - pl.x0), sy = niceStep(pl.y1 - pl.y0);
+        for (double t = std::ceil(pl.x0 / sx) * sx; t <= pl.x1 + 1e-9; t += sx) {
+            dl->AddLine({X(t), a.y}, {X(t), b.y}, alpha(p.line, 0.7f));
+            std::string s = label(t);
+            L.drawText(s, X(t) - L.textWidth(s, fs) / 2, b.y + 15, fs, p.muted, ui);
+        }
+        for (double t = std::ceil(pl.y0 / sy) * sy; t <= pl.y1 + 1e-9; t += sy) {
+            dl->AddLine({a.x, Y(t)}, {b.x, Y(t)}, alpha(p.line, 0.7f));
+            std::string s = label(t);
+            L.drawText(s, a.x - L.textWidth(s, fs) - 6, Y(t) + 4, fs, p.muted, ui);
+        }
+        if (pl.x0 < 0 && pl.x1 > 0) dl->AddLine({X(0), a.y}, {X(0), b.y}, p.muted, 1.2f);
+        if (pl.y0 < 0 && pl.y1 > 0) dl->AddLine({a.x, Y(0)}, {b.x, Y(0)}, p.muted, 1.2f);
+        static const ImU32 COLS[] = {IM_COL32(0x3b, 0x82, 0xf6, 255), IM_COL32(0xe5, 0x48, 0x4d, 255), IM_COL32(0x2f, 0x9e, 0x5b, 255),
+                                     IM_COL32(0xf5, 0x9e, 0x0b, 255), IM_COL32(0x8b, 0x5c, 0xf6, 255), IM_COL32(0x14, 0xb8, 0xa6, 255)};
+        dl->PushClipRect(a, b, true);
+        double span = pl.y1 - pl.y0;
+        for (size_t s = 0; s < pl.series.size(); s++) {
+            std::vector<ImVec2> seg;
+            auto flush = [&] {
+                if (seg.size() > 1) dl->AddPolyline(seg.data(), int(seg.size()), COLS[s % 6], 0, 2.2f);
+                seg.clear();
+            };
+            if (pl.series[s].points) {  // table data
+                for (auto& [px, py] : pl.series[s].pts)
+                    if (!std::isnan(py)) dl->AddCircleFilled({X(px), Y(py)}, 4.5f, COLS[s % 6]);
+                continue;
+            }
+            double prev = NAN;
+            for (auto& [px, py] : pl.series[s].pts) {
+                // ponytail: a jump over 3 view heights between samples is an asymptote, not a steep line
+                if (std::isnan(py) || (!std::isnan(prev) && std::fabs(py - prev) > 3 * span)) flush();
+                if (!std::isnan(py)) seg.push_back({X(px), Y(std::clamp(py, pl.y0 - 2 * span, pl.y1 + 2 * span))});
+                prev = py;
+            }
+            flush();
+        }
+        dl->PopClipRect();
+        float ly = a.y + 6;  // legend
+        for (size_t s = 0; s < pl.series.size(); s++, ly += 18) {
+            dl->AddRectFilled({a.x + 8, ly + 5}, {a.x + 22, ly + 8}, COLS[s % 6], 1);
+            L.drawText(pl.series[s].label, a.x + 28, ly + 11, 13, p.fg, ui);
+        }
+        if (!pl.error.empty()) L.drawText(pl.error, a.x + 8, b.y - 8, 13, IM_COL32(0xe5, 0x48, 0x4d, 255), ui);
+        return h;
+    }
+
     void drawDoc() {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -473,22 +863,78 @@ struct App {
         L.stops.clear();
         auto vl = vi.visualLines(ed);
         const Palette& p = pal();
+        float blockW = colW - 64;
+        bool slid = false;  // a slider changed the doc during this frame
         for (size_t k = 0; k < ed.doc.size(); k++) {
             const Row& row = ed.doc[k];
-            Box b = L.measureLine(row);
             Line kind = lineStyle(row).kind;
+            bool here = ed.topOf(ed.cur.row) == &row, first = k == 0 || lineStyle(ed.doc[k - 1]).kind != kind;
+            if (kind == Line::Table && first) tableTabs(k);
+            if (kind != Line::Table) L.tabs.clear();
+            L.tableHeader = kind == Line::Table && first;
+            // a divider or picture shows its source only while the cursor is on it; a stop keeps it clickable
+            if ((kind == Line::Rule || kind == Line::Image || kind == Line::Section) && !here) {
+                float h = kind == Line::Rule ? L.textSize * 1.4f : kind == Line::Section ? L.textSize * 3.2f
+                        : drawImage(row, x0, y + 6, blockW, false) + 12;
+                if (kind == Line::Rule) dl->AddLine({x0, y + h / 2}, {x0 + blockW, y + h / 2}, p.line, 1.5f);
+                else if (kind == Line::Section) {  // a banner: the title over a heavy rule; its own variables below
+                    float by = y + h - L.textSize * 0.7f;
+                    std::string t = sectionTitle(row);
+                    L.drawText("§", x0 - 22, by - 8, L.textSize, p.muted, bold);
+                    L.drawText(t.empty() ? "Section" : t, x0, by - 8, L.textSize * 1.1f, p.fg, bold);
+                    dl->AddRectFilled({x0, by}, {x0 + blockW, by + 2.5f}, p.fg, 1);
+                } else drawImage(row, x0, y + 6, blockW, true);
+                L.stops.push_back({&row, 0, x0, y, y + h});
+                y += h;
+                continue;
+            }
+            Box b = L.measureLine(row);
             y += L.textSize * (k == 0 ? 0 : kind == Line::H1 ? 0.9f : kind == Line::H2 ? 0.6f : kind == Line::H3 ? 0.35f : 0);
             float h = std::max(L.textSize * 1.7f, b.asc + b.desc + 10);
             float base = std::round(y + (h - b.asc - b.desc) / 2 + b.asc);
             if (vl && int(k) >= vl->first && int(k) <= vl->second) dl->AddRectFilled({x0 - 6, y}, {x0 + colW - 58, y + h}, p.sel);
+            if (kind == Line::Table) {  // grid: borders at the column stops, a rule under the header
+                bool last = k + 1 == ed.doc.size() || lineStyle(ed.doc[k + 1]).kind != Line::Table;
+                float bx = x0 + 0.45f * L.textSize;  // the middle of a border's padding
+                for (float t : L.tabs) dl->AddLine({bx + t, y}, {bx + t, y + h}, p.line, 1.2f);
+                float r = bx + (L.tabs.empty() ? 0 : L.tabs.back());
+                if (first) dl->AddRectFilled({bx, y}, {r, y + h}, alpha(p.line, 0.35f));
+                dl->AddLine({bx, y}, {r, y}, p.line, first ? 1.2f : 1);
+                if (first) dl->AddLine({bx, y + h}, {r, y + h}, p.muted, 1.2f);
+                if (last) dl->AddLine({bx, y + h}, {r, y + h}, p.line, 1.2f);
+            }
             L.drawLine(row, x0, base);
+            if (kind == Line::Image) h += drawImage(row, x0, y + h, blockW, true) + 8;
+            if (kind == Line::Plot && k < plots.size() && plots[k]) {
+                if (views.count(int(k)) && !viewPlots.count(int(k))) viewPlots[int(k)] = plot(ed, row, views[int(k)].data());
+                h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], x0, y + h, blockW, int(k)) + 12;
+            }
             float w = b.w;
             if (k < ghosts.size() && ghosts[k]) {
                 L.drawText(ghosts[k]->text, x0 + b.w + 0.5f * L.textSize, base, L.textSize * 0.9f, alpha(p.muted, 0.85f));
                 w += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
             }
+            if (kind == Line::Text) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
             maxW = std::max(maxW, w);
             y += h;
+        }
+        if (slid) {
+            ed.reindex();
+            changed();
+            scrollToCaret = false;  // dragging a slider shouldn't scroll back to the cursor
+        }
+        // search matches: everything the pattern hits, as you type it after "/"
+        if (std::string pat = vi.highlight(); !pat.empty()) {
+            std::unordered_map<const Row*, std::vector<const Stop*>> at;
+            for (auto& s : L.stops) at[s.row].push_back(&s);
+            for (auto& m : Vi::matches(ed, pat)) {
+                const Stop *a = nullptr, *b = nullptr;
+                for (auto* s : at[&ed.doc[m.line]]) {
+                    if (s->i == m.a) a = s;
+                    if (s->i == m.b) b = s;
+                }
+                if (a && b) dl->AddRectFilled({a->x, a->y0}, {b->x, a->y1}, IM_COL32(250, 204, 21, 80), 3);
+            }
         }
         // caret: a bar in Insert, a block over the item under the cursor otherwise
         caretPos = {-1, -1};
@@ -512,11 +958,15 @@ struct App {
             }
             break;
         }
+        ImGui::SetCursorScreenPos(origin);  // sliders and plots placed widgets; size the scroll area from the top
         ImGui::Dummy({std::max(maxW + 64, colW), y - origin.y + ImGui::GetWindowHeight() * 0.4f});
-        // mouse: click places the cursor, drag selects
-        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) {
+        // mouse: click places the cursor (Ctrl-click follows a [[link]]), drag selects
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
             sideFocus = false;
             vi.mouse(ed, hit(ImGui::GetMousePos()), false);
+            if (ImGui::GetIO().KeyCtrl && !ed.inSlot())
+                for (auto sp : linkSpans(*ed.cur.row))
+                    if (ed.cur.i >= sp.first && ed.cur.i < sp.second) return run("link " + linkTitle(*ed.cur.row, sp));
             Line kind = lineStyle(*ed.cur.row).kind;  // a click on a checkbox ticks it
             if ((kind == Line::Todo || kind == Line::Done) && ed.topOf(ed.cur.row) == ed.cur.row &&
                 ImGui::GetMousePos().x < x0 + 1.3f * L.textSize && ImGui::GetMousePos().x > x0)
@@ -575,7 +1025,8 @@ struct App {
             L.drawText(e.name, t1.x + 10, base, 14, p.fg, ui);
             std::string catText = lower(e.cat);
             for (auto& ch : catText) ch = char(std::toupper((unsigned char)ch));
-            std::string kbd = sel ? (e.insert ? "Tab" : "Enter") : j < 9 ? "Ctrl " + std::to_string(j + 1) : "";
+            bool tab = e.insert || e.cat == "Program", takes = sel && (tab || vi.enterPicks(ed));  // a text word needs ↓ first
+            std::string kbd = takes ? (tab ? "Tab" : "Enter") : j < 9 ? "Ctrl " + std::to_string(j + 1) : "";
             float kw = L.textWidth(kbd, 11), cw = L.textWidth(catText, 11);
             L.drawText(kbd, a.x + w - kw - 8, base - 1, 11, p.muted, ui);
             L.drawText(catText, a.x + w - kw - cw - 22, base - 1, 11, cc, bold);
@@ -609,7 +1060,7 @@ struct App {
         if (ImGui::Combo("##sort", &sort, "Last edited\0Created\0Name\0")) saveCfg();
         auto list = sortedFiles();
         sideSel = std::clamp(sideSel, 0, std::max(0, int(list.size()) - 1));
-        float metaH = 96;
+        float metaH = 96 + (backlinks.empty() ? 0 : 22 + 20 * std::min<size_t>(backlinks.size(), 4));
         ImGui::SetCursorPosX(6);
         ImGui::BeginChild("files", {ImGui::GetWindowWidth() - 12, -metaH});
         ImDrawList* dl = L.dl = ImGui::GetWindowDrawList();
@@ -630,7 +1081,17 @@ struct App {
             if (sideFocus && int(j) == sideSel) dl->AddRect(a, {a.x + w, a.y + 40}, IM_COL32(0x25, 0x63, 0xeb, 255), 6, 0, 1.5f);
             dl->PushClipRect(a, {a.x + w - 4, a.y + 40}, true);
             L.drawText(titleOf(f.meta), a.x + 10, a.y + 18, 14, p.fg, bold);
-            L.drawText(ago(str(f.meta, "edited")), a.x + 10, a.y + 34, 12, p.muted, ui);
+            std::string q = lower(filter), sub = ago(str(f.meta, "edited"));
+            if (!q.empty() && lower(titleOf(f.meta)).find(q) == std::string::npos) {  // matched in the text: show where
+                const std::string& t = noteText(f.name);
+                size_t at = t.find(q), s0 = at > 20 ? at - 20 : 0;
+                while (s0 > 0 && (t[s0] & 0xC0) == 0x80) s0--;
+                size_t s1 = std::min(t.size(), at + q.size() + 40);
+                while (s1 < t.size() && (t[s1] & 0xC0) == 0x80) s1++;
+                sub = (s0 ? "…" : "") + t.substr(s0, s1 - s0);
+                std::replace(sub.begin(), sub.end(), '\n', ' ');
+            }
+            L.drawText(sub, a.x + 10, a.y + 34, 12, p.muted, ui);
             dl->PopClipRect();
             if (hov) ImGui::SetTooltip("%s\n%s", titleOf(f.meta).c_str(), f.name.c_str());
         }
@@ -650,13 +1111,20 @@ struct App {
             for (auto& x : meta["defines"]) d += (d.empty() ? "" : ", ") + (x.is_string() ? x.get<std::string>() : "");
             ImGui::TextDisabled("Defines %s", d.c_str());
         }
+        std::string open;  // opened after the font/indent pops
+        if (!backlinks.empty()) {
+            ImGui::TextDisabled("Linked from");
+            for (size_t j = 0; j < backlinks.size() && j < 4; j++)
+                if (ImGui::SmallButton((titleOf(backlinks[j].meta) + "##bl" + std::to_string(j)).c_str())) open = backlinks[j].name;
+        }
         ImGui::Unindent(12);
         ImGui::PopFont();
         ImGui::PopFont();
+        if (!open.empty()) openDoc(open);
     }
 
     // formatting at the cursor, for the toolbar's pressed state
-    uint8_t fmtHere() const {
+    uint16_t fmtHere() const {
         if (vi.mode == Mode::Insert && !ed.range) return ed.style;
         const Row& r = ed.range ? *ed.range->row : *ed.cur.row;
         int i = ed.range ? std::min(ed.range->a, ed.range->b) : ed.cur.i;
@@ -669,7 +1137,7 @@ struct App {
         ImVec2 o = ImGui::GetCursorScreenPos();
         float W = ImGui::GetContentRegionAvail().x, x = o.x + 8, cy = o.y + h / 2;
         dl->AddLine({o.x, o.y + h - 1}, {o.x + W, o.y + h - 1}, p.line);
-        uint8_t f = fmtHere();
+        uint16_t f = fmtHere();
         Line kind = lineStyle(*ed.topOf(ed.cur.row)).kind;
         bool act = false;
         auto btn = [&](const char* id, const char* tip, bool on, auto icon, float w = 30) {
@@ -725,6 +1193,26 @@ struct App {
                 text("A", bold, 14)(c, col);
             }))
             vi.format(ed, Mark);
+        if (btn("sup", "Superscript text  (Space ^)", f & Sup, [&](ImVec2 c, ImU32 col) {
+                L.drawText("x", c.x - 7, c.y + 6, 15, col, ui);
+                L.drawText("2", c.x + 1, c.y - 1, 10, col, ui);
+            }))
+            vi.format(ed, Sup);
+        if (btn("sub", "Subscript text  (Space _)", f & Sub, [&](ImVec2 c, ImU32 col) {
+                L.drawText("x", c.x - 7, c.y + 3, 15, col, ui);
+                L.drawText("2", c.x + 1, c.y + 8, 10, col, ui);
+            }))
+            vi.format(ed, Sub);
+        {  // colour: cycles red, green, blue, none
+            uint16_t now = f & Colors, next = now == 0 ? Red : now == Red ? Green : now == Green ? Blue : 0;
+            ImU32 sw = now == Red ? IM_COL32(0xe5, 0x48, 0x4d, 255) : now == Green ? IM_COL32(0x2f, 0x9e, 0x5b, 255)
+                     : now == Blue ? IM_COL32(0x3b, 0x82, 0xf6, 255) : p.muted;
+            if (btn("col", "Text colour: red, green, blue, none  (Space R · G · B)", now, [&](ImVec2 c, ImU32 col) {
+                    text("A", bold, 15)(ImVec2{c.x, c.y - 2}, col);
+                    dl->AddRectFilled({c.x - 8, c.y + 6}, {c.x + 8, c.y + 9}, sw, 1);
+                }))
+                vi.format(ed, next ? next : now);
+        }
         if (btn("r", "Clear formatting  (Space r)", false, [&](ImVec2 c, ImU32 col) {
                 text("T", ui, 16)(c, col);
                 dl->AddLine({c.x - 7, c.y + 7}, {c.x + 7, c.y - 7}, col, 1.5f);
@@ -759,6 +1247,41 @@ struct App {
                 }))
             vi.setLine(ed, Line::Todo);
         sep();
+        if (btn("tbl", "Table  (Space | · :table rows cols · | separates cells)", kind == Line::Table, [&](ImVec2 c, ImU32 col) {
+                dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 2, 0, 1.5f);
+                dl->AddLine({c.x - 8, c.y - 2}, {c.x + 8, c.y - 2}, col, 1.5f);
+                dl->AddLine({c.x, c.y - 7}, {c.x, c.y + 7}, col, 1.5f);
+            }))
+            run("table 3 2");
+        if (btn("sec", "New section: its own variables, for the next exercise  (Space = · :section [title] · type ===)",
+                kind == Line::Section, text("§", bold, 17)))
+            run("section");
+        if (btn("hr", "Divider  (Space / · type ---)", kind == Line::Rule, [&](ImVec2 c, ImU32 col) {
+                dl->AddLine({c.x - 8, c.y}, {c.x + 8, c.y}, col, 2);
+            }))
+            run("rule");
+        if (btn("plot", "Plot  (type plot at the start of a line, Tab, then: sin(x), x^2, −3 < x < 3)", kind == Line::Plot, [&](ImVec2 c, ImU32 col) {
+                dl->AddLine({c.x - 8, c.y + 7}, {c.x + 8, c.y + 7}, col, 1.2f);
+                dl->AddLine({c.x - 8, c.y + 7}, {c.x - 8, c.y - 7}, col, 1.2f);
+                ImVec2 w[] = {{c.x - 7, c.y + 4}, {c.x - 3, c.y - 4}, {c.x + 1, c.y + 2}, {c.x + 7, c.y - 6}};
+                dl->AddPolyline(w, 4, col, 0, 1.6f);
+            }))
+        {
+            insertLines({""}, 0);
+            *ed.cur.row = {named(T::Fn, "plot"), M(" ")};
+            ed.cur.i = 2;
+            ed.reindex();
+            if (vi.mode == Mode::Normal) vi.key(ed, Vi::parse("a")[0]);
+            changed();
+        }
+        if (btn("img", "Image: drag a picture onto the window  (:image path)", kind == Line::Image, [&](ImVec2 c, ImU32 col) {
+                dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 2, 0, 1.5f);
+                ImVec2 m[] = {{c.x - 6, c.y + 5}, {c.x - 1, c.y - 1}, {c.x + 2, c.y + 2}, {c.x + 4, c.y}, {c.x + 7, c.y + 5}};
+                dl->AddPolyline(m, 5, col, 0, 1.4f);
+                dl->AddCircleFilled({c.x + 3, c.y - 3.5f}, 1.6f, col);
+            }))
+            message = "Drag a picture onto the window, or :image <path>";
+        sep();
         if (btn("m", "Math mode: everything typed is math  (Ctrl-m · Space m)", ed.mathMode, text("∑", L.math, 18))) ed.mathMode = !ed.mathMode;
         // theme, at the right edge
         x = std::max(x, o.x + W - 40);
@@ -779,7 +1302,7 @@ struct App {
         dl->AddRectFilled(a, {a.x + w, a.y + h}, p.side);
         dl->AddLine(a, {a.x + w, a.y}, p.line);
         std::string left = vi.mode == Mode::Insert ? "-- INSERT --" : vi.mode == Mode::Visual ? "-- VISUAL --"
-                         : vi.mode == Mode::VisualLine ? "-- VISUAL LINE --" : vi.mode == Mode::Command ? ":" + vi.cmdline : "";
+                         : vi.mode == Mode::VisualLine ? "-- VISUAL LINE --" : vi.mode == Mode::Command ? vi.prompt + vi.cmdline : "";
         if (sideFocus) left = "-- FILES --  j/k move · Enter open · / filter · Esc back";
         float x = a.x + 12;
         {  // Ctrl-m toggle beside the mode: filled when everything typed is math
@@ -800,11 +1323,11 @@ struct App {
         std::string msg = !vi.message.empty() ? vi.message : message;
         if (vi.leader())
             L.drawText("SPACE   b bold · i italic · u underline · s strike · c code · h highlight · r clear · 1 2 3 heading · 0 text · "
-                       "- bullets · n numbers · > quote · t checklist · x tick · m math · e sidebar",
+                       "^ sup · _ sub · R G B colour · - bullets · n numbers · > quote · t checklist · x tick · | table · / rule · = section · m math · e sidebar",
                        x + 4, base, 12, p.fg, ui);
         else if (!msg.empty()) L.drawText(msg, x + 16, base, 14, p.muted, ui);
         else if (left.empty())
-            L.drawText("i insert · Esc normal · Space formatting · Ctrl-m math · :w save · :e find · :new · Ctrl-w files", x + 4, base, 12, alpha(p.muted, 0.8f), ui);
+            L.drawText("i insert · Esc normal · Space formatting · Ctrl-m math · :w save · :e find · / search · :export · Ctrl-w files", x + 4, base, 12, alpha(p.muted, 0.8f), ui);
         int k = ed.lineOf(ed.topOf(ed.cur.row)) + 1;
         std::string right = titleOf(meta) + (docJson(ed.doc).dump() == savedJson ? "" : " [+]") + "   " + std::to_string(k) + "/" +
                             std::to_string(ed.doc.size());
@@ -814,6 +1337,7 @@ struct App {
 
     void frame() {
         input();
+        pdfDone();
         if (changedAt >= 0 && nowSec() - changedAt > 0.5) saveNow();
         if (!vi.message.empty() || !message.empty()) {}
         applyColors();
@@ -892,6 +1416,7 @@ int main(int argc, char** argv) {
     glfwSwapInterval(shot ? 0 : 1);  // Wayland blocks vsync'd swaps of a hidden window; screenshots must not wait
     glfwSetKeyCallback(win, onKey);  // before ImGui's, which chain to these
     glfwSetCharCallback(win, onChar);
+    glfwSetDropCallback(win, onDrop);
     glfwSetInputMode(win, GLFW_LOCK_KEY_MODS, GLFW_TRUE);  // CapsLock state in mods: see onKey
 
     IMGUI_CHECKVERSION();
@@ -904,6 +1429,8 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init(glsl);
 
     App app;
+    app.vi.getClip = [] { const char* s = ImGui::GetClipboardText(); return std::string(s ? s : ""); };
+    app.vi.setClip = [](const std::string& s) { ImGui::SetClipboardText(s.c_str()); };
     std::string fonts = resDir() + "/assets/fonts/";
     app.ui = io.Fonts->AddFontFromFileTTF((fonts + "Inter-Regular.ttf").c_str(), 14);
     app.bold = io.Fonts->AddFontFromFileTTF((fonts + "Inter-SemiBold.ttf").c_str(), 14);

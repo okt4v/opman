@@ -106,19 +106,22 @@ struct Impl {
     struct Top {
         LineStyle ls;
         float ts, scale = 1;  // text size, heading scale
-        bool heading = false;
+        bool heading = false, header = false;
     };
     Top top(const Row& row) {
         Top t{lineStyle(row), L.textSize};
         t.heading = t.ls.kind >= Line::H1 && t.ls.kind <= Line::H3;
         t.scale = t.ls.kind == Line::H1 ? 1.75f : t.ls.kind == Line::H2 ? 1.4f : t.ls.kind == Line::H3 ? 1.18f : 1;
         t.ts = L.textSize * t.scale;
+        t.header = t.ls.kind == Line::Table && L.tableHeader;
         return t;
     }
     ImFont* textFont(const Item& it, const Top& t) const {
-        return it.f & Code ? L.mono : (it.f & Bold) || t.heading ? L.bold : L.text;
+        return it.f & Code ? L.mono : (it.f & Bold) || t.heading || t.header ? L.bold : L.text;
     }
-    float textSize(const Item& it, const Top& t) const { return it.f & Code ? t.ts * 0.88f : t.ts; }
+    float textSize(const Item& it, const Top& t) const { return (it.f & Code ? t.ts * 0.88f : t.ts) * (it.f & Script ? 0.7f : 1); }
+    float textRise(const Item& it, const Top& t) const { return it.f & Sup ? -0.38f * t.ts : it.f & Sub ? 0.18f * t.ts : 0; }
+    static bool pipe(const Item& it, const Top& t) { return t.ls.kind == Line::Table && it.t == T::Ch && !it.m && it.c == "|"; }
     // width of the drawn prefix: bullet, number, quote bar, checkbox; headings show theirs in the margin
     float decoWidth(const Top& t) {
         switch (t.ls.kind) {
@@ -156,6 +159,7 @@ struct Impl {
         float x = 0;
         Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
         r.total = {0, c.top ? 0.75f * t.ts : 0, c.top ? 0.25f * t.ts : 0};
+        size_t cell = 0;
         for (size_t j = 0; j < n; j++) {
             r.xs[j] = x;
             const Item& it = row[j];
@@ -164,6 +168,11 @@ struct Impl {
             if (int(j) < t.ls.len) {  // the Markdown prefix: drawn as one decoration in its last item's place
                 w = int(j) == t.ls.len - 1 ? decoWidth(t) : 0;
                 b = {w, 0.72f * t.ts, 0.24f * t.ts};
+            } else if (c.top && pipe(it, t)) {  // a cell border: snaps to the column stop, drawn by the app as a grid line
+                if (cell < L.tabs.size()) x = r.xs[j] = std::max(x, L.tabs[cell]);
+                cell++;
+                b = {0.9f * t.ts, 0.72f * t.ts, 0.24f * t.ts};
+                w = b.w;
             } else if (!r.mask[j]) {
                 b = glyphBox(textFont(it, t), textSize(it, t), it.c);
                 b.asc = std::max(b.asc, 0.72f * t.ts);
@@ -248,13 +257,21 @@ struct Impl {
             L.dl->AddRectFilled({x + r.xs[j], base - 0.8f * t.ts}, {x + r.xs[j + 1], base + 0.3f * t.ts}, bg);
         }
         Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
+        auto links = c.top ? linkSpans(row) : std::vector<std::pair<int, int>>{};
         for (size_t j = t.ls.len; j < row.size(); j++) {
             const Item& it = row[j];
+            if (c.top && pipe(it, t)) continue;
+            int link = 0;  // 1: a link's title, 2: its brackets
+            for (auto [a, b] : links)
+                if (int(j) >= a && int(j) < b) link = int(j) < a + 2 || int(j) >= b - 2 ? 2 : 1;
             if (!r.mask[j]) {
                 float gx = x + r.xs[j], gw = r.xs[j + 1] - r.xs[j], th = std::max(1.f, 0.065f * t.ts);
-                ImU32 tc = col(c, done ? L.pal->muted : it.f & Code ? L.pal->constant : L.pal->fg);
-                glyph(textFont(it, t), textSize(it, t), it.c, gx, base, tc, it.f & Italic);
-                if (L.dl && (it.f & Underline)) L.dl->AddRectFilled({gx, base + 0.1f * t.ts}, {gx + gw, base + 0.1f * t.ts + th}, tc);
+                ImU32 hue = it.f & Red ? IM_COL32(0xe5, 0x48, 0x4d, 255) : it.f & Green ? IM_COL32(0x2f, 0x9e, 0x5b, 255)
+                          : it.f & Blue ? IM_COL32(0x3b, 0x82, 0xf6, 255) : L.pal->fg;
+                if (link) hue = link == 1 ? L.pal->fn : L.pal->muted;
+                ImU32 tc = col(c, done ? L.pal->muted : it.f & Code ? L.pal->constant : hue);
+                glyph(textFont(it, t), textSize(it, t), it.c, gx, base + textRise(it, t), tc, it.f & Italic);
+                if (L.dl && ((it.f & Underline) || link == 1)) L.dl->AddRectFilled({gx, base + 0.1f * t.ts}, {gx + gw, base + 0.1f * t.ts + th}, tc);
                 if (L.dl && ((it.f & Strike) || done)) L.dl->AddRectFilled({gx, base - 0.3f * t.ts}, {gx + gw, base - 0.3f * t.ts + th}, tc);
             } else if (!isSpace(it)) item(it, mc, prev, true, x + r.xs[j] + r.lsp[j], base);
             if (!isSpace(it)) prev = r.boxes[j];
@@ -491,6 +508,16 @@ Box Layout::measureLine(const Row& row) {
     return b;
 }
 void Layout::drawLine(const Row& row, float x, float base) { Impl{*this}.drawRow(row, {mathSize, true, true, 0}, x, base); }
+std::vector<float> Layout::pipeXs(const Row& row) {
+    auto keep = std::move(tabs);
+    tabs.clear();
+    RowLay r = Impl{*this}.lay(row, {mathSize, true, true, 0});
+    tabs = std::move(keep);
+    std::vector<float> out;
+    for (size_t j = 0; j < row.size(); j++)
+        if (row[j].t == T::Ch && !row[j].m && row[j].c == "|") out.push_back(r.xs[j]);
+    return out;
+}
 Box Layout::measureMath(const Row& row, float size) { return Impl{*this}.rowBox(row, {size, true, false, 0}); }
 void Layout::drawMath(const Row& row, float x, float base, float size, ImU32 c) { Impl{*this}.drawRow(row, {size, true, false, c}, x, base); }
 float Layout::textWidth(const std::string& s, float size) { return text->CalcTextSizeA(size, FLT_MAX, 0, s.c_str()).x; }

@@ -1,6 +1,7 @@
 #include "vi.hpp"
 #include "math.hpp"
 #include <algorithm>
+#include <cstring>
 #include <map>
 
 namespace om {
@@ -42,7 +43,8 @@ std::vector<Key> Vi::parse(const std::string& s) {
     for (size_t i = 0; i < s.size();) {
         Key k;
         size_t close = s.find('>', i);
-        if (s[i] == '<' && close != std::string::npos && close > i + 1) {
+        if (s[i] == '<' && close != std::string::npos && close > i + 1 &&
+            s.find_first_of(" <", i + 1) > close) {  // "<Esc>" is a key; the "<" in "0 < x <Esc>" is typed
             std::string t = s.substr(i + 1, close - i - 1);
             i = close + 1;
             if (t == "Esc") k.sp = Key::Esc;
@@ -81,7 +83,7 @@ std::pair<int, int> Vi::lines(const Editor& ed) const {
     return {k, k};
 }
 
-void Vi::format(Editor& ed, uint8_t flag) {
+void Vi::format(Editor& ed, uint16_t flag) {
     auto done = [&] {
         if (mode == Mode::Visual || mode == Mode::VisualLine) mode = Mode::Normal, ed.range.reset();
     };
@@ -97,7 +99,7 @@ void Vi::format(Editor& ed, uint8_t flag) {
         return done();
     }
     if (mode == Mode::Insert) {
-        ed.style = flag ? ed.style ^ flag : 0;
+        ed.style = !flag ? 0 : ed.style & flag ? ed.style & ~flag : (ed.style & ~fmtGroup(flag)) | flag;
         return;
     }
     Row& r = *ed.cur.row;  // Normal: the word under the cursor
@@ -127,10 +129,14 @@ void Vi::toggleDone(Editor& ed) {
 }
 
 void Vi::leaderKey(Editor& ed, const std::string& c) {
-    static const std::map<std::string, uint8_t> FMT = {{"b", Bold}, {"i", Italic}, {"u", Underline}, {"s", Strike},
-                                                       {"c", Code}, {"h", Mark}, {"r", 0}};
+    static const std::map<std::string, uint16_t> FMT = {{"b", Bold}, {"i", Italic}, {"u", Underline}, {"s", Strike}, {"c", Code},
+                                                        {"h", Mark}, {"^", Sup}, {"_", Sub}, {"R", Red}, {"G", Green},
+                                                        {"B", Blue}, {"r", 0}};
     static const std::map<std::string, Line> LINE = {{"0", Line::Text}, {"1", Line::H1}, {"2", Line::H2}, {"3", Line::H3},
                                                      {"-", Line::Bullet}, {"n", Line::Number}, {">", Line::Quote}, {"t", Line::Todo}};
+    if (c == "|") return cmds.push_back("table 3 2");  // a 3×2 table below
+    if (c == "/") return cmds.push_back("rule");
+    if (c == "=") return cmds.push_back("section");
     if (auto f = FMT.find(c); f != FMT.end()) format(ed, f->second);
     else if (auto l = LINE.find(c); l != LINE.end()) setLine(ed, l->second);
     else if (c == "x") toggleDone(ed);
@@ -150,6 +156,22 @@ void Vi::visualSelect(Editor& ed) {
 }
 
 void Vi::key(Editor& ed, const Key& k) {
+    bool idle = mode == Mode::Normal && pending.empty();
+    if (!replaying) {
+        if (idle && k.ch == "." && !k.ctrl) {  // ponytail: no count on ., and an insert replays its keys as typed
+            replaying = true;
+            for (auto& x : std::vector<Key>(last)) key(ed, x);
+            replaying = false;
+            return;
+        }
+        if (idle) rec.clear(), recFrom = ed.changes;
+        rec.push_back(k);
+    }
+    key1(ed, k);
+    if (!replaying && mode == Mode::Normal && pending.empty() && ed.changes != recFrom) last = rec, recFrom = ed.changes;
+}
+
+void Vi::key1(Editor& ed, const Key& k) {
     message.clear();
     if (k.ctrl && k.ch == "\\") cmds.push_back("sidebar");
     else if (k.ctrl && (k.ch == "b" || k.ch == "i" || k.ch == "u") && mode != Mode::Command)
@@ -189,8 +211,9 @@ void Vi::insertKey(Editor& ed, const Key& k) {
     int n = int(items.size());
     if (k.ctrl) {
         if (k.ch.size() == 1 && k.ch[0] >= '1' && k.ch[0] <= '9') pickItem(ed, k.ch[0] - '1');
-        else if (n && (k.ch == "n" || k.ch == "p")) ed.pick = (ed.pick + (k.ch == "n" ? 1 : n - 1)) % n;
+        else if (n && (k.ch == "n" || k.ch == "p")) ed.pick = (ed.pick + (k.ch == "n" ? 1 : n - 1)) % n, navigated = true;
         else if (k.ch == "a") ed.selectAll();
+        else if (k.ch == "v" && getClip) { ed.deleteSelection(); pasteText(ed, getClip()); }
         return;
     }
     switch (k.sp) {
@@ -201,16 +224,30 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         return;
     case Key::Enter:
         if (k.shift) { if (!ed.addMatrixRow()) ed.enter(); }
-        else if (n && !items[0].insert) pickItem(ed, ed.pick);
+        else if (n && !items[0].insert && enterPicks(ed)) pickItem(ed, ed.pick);
         else { ed.deleteSelection(); if (!ed.listEnter()) ed.enter(); }
         return;
     case Key::Tab:
-        if (n && items[0].insert) pickItem(ed, ed.pick);
-        else if (auto g = ghostHere()) ed.insertItems(g->insert);
-        else ed.exitSlot();
+        if (n && (items[0].insert || navigated || items[ed.pick].cat == "Program")) pickItem(ed, ed.pick);
+        else if (auto g = ghostHere(); g && !k.shift) ed.insertItems(g->insert);
+        else if (!ed.inSlot() && lineStyle(*ed.cur.row).kind == Line::Table) {  // next cell (Shift-Tab: previous)
+            Row& r = *ed.cur.row;
+            auto cells = tableCells(r);
+            int c = 0;
+            while (c < int(cells.size()) && cells[c].second < ed.cur.i) c++;
+            c += k.shift ? -1 : 1;
+            if (c < 0) return;
+            if (c >= int(cells.size())) {  // past the last cell: a new row
+                ed.cur.i = len(&r);
+                ed.listEnter();
+                return;
+            }
+            int a = cells[c].first;
+            ed.cur.i = a < len(&r) && isSpace(r[a]) ? a + 1 : a;
+        } else ed.exitSlot();
         return;
     case Key::Up: case Key::Down:
-        if (n) ed.pick = (ed.pick + (k.sp == Key::Down ? 1 : n - 1)) % n;
+        if (n) ed.pick = (ed.pick + (k.sp == Key::Down ? 1 : n - 1)) % n, navigated = true;
         else { ed.range.reset(); ed.vertical(k.sp == Key::Up ? -1 : 1); }
         return;
     case Key::Left: case Key::Right:
@@ -226,6 +263,7 @@ void Vi::insertKey(Editor& ed, const Key& k) {
             ed.cur.row->erase(ed.cur.row->begin() + ed.cur.i);
         return;
     case Key::None:
+        navigated = false;
         if (k.ch.empty()) return;
         if (k.ch == " " && k.shift) {
             ed.deleteSelection();
@@ -287,6 +325,23 @@ bool Vi::motion(Editor& ed, const std::string& m, int n, bool hasCount, bool str
         int k = hasCount ? n - 1 : m == "gg" ? 0 : int(ed.doc.size()) - 1;
         ed.cur = {&ed.doc[std::clamp(k, 0, int(ed.doc.size()) - 1)], 0};
         linewise = true;
+    } else if (m == ";" || m == "," || (m.size() > 1 && std::strchr("fFtT", m[0]))) {
+        std::string f = m.size() > 1 ? m : lastFind;
+        if (f.empty()) return true;
+        bool repeat = m.size() == 1;
+        if (!repeat) lastFind = m;
+        else if (m == ",") f[0] = f[0] == 'f' ? 'F' : f[0] == 'F' ? 'f' : f[0] == 't' ? 'T' : 't';
+        bool fwd = f[0] == 'f' || f[0] == 't', till = f[0] == 't' || f[0] == 'T';
+        std::string want = f.substr(1);
+        int i = ed.cur.i;
+        for (int k = 0; k < n; k++) {
+            int j = i + (fwd ? 1 : -1) * (till && (repeat || k) ? 2 : 1);  // a repeated t jumps past the target it stops at
+            while (j >= 0 && j < len(row) && (*row)[j].c != want) j += fwd ? 1 : -1;
+            if (j < 0 || j >= len(row)) return true;  // not found: stay, and an operator gets an empty range
+            i = till ? j + (fwd ? -1 : 1) : j;
+        }
+        ed.cur.i = i;
+        inclusive = fwd;
     } else if (m == "%") {
         auto f = ed.parents.find(ed.cur.row);
         if (f != ed.parents.end()) ed.cur = {f->second.row, int(f->second.node - f->second.row->data())};
@@ -298,6 +353,7 @@ void Vi::deleteLines(Editor& ed, int a, int b, bool yankOnly) {
     b = std::min(b, int(ed.doc.size()) - 1);
     reg.lines = true;
     reg.doc.assign(ed.doc.begin() + a, ed.doc.begin() + b + 1);
+    yanked();
     if (yankOnly) return;
     ed.doc.erase(ed.doc.begin() + a, ed.doc.begin() + b + 1);
     if (ed.doc.empty()) ed.doc.emplace_back();
@@ -306,9 +362,22 @@ void Vi::deleteLines(Editor& ed, int a, int b, bool yankOnly) {
 }
 
 // ---------- Normal ----------
-void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
-    if (k.sp == Key::Esc) { pending.clear(); ed.range.reset(); return; }
+void Vi::normalKey(Editor& ed, const std::string& c0, const Key& k) {
+    std::string c = c0;
+    if (k.sp == Key::Esc) { pending.clear(); ed.range.reset(); hlsearch = false; return; }
+    auto link = [&] {  // the [[link]] under the cursor
+        if (ed.inSlot()) return false;
+        for (auto sp : linkSpans(*ed.cur.row))
+            if (ed.cur.i >= sp.first && ed.cur.i < sp.second) return cmds.push_back("link " + linkTitle(*ed.cur.row, sp)), true;
+        return false;
+    };
+    if (k.sp == Key::Enter && pending.empty()) {  // follows a [[link]], else moves down like vim
+        bool lw, inc;
+        if (!link()) motion(ed, "j", 1, false, true, lw, inc);
+        return;
+    }
     if (k.ctrl) {
+        if (k.ch == "o") cmds.push_back("back");
         if (k.ch == "r") ed.redo();
         pending.clear();
         return;
@@ -329,6 +398,11 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         if (ed.cur.row == row) ed.cur.i = i;
         return;
     }
+    // f/t/F/T<c>: the motion is the prefix and its target
+    if (!pending.empty() && std::strchr("fFtT", pending.back())) {
+        c = pending.back() + c;
+        pending.pop_back();
+    }
     // count
     if ((c >= "1" && c <= "9" && c.size() == 1) || (c == "0" && !pending.empty() && std::isdigit((unsigned char)pending.back()))) {
         pending += c;
@@ -342,9 +416,10 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
     std::string op = !rest.empty() && (rest[0] == 'd' || rest[0] == 'c' || rest[0] == 'y') ? rest.substr(0, 1) : "";
     std::string m = c;
     if (rest.ends_with("g")) {
+        if (c == "f" && op.empty()) { pending.clear(); if (!link()) message = "No [[link]] under the cursor"; return; }
         if (c != "g") { pending.clear(); return; }
         m = "gg";
-    } else if (c == "g" || c == "r") { pending += c; return; }
+    } else if (c == "g" || c == "r" || c == "f" || c == "F" || c == "t" || c == "T") { pending += c; return; }
 
     if (!op.empty()) {
         pending.clear();
@@ -387,6 +462,7 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         b = std::min(b, len(from.row));
         reg.lines = false;
         reg.items.assign(from.row->begin() + a, from.row->begin() + b);
+        yanked();
         ed.cur = {from.row, a};
         if (op == "y") return;
         ed.undoStack.push_back(std::move(before));
@@ -414,7 +490,8 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         ed.cur = {&ed.doc[at], 0};
         ed.reindex();
         LineStyle s = lineStyle(ed.doc[k0 + (m == "O")]);
-        if (m == "o" && s.kind >= Line::Bullet) ed.setLine(ed.doc[at], s.kind == Line::Done ? Line::Todo : s.kind, s.num + 1);
+        if (m == "o" && s.kind == Line::Table) ed.tableRow(ed.doc[k0], ed.doc[at]);
+        else if (m == "o" && isList(s.kind)) ed.setLine(ed.doc[at], s.kind == Line::Done ? Line::Todo : s.kind, s.num + 1);
         return toInsert(ed, true);
     }
     if (m == "x" || m == "s" || m == "X") {
@@ -423,6 +500,7 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         ed.snap();
         reg.lines = false;
         reg.items.assign(row->begin() + a, row->begin() + b);
+        yanked();
         row->erase(row->begin() + a, row->begin() + b);
         ed.cur.i = a;
         ed.reindex();
@@ -433,6 +511,7 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
         ed.snap();
         reg.lines = false;
         reg.items.assign(row->begin() + i, row->end());
+        yanked();
         row->erase(row->begin() + i, row->end());
         ed.reindex();
         if (m == "C") toInsert(ed, true);
@@ -447,6 +526,10 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
     }
     if (m == "p" || m == "P") {
         ed.snap();
+        if (std::string t = getClip ? getClip() : ""; !t.empty() && t != copied) {  // copied in another app
+            if (m == "p" && ed.cur.i < len(ed.cur.row)) ed.cur.i++;
+            return pasteText(ed, t);
+        }
         for (int n = 0; n < count; n++) {
             if (reg.lines) {
                 int at = m == "p" ? lineIdx(ed) + 1 : lineIdx(ed);
@@ -477,7 +560,8 @@ void Vi::normalKey(Editor& ed, const std::string& c, const Key& k) {
     if (m == "u") { for (int n = 0; n < count; n++) ed.undo(); return; }
     if (m == "v") { mode = Mode::Visual; anchor = ed.cur; visualSelect(ed); return; }
     if (m == "V") { mode = Mode::VisualLine; anchorLine = k0; return; }
-    if (m == ":") { mode = Mode::Command; cmdline.clear(); return; }
+    if (m == ":" || m == "/" || m == "?") { mode = Mode::Command; prompt = m[0]; cmdline.clear(); return; }
+    if (m == "n" || m == "N") { for (int n = 0; n < count; n++) searchNext(ed, m == "N"); return; }
 }
 
 // ---------- Visual / Visual line ----------
@@ -500,9 +584,11 @@ void Vi::visualKey(Editor& ed, const std::string& c, const Key& k) {
     if (c.empty()) return;
     if (leader()) { pending.clear(); return leaderKey(ed, c); }
     if (c == " " && pending.empty()) { pending = " "; return; }
-    if (pending == "g" && c != "g") pending.clear();
-    if (c == "g" && pending.empty()) { pending = "g"; return; }
     std::string m = c == "g" ? "gg" : c;
+    if (!pending.empty() && std::strchr("fFtT", pending[0])) m = pending + c;
+    else if (c.size() == 1 && std::strchr("fFtT", c[0]) && pending.empty()) { pending = c; return; }
+    else if (pending == "g" && c != "g") pending.clear();
+    else if (c == "g" && pending.empty()) { pending = "g"; return; }
     pending.clear();
     bool linewise, inclusive;
     if (motion(ed, m, 1, false, true, linewise, inclusive)) {
@@ -529,6 +615,7 @@ void Vi::visualKey(Editor& ed, const std::string& c, const Key& k) {
     } else {
         reg.lines = false;
         reg.items = ed.selectedItems();
+        yanked();
         if (del) { ed.snap(); ed.deleteSelection(); }
         else if (auto r = ed.selRange()) ed.cur = {ed.range->row, r->first};
         leave();
@@ -538,30 +625,120 @@ void Vi::visualKey(Editor& ed, const std::string& c, const Key& k) {
 
 // ---------- Command line ----------
 void Vi::commandKey(Editor& ed, const Key& k) {
-    if (k.sp == Key::Esc) { mode = Mode::Normal; return; }
+    if (k.sp == Key::Esc) { mode = Mode::Normal; prompt = ':'; return; }
     if (k.sp == Key::Backspace) {
-        if (cmdline.empty()) { mode = Mode::Normal; return; }
+        if (cmdline.empty()) { mode = Mode::Normal; prompt = ':'; return; }
         while (!cmdline.empty() && (cmdline.back() & 0xC0) == 0x80) cmdline.pop_back();  // whole UTF-8 sequence
         if (!cmdline.empty()) cmdline.pop_back();
         return;
     }
     if (k.sp == Key::Enter) {
         mode = Mode::Normal;
+        if (prompt != ':') {
+            if (!cmdline.empty()) lastSearch = cmdline;
+            lastBack = prompt == '?';
+            prompt = ':';
+            hlsearch = true;
+            return searchNext(ed, false);
+        }
         std::string c = cmdline;
         while (!c.empty() && c.back() == ' ') c.pop_back();
         if (c.empty()) return;
+        if (c == "noh" || c == "nohlsearch") { hlsearch = false; return; }
         if (std::all_of(c.begin(), c.end(), ::isdigit)) {
             int n = std::clamp(std::stoi(c), 1, int(ed.doc.size()));
             ed.cur = {&ed.doc[n - 1], 0};
             return;
         }
         std::string name = c.substr(0, c.find(' '));
-        static const std::vector<std::string> known = {"w", "q", "q!", "wq", "x", "e", "new", "rename", "trash", "set"};
+        static const std::vector<std::string> known = {"w", "q", "q!", "wq", "x", "e", "new", "rename", "trash", "set", "export", "image", "table", "rule", "section"};
         if (std::find(known.begin(), known.end(), name) == known.end()) { message = "Not an editor command: " + c; return; }
         cmds.push_back(c);
         return;
     }
     if (k.sp == Key::None && !k.ctrl) cmdline += k.ch;
+}
+
+// ---------- clipboard and search ----------
+void Vi::yanked() {
+    copied = reg.lines ? markdown(reg.doc) : markdown(reg.items);
+    if (reg.lines && copied.ends_with("\n")) copied.pop_back();
+    if (setClip) setClip(copied);
+}
+
+// ponytail: pasted text is typed in, so it gets the same text/math reading as typing it ("a/b" becomes a fraction)
+void Vi::pasteText(Editor& ed, const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        unsigned char b = s[i];
+        size_t n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+        std::string c = s.substr(i, n);
+        i += n;
+        if (c == "\n") ed.enter();
+        else if (c == "\t") ed.insertChar(" ");
+        else if (c != "\r") ed.insertChar(c);
+        ed.reindex();
+    }
+}
+
+// matches in the text of top-level lines; math inside slots is one placeholder item and isn't searched
+std::vector<Vi::Match> Vi::matches(const Editor& ed, const std::string& pattern) {
+    std::vector<Match> out;
+    if (pattern.empty()) return out;
+    bool icase = std::none_of(pattern.begin(), pattern.end(), [](char c) { return std::isupper((unsigned char)c); });
+    auto fold = [&](std::string t) {
+        if (icase) for (auto& c : t) c = char(std::tolower((unsigned char)c));
+        return t;
+    };
+    std::string want = fold(pattern);
+    for (int k = 0; k < int(ed.doc.size()); k++) {  // ponytail: scans the whole doc, fine for notes
+        std::string text;
+        std::vector<int> item;  // item index of every byte
+        for (int j = 0; j < len(&ed.doc[k]); j++) {
+            const Item& it = ed.doc[k][j];
+            std::string t = it.s.empty() && !it.c.empty() ? fold(it.c) : "\x01";
+            text += t;
+            item.insert(item.end(), t.size(), j);
+        }
+        for (size_t p = text.find(want); p != std::string::npos; p = text.find(want, p + 1))
+            out.push_back({k, item[p], item[p + want.size() - 1] + 1});
+    }
+    return out;
+}
+
+std::string Vi::highlight() const {
+    if (mode == Mode::Command && prompt != ':') return cmdline;  // as you type
+    return hlsearch ? lastSearch : "";
+}
+
+bool Vi::enterPicks(const Editor& ed) const {
+    if (navigated) return true;
+    std::string w = ed.pendingWord();
+    int i = ed.cur.i - int(w.size());
+    return w.empty() || ed.inSlot() || (i >= 0 && i < len(ed.cur.row) && (*ed.cur.row)[i].m);
+}
+
+void Vi::searchNext(Editor& ed, bool reverse) {
+    if (lastSearch.empty()) { message = "No previous search"; return; }
+    bool back = lastBack != reverse;
+    Cur at = ed.cur;  // where the cursor is in its top-level line
+    for (auto f = ed.parents.find(at.row); f != ed.parents.end(); f = ed.parents.find(at.row))
+        at = {f->second.row, int(f->second.node - f->second.row->data())};
+    std::pair<int, int> here{ed.lineOf(at.row), at.i};
+    std::vector<std::pair<int, int>> hits;
+    for (auto& m : matches(ed, lastSearch)) hits.push_back({m.line, m.a});
+    if (hits.empty()) { message = "Pattern not found: " + lastSearch; return; }
+    std::pair<int, int> to;
+    if (!back) {
+        auto h = std::upper_bound(hits.begin(), hits.end(), here);
+        if (h == hits.end()) message = "search hit BOTTOM, continuing at TOP", h = hits.begin();
+        to = *h;
+    } else {
+        auto h = std::lower_bound(hits.begin(), hits.end(), here);
+        if (h == hits.begin()) message = "search hit TOP, continuing at BOTTOM", h = hits.end();
+        to = *--h;
+    }
+    ed.range.reset();
+    ed.cur = {&ed.doc[to.first], to.second};
 }
 
 }  // namespace om
