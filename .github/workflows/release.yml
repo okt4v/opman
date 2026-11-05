@@ -54,8 +54,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOPMAN_VERSION="$OPMAN_VERSION"
 
+      # compiler errors become annotations, readable on the run page and through the public API
       - name: Build
-        run: cmake --build build --config Release --parallel
+        shell: bash
+        run: |
+          set +e
+          cmake --build build --config Release --parallel 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "error|Error" build.log | grep -v "^ *[0-9]* Error" | head -40 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $status
 
       - name: Self-checks
         shell: bash
