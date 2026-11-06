@@ -233,6 +233,7 @@ struct Impl {
 
     // operator spacing like MathML's operator dictionary; none in scripts, none for a prefix +/−
     std::pair<float, float> spacing(const Row& row, size_t j, const std::vector<bool>& mask, Ctx c) {
+        if (isDecimalComma(row, j)) return {0, 0};  // 2,5
         if (c.size < L.mathSize * 0.9f) return {0, 0};
         const Item& it = row[j];
         float em = c.size;

@@ -16,7 +16,7 @@ goes to `.old/`). Open/save dialogs are the system's (Linux: zenity or kdialog),
 ## Settings, help, commands
 
 - **Settings** (Ctrl-, or the gear): theme, text size, page width, vim or standard keys, CapsLock-as-Escape, live
-  results, sliders, autosave delay, significant digits, degrees/radians, exact/decimal results, default plot range,
+  results, sliders, autosave delay, significant digits, degrees/radians, exact/decimal results, decimal point or comma, default plot range,
   library and export folders, the pdflatex command, system or built-in dialogs.
 - **Help** (F1 or ?): every feature, searchable.
 - **Command palette** (Ctrl-Shift-p): any action, setting, note or help topic by name.
@@ -55,7 +55,7 @@ Ctrl-c/x/v clipboard, Ctrl-f find.
 
 Ex commands: `:w [path] :saveas [path] :open [path] :q :q! :wq :e <title|path> :new [title] :rename <title> :trash
 :folder :export [md|html|tex|pdf|path] :image <path> :table [rows] [cols] :rule :section [title] :s/a/b/g :%s/a/b/g :noh
-:set dark|light|degrees|radians|decimals|fractions|digits=N|vim|standard :help [topic] :settings :palette :outline
+:set dark|light|degrees|radians|decimals|fractions|comma|point|digits=N|vim|standard :help [topic] :settings :palette :outline
 :zoom in|out|reset`.
 
 In Insert mode the popup offers completions: Tab takes a computed result or a program function, Enter takes the entry
@@ -89,6 +89,8 @@ Also:
   (`\qquad|\;` in LaTeX); it's shown dimmed and never calculated. `2 = |x|` stays an absolute value.
 - **Sets**: `{` in math makes growing braces, for a solution set `L = {2; 3; 5}` or `L = {x | x > 0}` (`\{ … \}`,
   `\mid` in LaTeX).
+- **Decimal comma**: Settings > Math > Numbers (`:set comma`): `2,5` is a number and `;` separates arguments, as in
+  `max(1; 2,5)`. A comma with a space after it still separates, so plot lines and `max(1, 2,5)` keep working.
 - **Exact answers**: `√8 = 2√2`, `arctan(1) = π/4`; Tab writes the exact form.
 - **Equation numbers**: end a line with `#name` to number it `(1)`; `[#name]` refers to it (Ctrl-click jumps).
 - **Tour**: `:tour` (or Help > Open the tour) types an example note.
@@ -100,7 +102,7 @@ Also:
 
 `:export` takes a file name or just a format: `md` (default), `html`, `tex` or `pdf`. Without a path it writes
 `~/<title>.<ext>`.
-- **HTML**: one shareable file; math by KaTeX (loaded from a CDN), images inlined, plots as SVG.
+- **HTML**: one shareable file that works offline; math as MathML (browsers draw it themselves), images inlined, plots as SVG.
 - **PDF**: runs `pdflatex` in the background (needs a TeX distribution with amsmath, pgfplots, soul and ulem).
 - **LaTeX**: lists, quotes and tables become environments, lines of only math display math, plots pgfplots.
 - **Print**: `:print` (File > Print) sends a PDF to the default printer (`lp`; on Windows the PDF viewer's Print), or

@@ -302,7 +302,7 @@ std::vector<Tok> tokens(const Row& row) {
         if (hasC && c == " ") continue;
         if (numChar(it)) {
             std::string s = c;
-            while (j + 1 < row.size() && numChar(row[j + 1])) s += row[++j].c;
+            while (j + 1 < row.size() && (numChar(row[j + 1]) || isDecimalComma(row, j + 1))) s += row[++j].c == "," ? "." : row[j].c;
             size_t dot = s.find('.');
             std::string whole = s.substr(0, dot), frac = dot == std::string::npos ? "" : s.substr(dot + 1);
             frac = frac.substr(0, frac.find('.'));
@@ -337,11 +337,13 @@ std::string parenFn(const std::string& o) {
     return o == "|" || o == "‖" ? "abs" : o == "⌊" ? "floor" : o == "⌈" ? "ceil" : "";
 }
 
+bool argSep(const Row& row, size_t j) { return row[j].t == T::Ch && (row[j].c == ";" || (row[j].c == "," && !isDecimalComma(row, j))); }
+
 std::vector<Row> splitArgs(const Row& row) {
     std::vector<Row> parts(1);
-    for (auto& it : row)
-        if (it.t == T::Ch && it.c == ",") parts.emplace_back();
-        else parts.back().push_back(it);
+    for (size_t j = 0; j < row.size(); j++)
+        if (argSep(row, j)) parts.emplace_back();
+        else parts.back().push_back(row[j]);
     return parts;
 }
 
@@ -1530,7 +1532,7 @@ bool unitStartsWith(const std::string& c) {
     return false;
 }
 
-std::vector<Entry> evalSuggestions(Editor& ed) {
+static std::vector<Entry> evalSuggestions0(Editor& ed) {
     ED = &ed;
     const Row& row = *ed.cur.row;
     if (int b = stepBar(*ed.topOf(ed.cur.row)); b >= 0) {  // typing the step after "|": no results
@@ -1589,7 +1591,24 @@ std::string fitText(const std::vector<double>& c, bool expo, const std::string& 
 Ast fitAst(const std::vector<double>& c, bool expo, const std::string& x);
 }  // namespace
 
-std::optional<Ghost> ghost(Editor& ed, const Row& row) {
+// results in the number format of the settings
+static void localize(Row& row) {
+    for (size_t j = 0; j < row.size(); j++) {
+        if (row[j].t == T::Ch && row[j].c == "." && j > 0 && j + 1 < row.size() && isDigit(row[j - 1].c) && isDigit(row[j + 1].c)) row[j].c = ",";
+        for (auto& slot : row[j].s) localize(slot);
+    }
+}
+std::vector<Entry> evalSuggestions(Editor& ed) {
+    auto out = evalSuggestions0(ed);
+    if (decimalComma)
+        for (auto& e : out) {
+            e.name = localNum(e.name);
+            if (e.insert) localize(*e.insert);
+        }
+    return out;
+}
+
+static std::optional<Ghost> ghost0(Editor& ed, const Row& row) {
     ED = &ed;
     auto mask = mathMask(row, true);
     int end = eqTag(row).first >= 0 ? eqTag(row).first : int(row.size());  // "x + 1 #eq": the answer goes before the tag
@@ -1649,6 +1668,12 @@ std::optional<Ghost> ghost(Editor& ed, const Row& row) {
             return std::nullopt;
         }
     }
+}
+
+std::optional<Ghost> ghost(Editor& ed, const Row& row) {
+    auto g = ghost0(ed, row);
+    if (g && decimalComma) g->text = localNum(g->text), localize(g->insert);
+    return g;
 }
 
 // "plot table": the nearest table above in the section; column 1 is x, every other column a series of points
@@ -1765,7 +1790,7 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
     std::vector<Row> parts(1);  // split at top-level commas, without spaces; text letters count as math here
     for (size_t j = 1; j < row.size(); j++) {  // after the plot function
         Item it = row[j];
-        if (it.t == T::Ch && it.c == ",") parts.emplace_back();
+        if (argSep(row, j)) parts.emplace_back();
         else if (!isSpace(it)) {
             if (it.t == T::Ch) it.m = true;
             parts.back().push_back(it);

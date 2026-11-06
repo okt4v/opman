@@ -705,7 +705,8 @@ static void checkVi() {
         CHECK(eqRefs(e.doc[2]).size() == 3 && eqName(e.doc[2], eqRefs(e.doc[2])[1]) == "sum");
         CHECK(eqTag(e.doc[2]).first < 0);
         std::string h = html(e, "/n", "T"), t = latex(e, "/n");
-        CHECK(h.find("2+3=5 \\tag{2}") != std::string::npos && h.find("By (1), (2) and (?).") != std::string::npos);
+        CHECK(h.find("<span class=eqn>(2)</span><math display=\"block\">") != std::string::npos && h.find("By (1), (2) and (?).") != std::string::npos);
+        CHECK(h.find("http") == std::string::npos && h.find("<mn>2</mn>") != std::string::npos);  // nothing from the network
         CHECK(t.find("A=2 \\tag{1}") != std::string::npos && t.find("#area") == std::string::npos);
     }
 
@@ -908,6 +909,29 @@ static void checkVi() {
         CHECK(m[5] == 5);
         m = followLines(PL{{2, "a"}, {5, "b"}}, PL{{4, "b"}});  // one was deleted
         CHECK(m.size() == 1 && m[5] == 4);
+    }
+
+    // German numbers: 2,5 is a decimal, ; separates arguments, a comma with a space too; results use the comma
+    {
+        decimalComma = true;
+        Editor e;
+        Vi v;
+        v.mode = Mode::Insert;
+        keys(e, v, "<C-m>a = 2,5<CR>a+1");
+        CHECK_EQ(ghost(e, e.doc[1])->text, "= 7/2");
+        keys(e, v, "<CR>max(1;2,5)");
+        CHECK_EQ(ghost(e, e.doc[2])->text, "= 5/2");
+        keys(e, v, "<CR>max(1, 2,5)");
+        CHECK_EQ(ghost(e, e.doc[3])->text, "= 5/2");
+        mathOpts.decimals = true;
+        keys(e, v, "<CR>a/2");
+        auto g = ghost(e, e.doc[4]);
+        CHECK_EQ(g->text, "= 1,25");
+        CHECK_EQ(plain(g->insert).find("1,25") != std::string::npos, true);
+        CHECK_EQ(lineTex(e.doc[0]).find("2{,}5") != std::string::npos, true);
+        mathOpts.decimals = false;
+        decimalComma = false;
+        CHECK_EQ(localNum("2.5"), "2.5");
     }
 
     // matrices in insert mode: Shift+Space grows a column, Shift+Enter a row

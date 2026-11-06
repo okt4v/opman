@@ -133,6 +133,18 @@ static std::vector<std::string> codepoints(const std::string& s) {
     return out;
 }
 
+bool decimalComma = false;
+bool isDecimalComma(const Row& row, size_t j) {
+    return decimalComma && j > 0 && j + 1 < row.size() && row[j].t == T::Ch && row[j].c == "," && row[j - 1].t == T::Ch && row[j + 1].t == T::Ch &&
+           isDigit(row[j - 1].c) && isDigit(row[j + 1].c);
+}
+std::string localNum(std::string s) {
+    if (decimalComma)
+        for (size_t j = 1; j + 1 < s.size(); j++)
+            if (s[j] == '.' && std::isdigit((unsigned char)s[j - 1]) && std::isdigit((unsigned char)s[j + 1])) s[j] = ',';
+    return s;
+}
+
 static std::string trimSpaces(const std::string& s) {
     size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
     return a == std::string::npos ? "" : s.substr(a, b - a + 1);
@@ -200,7 +212,7 @@ static std::string texItem(const Item& it) {
 
 std::string tex(const Row& row) {
     std::string s, out;
-    for (auto& it : row) s += texItem(it);
+    for (size_t j = 0; j < row.size(); j++) s += isDecimalComma(row, j) ? "{,}" : texItem(row[j]);
     bool ws = false;  // collapse whitespace runs, then trim
     for (char c : s) {
         bool w = c == ' ' || c == '\n' || c == '\t';

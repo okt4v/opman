@@ -159,6 +159,7 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
             if (pl.series.empty()) { out += "\\texttt{" + esc(plain(row)) + "}\n\n"; break; }
             double span = pl.y1 - pl.y0;
             out += "\\begin{center}\n\\begin{tikzpicture}\n\\begin{axis}[width=0.8\\linewidth, height=6.5cm, grid=major, "
+                   + std::string(decimalComma ? "/pgf/number format/use comma, " : "") +
                    "grid style={gray!25}, unbounded coords=jump, no markers, xmin=" + num(pl.x0) + ", xmax=" + num(pl.x1) +
                    ", ymin=" + num(pl.y0) + ", ymax=" + num(pl.y1) + ", restrict y to domain=" + num(pl.y0 - 4 * span) + ":" +
                    num(pl.y1 + 4 * span) + ", legend style={at={(0.5,-0.18)}, anchor=north, draw=none, legend columns=2, column sep=1em}]\n";
@@ -219,7 +220,71 @@ static std::string htmlEsc(const std::string& s) {
     return out;
 }
 
-// a top-level line's items [a, b): text with formatting tags, math as \( … \) for KaTeX
+// math as MathML, which browsers draw themselves: the file needs nothing from the network
+static std::string mathml(const Row& row);
+static std::string mrow(const Row& row) { return "<mrow>" + mathml(row) + "</mrow>"; }
+static std::string mo(const std::string& c) { return c.empty() ? "" : "<mo>" + htmlEsc(c) + "</mo>"; }
+static std::string mi(const std::string& c, bool upright = false) {
+    return std::string(upright ? "<mi mathvariant=\"normal\">" : "<mi>") + htmlEsc(c) + "</mi>";
+}
+static std::string mathml(const Row& row) {
+    std::vector<std::string> out;
+    auto base = [&] {  // what a script attaches to
+        std::string b = out.empty() ? "<mrow></mrow>" : out.back();
+        if (!out.empty()) out.pop_back();
+        return b;
+    };
+    for (size_t j = 0; j < row.size(); j++) {
+        const Item& it = row[j];
+        switch (it.t) {
+        case T::Ch: {
+            if (it.c == " ") break;
+            if (isDigit(it.c) || (it.c == "." && j + 1 < row.size() && isDigit(row[j + 1].c))) {
+                std::string n;
+                for (; j < row.size() && row[j].t == T::Ch && (isDigit(row[j].c) || row[j].c == "." || (row[j].c == "," && j + 1 < row.size() && decimalComma && isDigit(row[j + 1].c))); j++) n += row[j].c;
+                j--;
+                out.push_back("<mn>" + n + "</mn>");
+            } else if (isLetter(it.c)) out.push_back(mi(it.c));
+            else out.push_back(mo(it.c == "*" ? "⋅" : it.c == "-" ? "−" : it.c));
+            break;
+        }
+        case T::Var: out.push_back(mi(it.c)); break;
+        case T::Const: out.push_back(mi(it.c, true)); break;
+        case T::Unit: out.push_back("<mspace width=\"0.17em\"></mspace>" + mi(it.c, true)); break;
+        case T::Sym:
+            if (isStepBar(it)) out.push_back("<mspace width=\"2em\"></mspace><mo>|</mo><mspace width=\"0.28em\"></mspace>");
+            else out.push_back(mo(it.c));
+            break;
+        case T::Fn: out.push_back(mi(it.c, true) + "<mo>&#x2061;</mo>"); break;
+        case T::Frac: out.push_back("<mfrac>" + mrow(it.s[0]) + mrow(it.s[1]) + "</mfrac>"); break;
+        case T::Sup: out.push_back("<msup>" + base() + mrow(it.s[0]) + "</msup>"); break;
+        case T::Sub: out.push_back("<msub>" + base() + mrow(it.s[0]) + "</msub>"); break;
+        case T::Sqrt: out.push_back("<msqrt>" + mathml(it.s[0]) + "</msqrt>"); break;
+        case T::Lim: out.push_back("<munder><mi mathvariant=\"normal\">lim</mi>" + mrow(it.s[0]) + "</munder>"); break;
+        case T::Paren: out.push_back("<mrow>" + mo(it.o) + mathml(it.s[0]) + mo(it.cl) + "</mrow>"); break;
+        case T::Mat: {
+            std::string t = "<mtable>";
+            for (int r = 0; r < matRows(it); r++) {
+                t += "<mtr>";
+                for (int c = 0; c < it.cols; c++) t += "<mtd>" + mathml(it.s[r * it.cols + c]) + "</mtd>";
+                t += "</mtr>";
+            }
+            out.push_back("<mrow>" + mo(it.o) + t + "</mtable>" + mo(it.cl) + "</mrow>");
+            break;
+        }
+        case T::Big: {
+            const char* tag = it.m ? "munderover" : "msubsup";
+            out.push_back(std::string("<") + tag + "><mo>" + htmlEsc(it.c) + "</mo>" + mrow(it.s[0]) + mrow(it.s[1]) + "</" + tag + ">");
+            break;
+        }
+        }
+    }
+    std::string s;
+    for (auto& e : out) s += e;
+    return s;
+}
+
+// a top-level line's items [a, b): text with formatting tags, math as MathML
 static std::string htmlText(const Row& row, int a, int b) {
     static const struct { uint16_t f; const char *open, *close; } MK[] = {
         {Mark, "<mark>", "</mark>"}, {Underline, "<u>", "</u>"}, {Strike, "<s>", "</s>"}, {Bold, "<b>", "</b>"},
@@ -240,8 +305,8 @@ static std::string htmlText(const Row& row, int a, int b) {
         while (k < b && mask[k] == mask[j]) k++;
         if (mask[j]) {
             set(0);
-            std::string t = tex(Row(row.begin() + j, row.begin() + k));
-            if (!t.empty()) out += "\\(" + htmlEsc(t) + "\\)";
+            std::string t = mathml(Row(row.begin() + j, row.begin() + k));
+            if (!t.empty()) out += "<math>" + t + "</math>";
         } else
             for (int i = j; i < k; i++) {
                 set(isSpace(row[i]) ? on & row[i].f : row[i].f);
@@ -339,10 +404,10 @@ static std::string svgPlot(const Plot& pl) {
     double sx = step(pl.x1 - pl.x0), sy = step(pl.y1 - pl.y0);
     for (double t = std::ceil(pl.x0 / sx) * sx; t <= pl.x1 + 1e-9; t += sx)
         s += "<line x1=" + num(X(t)) + " x2=" + num(X(t)) + " y1=10 y2=314 class=grid /><text x=" + num(X(t)) + " y=330 text-anchor=middle>" +
-             num(std::fabs(t) < 1e-12 ? 0 : t) + "</text>";
+             localNum(num(std::fabs(t) < 1e-12 ? 0 : t)) + "</text>";
     for (double t = std::ceil(pl.y0 / sy) * sy; t <= pl.y1 + 1e-9; t += sy)
         s += "<line x1=44 x2=630 y1=" + num(Y(t)) + " y2=" + num(Y(t)) + " class=grid /><text x=38 y=" + num(Y(t) + 4) +
-             " text-anchor=end>" + num(std::fabs(t) < 1e-12 ? 0 : t) + "</text>";
+             " text-anchor=end>" + localNum(num(std::fabs(t) < 1e-12 ? 0 : t)) + "</text>";
     s += "<g clip-path=url(#c)>";
     double span = pl.y1 - pl.y0;
     for (size_t k = 0; k < pl.series.size(); k++) {
@@ -371,14 +436,11 @@ static std::string svgPlot(const Plot& pl) {
 static const char* HTML_HEAD = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%TITLE%</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
-  onload="renderMathInElement(document.body)"></script>
 <style>
 :root { --fg: #1d1d1f; --muted: #8a8a8e; --line: #e5e5e5; --bg: #fdfdfc; --side: #f6f5f3; }
 @media (prefers-color-scheme: dark) { :root { --fg: #e8e8ea; --muted: #8a8a8e; --line: #3a3a3d; --bg: #1b1b1d; --side: #222225; } }
 body { font: 17px/1.6 Inter, system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 760px; margin: 40px auto; padding: 0 16px; }
+math { font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", math; font-size: 1.1em; } math[display=block] { margin: .5em 0; }
 p { margin: .4em 0; } hr { border: 0; border-top: 1px solid var(--line); margin: 1.2em 0; }
 .section { margin: 2em 0 .6em; padding-bottom: .2em; border-bottom: 2px solid var(--fg); font-weight: 700; font-size: 1.15em; }
 blockquote { border-left: 3px solid var(--line); margin: .4em 0; padding-left: 1em; color: var(--muted); }
@@ -473,7 +535,7 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
             if (a == int(row.size())) break;
             auto mask = mathMask(row, true);
             if (std::all_of(mask.begin() + a, mask.end(), [](bool m) { return m; }))
-                out += "<p>\\[" + htmlEsc(tex(Row(row.begin() + a, row.end())) + (eqNum(doc[k], nums).empty() ? "" : " \\tag{" + eqNum(doc[k], nums).substr(1, eqNum(doc[k], nums).size() - 2) + "}")) + "\\]</p>\n";
+                out += (eqNum(doc[k], nums).empty() ? "<p>" : "<p><span class=eqn>" + eqNum(doc[k], nums) + "</span>") + "<math display=\"block\">" + mathml(Row(row.begin() + a, row.end())) + "</math></p>\n";
             else out += "<p>" + body + "</p>\n";
         }
         }

@@ -293,6 +293,7 @@ struct App {
         mathOpts.digits = std::clamp(cfg.value("digits", 10), 2, 15);
         mathOpts.degrees = cfg.value("angles", std::string("radians")) == "degrees";
         mathOpts.decimals = cfg.value("decimals", false);
+        decimalComma = cfg.value("decimalComma", false);
         mathOpts.plotX0 = cfg.value("plotX0", -10.0);
         mathOpts.plotX1 = cfg.value("plotX1", 10.0);
         if (!(mathOpts.plotX0 < mathOpts.plotX1)) mathOpts.plotX0 = -10, mathOpts.plotX1 = 10;
@@ -333,6 +334,7 @@ struct App {
         cfg["digits"] = mathOpts.digits;
         cfg["angles"] = mathOpts.degrees ? "degrees" : "radians";
         cfg["decimals"] = mathOpts.decimals;
+        cfg["decimalComma"] = decimalComma;
         cfg["plotX0"] = mathOpts.plotX0;
         cfg["plotX1"] = mathOpts.plotX1;
         cfg["recent"] = recent;
@@ -797,6 +799,7 @@ struct App {
             if (arg == "dark" || arg == "light") dark = arg == "dark";
             else if (arg == "degrees" || arg == "radians") mathOpts.degrees = arg == "degrees";
             else if (arg == "decimals" || arg == "fractions") mathOpts.decimals = arg == "decimals";
+            else if (arg == "comma" || arg == "point") decimalComma = arg == "comma";
             else if (arg == "vim" || arg == "standard") { vim = arg == "vim"; vi.mode = vim ? Mode::Normal : Mode::Insert; }
             else if (std::sscanf(arg.c_str(), "digits=%d", &n) == 1) mathOpts.digits = std::clamp(n, 2, 15);
             else { message = "Unknown option: " + arg + " (dark light · degrees radians · decimals fractions · digits=N · vim standard)"; return; }
@@ -1002,7 +1005,7 @@ struct App {
         fs::path f = fs::temp_directory_path(ec) / "opman-print" / "note.html";
         fs::create_directories(f.parent_path(), ec);
         std::string h = html(ed, media, titleOf(meta));
-        h.insert(h.rfind("</body>"), "<script>addEventListener('load', () => setTimeout(print, 600))</script>\n");  // after KaTeX
+        h.insert(h.rfind("</body>"), "<script>addEventListener('load', () => setTimeout(print, 200))</script>\n");
         if (!(std::ofstream(f, std::ios::binary) << h)) { message = "Could not write " + f.string(); return; }
         openExternal(f.string());
         message = "Opened in the browser to print";
@@ -1259,8 +1262,8 @@ struct App {
         std::string num;
         for (size_t j = 2; j < v.size(); j++) {
             const Item& it = row[v[j]];
-            if (it.t != T::Ch || !(isDigit(it.c) || it.c == "." || ((it.c == "-" || it.c == "−") && j == 2))) return false;
-            num += it.c == "−" ? "-" : it.c;
+            if (it.t != T::Ch || !(isDigit(it.c) || it.c == "." || (decimalComma && it.c == ",") || ((it.c == "-" || it.c == "−") && j == 2))) return false;
+            num += it.c == "−" ? "-" : it.c == "," ? "." : it.c;
         }
         double val;
         try { val = std::stod(num); } catch (...) { return false; }
@@ -1290,7 +1293,7 @@ struct App {
             if (s != num) {
                 row.erase(row.begin() + v[1] + 1, row.end());
                 row.push_back(M(" "));
-                for (char c : s) row.push_back(M(c == '-' ? "−" : std::string(1, c)));
+                for (char c : localNum(s)) row.push_back(M(c == '-' ? "−" : std::string(1, c)));
                 if (ed.cur.row == &row) ed.cur.i = std::min(ed.cur.i, int(row.size()));
                 changedNum = true;
             }
@@ -1473,7 +1476,7 @@ struct App {
         auto label = [](double v) {
             char s[32];
             std::snprintf(s, sizeof s, "%g", std::fabs(v) < 1e-12 ? 0.0 : v);
-            return std::string(s);
+            return localNum(s);
         };
         float fs = 12;
         double sx = niceStep(pl.x1 - pl.x0), sy = niceStep(pl.y1 - pl.y0);
@@ -1812,6 +1815,13 @@ struct App {
                 if (ImGui::RadioButton("Exact (3/4)", &dec, 0)) mathOpts.decimals = false, cfgDirty = math = true;
                 ImGui::SameLine();
                 if (ImGui::RadioButton("Decimal (0.75)", &dec, 1)) mathOpts.decimals = true, cfgDirty = math = true;
+                ImGui::TextUnformatted("Numbers");
+                ImGui::SameLine(160);
+                int comma = decimalComma;
+                if (ImGui::RadioButton("Point (2.5)", &comma, 0)) decimalComma = false, cfgDirty = math = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Comma (2,5)", &comma, 1)) decimalComma = true, cfgDirty = math = true;
+                hint("With a comma, a ; separates arguments: max(1; 2,5). A comma followed by a space still does: max(1, 2,5)");
                 section("Plots");
                 float r[2] = {float(mathOpts.plotX0), float(mathOpts.plotX1)};
                 ImGui::SetNextItemWidth(260);

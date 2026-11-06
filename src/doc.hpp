@@ -69,6 +69,12 @@ std::map<std::string, int> eqNumbers(const std::vector<Row>& doc);
 // first, then what's left over pairs up in order when as many remain (an edited line). Lines that went are absent
 std::map<int, int> followLines(const std::vector<std::pair<int, std::string>>& before, const std::vector<std::pair<int, std::string>>& after);
 
+// German numbers (Settings > Math): 2,5 is a decimal and ";" separates arguments ("max(1, 2)" with a space still splits);
+// results are shown and written with a comma
+extern bool decimalComma;
+bool isDecimalComma(const Row& row, size_t j);  // the comma at j sits between two digits and the setting is on
+std::string localNum(std::string s);            // "2.5" -> "2,5" when the setting is on (only between digits)
+
 // constructors
 Item ch(std::string c, bool m);
 inline Item M(std::string c) { return ch(std::move(c), true); }

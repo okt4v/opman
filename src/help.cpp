@@ -226,7 +226,7 @@ Pictures are stored inside the .opman file, so they travel with the note. Export
 
         {"Exporting and printing", R"(File menu > Export, or :export with a format or a path:
 `:export md` Markdown, math as $…$
-`:export html` one web page: math by KaTeX, pictures and plots inside
+`:export html` one web page that works offline: math, pictures and plots inside
 `:export tex` a LaTeX article (tables, lists, plots as pgfplots)
 `:export pdf` a PDF through pdflatex, in the background
 `:export ~/Desktop/notes.pdf` a path picks the format by its extension
@@ -332,7 +332,7 @@ Everything else (the popup, Tab, the toolbar, the palette) works the same in bot
         {"Settings", R"(Ctrl-, (or the gear in the toolbar) opens the settings; changes apply at once and are remembered.
 - Appearance: theme, text size, page width, formatting toolbar.
 - Editor: vim or standard keys, CapsLock as Escape, live results, sliders, autosave delay, what opens at start.
-- Math: significant digits, degrees or radians, fractions or decimals, default plot range.
+- Math: significant digits, degrees or radians, fractions or decimals, decimal point or comma (2,5, with ; between arguments), default plot range.
 - Files: library folder, export folder, pdflatex command, system or built-in file dialogs.
 Settings live in config.json in your user settings folder (%APPDATA%\opman, ~/Library/Application Support/opman, ~/.config/opman).)"},
     };
