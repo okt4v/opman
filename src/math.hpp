@@ -70,6 +70,9 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
 // the document as a LaTeX article (export.cpp); image paths are relative to base
 std::string latex(Editor& ed, const std::filesystem::path& base);
 
+// a PDF of whole-page pictures: RGB pixels, w x h, top row first, each page filling A4 (export.cpp)
+std::string imagePdf(const std::vector<std::string>& pages, int w, int h);
+
 // JS Number formatting, shared with the tests: String(x) and +x.toPrecision(p)
 std::string jsNum(double x);
 double toPrecision(double x, int p);

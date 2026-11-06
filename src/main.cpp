@@ -241,6 +241,11 @@ struct App {
     std::future<int> pdfJob;                          // pdflatex in the background
     fs::path pdfOut, pdfTmp;
     bool printing = false;  // the running PDF export is for :print
+    int pdfEngine = 0;      // 0 pdflatex when it's installed, else built-in; 1 pdflatex; 2 built-in
+    bool pdfWanted = false; // the main loop renders the built-in PDF to pdfOut after this frame
+    bool printMode = false; // drawing a PDF page: no caret, results or selection
+    float printTop = 48;    // the page's first line, in document coordinates (the first line is at 48)
+    std::vector<float> lineStarts;  // document y of each line, drawn in print mode: where pages can break
     std::vector<std::string> history;                 // notes opened before, for Ctrl-o
     bool goingBack = false;
     mutable std::map<std::string, std::pair<fs::file_time_type, std::string>> texts;  // lowercase text per note
@@ -283,6 +288,7 @@ struct App {
         nativeDialogs = cfg.value("nativeDialogs", true);
         exportDir = cfg.value("exportDir", std::string());
         pdflatex = cfg.value("pdflatex", std::string("pdflatex"));
+        pdfEngine = std::clamp(cfg.value("pdfEngine", 0), 0, 2);
         completeOpts.popup = cfg.value("completePopup", true);
         completeOpts.minLetters = std::clamp(cfg.value("completeMinLetters", 1), 1, 4);
         completeOpts.maxItems = std::clamp(cfg.value("completeMaxItems", 9), 3, 15);
@@ -324,6 +330,7 @@ struct App {
         cfg["nativeDialogs"] = nativeDialogs;
         cfg["exportDir"] = exportDir;
         cfg["pdflatex"] = pdflatex;
+        cfg["pdfEngine"] = pdfEngine;
         cfg["completePopup"] = completeOpts.popup;
         cfg["completeMinLetters"] = completeOpts.minLetters;
         cfg["completeMaxItems"] = completeOpts.maxItems;
@@ -800,6 +807,7 @@ struct App {
             else if (arg == "degrees" || arg == "radians") mathOpts.degrees = arg == "degrees";
             else if (arg == "decimals" || arg == "fractions") mathOpts.decimals = arg == "decimals";
             else if (arg == "comma" || arg == "point") decimalComma = arg == "comma";
+            else if (arg == "pdf=auto" || arg == "pdf=latex" || arg == "pdf=builtin") pdfEngine = arg == "pdf=auto" ? 0 : arg == "pdf=latex" ? 1 : 2;
             else if (arg == "vim" || arg == "standard") { vim = arg == "vim"; vi.mode = vim ? Mode::Normal : Mode::Insert; }
             else if (std::sscanf(arg.c_str(), "digits=%d", &n) == 1) mathOpts.digits = std::clamp(n, 2, 15);
             else { message = "Unknown option: " + arg + " (dark light · degrees radians · decimals fractions · digits=N · vim standard)"; return; }
@@ -956,7 +964,12 @@ struct App {
             message = ok ? "Exported to " + out.string() : "Could not write " + out.string();
             return;
         }
-        if (pdfJob.valid()) { message = "A PDF export is still running"; return; }
+        if (pdfJob.valid() || pdfWanted) { message = "A PDF export is still running"; return; }
+        if (ext == ".pdf" && (pdfEngine == 2 || (pdfEngine == 0 && !onPath(pdflatex.empty() ? "pdflatex" : pdflatex)))) {
+            pdfOut = out, pdfWanted = true;
+            message = "Exporting PDF…";
+            return;
+        }
         std::string tex = latex(ed, media);
         fs::path file = out;
         std::error_code ec;
@@ -997,7 +1010,7 @@ struct App {
         fs::create_directories(tmp, ec);
         printing = true;
         exportTo((tmp / "note.pdf").string());
-        if (!pdfJob.valid()) printing = false, printHtml();
+        if (!pdfJob.valid() && !pdfWanted) printing = false, printHtml();
         else message = "Preparing to print…";
     }
     void printHtml() {
@@ -1021,29 +1034,148 @@ struct App {
         std::thread([cmd] { (void)std::system(cmd.c_str()); }).detach();
     }
 
+    void sendToPrinter(const std::string& f) {
+#ifdef _WIN32
+        std::string cmd = "powershell -NoProfile -Command \"Start-Process -FilePath '" + f + "' -Verb Print\"";
+#else
+        std::string cmd = "lp \"" + f + "\" >/dev/null 2>&1";
+#endif
+        message = "Sent to the printer";
+        std::thread([cmd, f] {
+            if (std::system(cmd.c_str()) != 0) openExternal(f);  // no lp or no printer: open the PDF to print from there
+        }).detach();
+    }
+
+    // is this command a file, or on PATH?
+    static bool onPath(const std::string& cmd) {
+        std::error_code ec;
+        if (cmd.find_first_of("/\\") != std::string::npos) return fs::exists(cmd, ec);
+        const char* env = std::getenv("PATH");
+        std::string path = env ? env : "", dir;
+#ifdef _WIN32
+        const char sep = ';';
+#else
+        const char sep = ':';
+#endif
+        for (char c : path + sep) {
+            if (c != sep) { dir += c; continue; }
+            if (!dir.empty() && (fs::exists(fs::path(dir) / cmd, ec) || fs::exists(fs::path(dir) / (cmd + ".exe"), ec))) return true;
+            dir.clear();
+        }
+        return false;
+    }
+
     void pdfDone() {  // polled each frame; the PDF's existence is the result
         if (!pdfJob.valid() || pdfJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
         pdfJob.get();
         std::error_code ec;
+        if (!fs::exists(pdfTmp / "note.pdf") && pdfEngine == 0) { pdfWanted = true; return; }  // LaTeX failed (a missing package): still give a PDF
         if (printing) {
             printing = false;
             if (!fs::exists(pdfTmp / "note.pdf")) return printHtml();
             fs::copy_file(pdfTmp / "note.pdf", pdfOut, fs::copy_options::overwrite_existing, ec);
-            std::string f = pdfOut.string();
-#ifdef _WIN32
-            std::string cmd = "powershell -NoProfile -Command \"Start-Process -FilePath '" + f + "' -Verb Print\"";
-#else
-            std::string cmd = "lp \"" + f + "\" >/dev/null 2>&1";
-#endif
-            message = "Sent to the printer";
-            std::thread([cmd, f] {
-                if (std::system(cmd.c_str()) != 0) openExternal(f);  // no lp or no printer: open the PDF to print from there
-            }).detach();
-            return;
+            return sendToPrinter(pdfOut.string());
         }
         if (!fs::exists(pdfTmp / "note.pdf")) { message = "pdflatex failed, see " + (pdfTmp / "note.log").string(); return; }
         fs::copy_file(pdfTmp / "note.pdf", pdfOut, fs::copy_options::overwrite_existing, ec);
         message = ec ? "Could not write " + pdfOut.string() : "Exported to " + pdfOut.string();
+    }
+
+    // ---------- the built-in PDF: A4 pages drawn by the app itself into a texture, as pictures ----------
+    // ponytail: pictures, so a PDF's text can't be selected; pdflatex gives real text when it's installed
+    void renderPdf() {
+        pdfWanted = false;
+#ifdef _WIN32
+#define OM_GL __stdcall
+#else
+#define OM_GL
+#endif
+        auto genFb = (void(OM_GL*)(int, unsigned*))glfwGetProcAddress("glGenFramebuffers");
+        auto bindFb = (void(OM_GL*)(unsigned, unsigned))glfwGetProcAddress("glBindFramebuffer");
+        auto attach = (void(OM_GL*)(unsigned, unsigned, unsigned, unsigned, int))glfwGetProcAddress("glFramebufferTexture2D");
+        auto delFb = (void(OM_GL*)(int, const unsigned*))glfwGetProcAddress("glDeleteFramebuffers");
+        if (!genFb || !bindFb || !attach || !delFb) { message = "Could not render the PDF"; printing = false; return; }
+        const unsigned FRAMEBUFFER = 0x8D40, COLOR0 = 0x8CE0;
+        const float W = 794, H = 1123, S = 2.5f;  // A4 at 96 dpi, drawn at 240
+        const int pw = int(W * S), ph = int(H * S);
+        ImGuiIO& io = ImGui::GetIO();
+        unsigned fb = 0, tex = 0;
+        genFb(1, &fb);
+        bindFb(FRAMEBUFFER, fb);
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        attach(FRAMEBUFFER, COLOR0, GL_TEXTURE_2D, tex, 0);
+        bool dark0 = dark;
+        dark = false;
+        printMode = true;
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        auto page = [&](float top, float bottom, std::string* out) {
+            printTop = top;
+            lineStarts.clear();
+            ImGui_ImplOpenGL3_NewFrame();
+            io.DisplaySize = {W, H};
+            io.DisplayFramebufferScale = {S, S};
+            ImGui::NewFrame();
+            L.pal = &LIGHT;
+            ImGui::SetNextWindowPos({0, 0});
+            ImGui::SetNextWindowSize({W, H});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32_WHITE);
+            ImGui::Begin("##pdf", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::PushClipRect({0, 46}, {W, bottom - top + 48}, true);  // this page's lines, not its neighbours'
+            drawDoc();
+            ImGui::PopClipRect();
+            ImGui::End();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+            ImGui::Render();
+            bindFb(FRAMEBUFFER, fb);
+            glViewport(0, 0, pw, ph);
+            glClearColor(1, 1, 1, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            if (!out) return;
+            std::string flipped(size_t(pw) * ph * 3, 0), px(size_t(pw) * ph * 3, 0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, pw, ph, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+            for (int y = 0; y < ph; y++) std::memcpy(&flipped[size_t(y) * pw * 3], &px[size_t(ph - 1 - y) * pw * 3], size_t(pw) * 3);
+            *out = std::move(flipped);
+        };
+        page(48, 1e9f, nullptr);  // measures the lines, and the plots' shape on a page
+        if (plotAspect > 0) {
+            mathOpts.plotAspect = plotAspect;
+            plotAspect = 0;
+            std::erase_if(lineCache, [](auto& e) { return e.second.plot && e.second.plot->equal; });
+            changed(true);
+            page(48, 1e9f, nullptr);
+        }
+        std::vector<float> starts = lineStarts;  // the last entry is where the note ends
+        std::vector<std::string> pages;
+        for (float top = 48; top < starts.back() - 0.5f || pages.empty();) {
+            float bottom = top;
+            for (float s : starts)
+                if (s <= top + H - 96) bottom = std::max(bottom, s);
+            if (bottom <= top) {  // a line taller than a page: it gets the page, cut off
+                auto next = std::upper_bound(starts.begin(), starts.end(), top);
+                bottom = next == starts.end() ? starts.back() : *next;
+            }
+            pages.emplace_back();
+            page(top, bottom, &pages.back());
+            top = bottom;
+        }
+        bindFb(FRAMEBUFFER, 0);
+        delFb(1, &fb);
+        glDeleteTextures(1, &tex);
+        printMode = false;
+        dark = dark0;
+        L.pal = &pal();
+        std::string file = imagePdf(pages, pw, ph);
+        bool ok = bool(std::ofstream(pdfOut, std::ios::binary) << file);
+        if (ok && printing) { printing = false; return sendToPrinter(pdfOut.string()); }
+        printing = false;
+        message = ok ? "Exported to " + pdfOut.string() + " (pictures: text can't be selected)" : "Could not write " + pdfOut.string();
     }
 
     Tex& texture(const std::string& path) {
@@ -1531,12 +1663,13 @@ struct App {
     void drawDoc() {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 origin = ImGui::GetCursorScreenPos();
-        float avail = ImGui::GetContentRegionAvail().x, colW = std::min(pageWidth, avail);
+        float avail = ImGui::GetContentRegionAvail().x, colW = printMode ? avail : std::min(pageWidth, avail);
         float x0 = origin.x + std::max(0.f, (avail - colW) / 2) + 32, y = origin.y + 48, maxW = 0;
+        if (printMode) y += 48 - printTop;
         L.dl = dl;
-        L.ed = &ed;
+        L.ed = printMode ? nullptr : &ed;
         L.stops.clear();
-        auto vl = vi.visualLines(ed);
+        auto vl = printMode ? std::nullopt : vi.visualLines(ed);
         const Palette& p = pal();
         float blockW = colW - 64;
         bool slid = false;  // a slider changed the doc during this frame
@@ -1544,7 +1677,8 @@ struct App {
         for (size_t k = 0; k < ed.doc.size(); k++) {
             const Row& row = ed.doc[k];
             Line kind = lineStyle(row).kind;
-            bool here = ed.topOf(ed.cur.row) == &row, first = k == 0 || lineStyle(ed.doc[k - 1]).kind != kind;
+            if (printMode) lineStarts.push_back(y + printTop - 48);
+            bool here = !printMode && ed.topOf(ed.cur.row) == &row, first = k == 0 || lineStyle(ed.doc[k - 1]).kind != kind;
             if (kind == Line::Table && first) tableTabs(k);
             if (kind != Line::Table) L.tabs.clear();
             L.tableHeader = kind == Line::Table && first;
@@ -1592,11 +1726,11 @@ struct App {
                 else h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], x0, y + h, blockW, int(k)) + 12;
             }
             float w = b.w;
-            if (k < ghosts.size() && ghosts[k]) {
+            if (!printMode && k < ghosts.size() && ghosts[k]) {
                 L.drawText(ghosts[k]->text, x0 + b.w + 0.5f * L.textSize, base, L.textSize * 0.9f, alpha(p.muted, 0.85f));
                 w += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
             }
-            if (kind == Line::Text && sliders) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
+            if (kind == Line::Text && sliders && !printMode) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
             maxW = std::max(maxW, w);
             y += h;
         }
@@ -1605,6 +1739,7 @@ struct App {
             changed();
             scrollToCaret = false;  // dragging a slider shouldn't scroll back to the cursor
         }
+        if (printMode) { lineStarts.push_back(y + printTop - 48); return; }
         // search matches: everything the pattern hits, as you type it after "/"
         if (std::string pat = vi.highlight(); !pat.empty()) {
             std::unordered_map<const Row*, std::vector<const Stop*>> at;
@@ -1854,6 +1989,9 @@ struct App {
                         saveCfg();
                     }, true);
                 static char tex[256];
+                ImGui::SetNextItemWidth(260);
+                if (ImGui::Combo("PDF export", &pdfEngine, "Automatic\0pdflatex\0Built-in (no LaTeX)\0")) cfgDirty = true;
+                hint("Built-in needs nothing installed and looks like the app, but pages are pictures, so text can't be selected. Automatic uses pdflatex when it's installed");
                 std::snprintf(tex, sizeof tex, "%s", pdflatex.c_str());
                 ImGui::SetNextItemWidth(260);
                 if (ImGui::InputText("pdflatex command", tex, sizeof tex)) pdflatex = tex, cfgDirty = true;
@@ -2845,6 +2983,7 @@ int main(int argc, char** argv) {
             break;
         }
         glfwSwapBuffers(win);
+        if (app.pdfWanted) app.renderPdf();
     }
     app.saveNow();
     ImGui_ImplOpenGL3_Shutdown();

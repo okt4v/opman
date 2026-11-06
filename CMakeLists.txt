@@ -62,6 +62,7 @@ target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)  # math italic letter
 add_library(opman_core STATIC src/doc.cpp src/edit.cpp src/math.cpp src/vi.cpp src/export.cpp src/help.cpp)
 target_include_directories(opman_core PUBLIC src)
 target_link_libraries(opman_core PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(opman_core PRIVATE ${stb_SOURCE_DIR})  # stb_image_write's zlib, for built-in PDFs
 
 add_executable(opman src/main.cpp src/layout.cpp src/dialog.cpp)
 target_link_libraries(opman PRIVATE opman_core imgui)

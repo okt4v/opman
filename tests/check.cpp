@@ -934,6 +934,17 @@ static void checkVi() {
         CHECK_EQ(localNum("2.5"), "2.5");
     }
 
+    // the built-in PDF's container: two pages with a good xref
+    {
+        std::string pdf = imagePdf({std::string(12, char(255)), std::string(12, char(0))}, 2, 2);
+        CHECK(pdf.starts_with("%PDF-1.4") && pdf.ends_with("%%EOF\n"));
+        CHECK(pdf.find("/Count 2") != std::string::npos);
+        size_t x = pdf.rfind("startxref\n") + 10;
+        size_t table = std::stoul(pdf.substr(x));
+        CHECK(pdf.compare(table, 4, "xref") == 0);
+        CHECK(pdf.compare(std::stoul(pdf.substr(table + pdf.substr(table).find("\n", 8) + 21, 10)), 7, "1 0 obj") == 0);
+    }
+
     // matrices in insert mode: Shift+Space grows a column, Shift+Enter a row
     keys(ed, vi, "oA = (1<S-Space>2<S-CR>3<Tab>4<Esc>");
     CHECK(lineTex(ed.doc.back()).find("\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}") != std::string::npos);

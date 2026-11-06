@@ -228,14 +228,15 @@ Pictures are stored inside the .opman file, so they travel with the note. Export
 `:export md` Markdown, math as $…$
 `:export html` one web page that works offline: math, pictures and plots inside
 `:export tex` a LaTeX article (tables, lists, plots as pgfplots)
-`:export pdf` a PDF through pdflatex, in the background
+`:export pdf` a PDF: through pdflatex in the background when it's installed, else drawn by opman itself
 `:export ~/Desktop/notes.pdf` a path picks the format by its extension
 Without a path the file goes to the export folder (Settings > Files, your home folder by default) named after the note.
 
-PDF export needs a TeX installation (TeX Live, MiKTeX or MacTeX) with amsmath, pgfplots, soul and ulem; set the pdflatex command in Settings > Files if it isn't on your PATH.
+pdflatex needs a TeX installation (TeX Live, MiKTeX or MacTeX) with amsmath, pgfplots, soul and ulem; set its command in Settings > Files if it isn't on your PATH.
+Without it, or with Settings > Files > PDF export set to Built-in (:set pdf=builtin), opman draws the A4 pages itself. It looks like the app, but pages are pictures, so text can't be selected.
 
 ## Printing
-File menu > Print, :print, or Ctrl-p (standard keys) sends the note to your default printer as a PDF. Without pdflatex (or a printer command) the note opens in your browser with its print dialog instead.)"},
+File menu > Print, :print, or Ctrl-p (standard keys) sends the note to your default printer as a PDF. Without a printer command the PDF opens in your viewer so you can print from there.)"},
 
         {"Search and replace", R"(`/` search forward, `?` backward (vim keys); Ctrl-f in standard keys
 `n` `N` next / previous match
@@ -333,7 +334,7 @@ Everything else (the popup, Tab, the toolbar, the palette) works the same in bot
 - Appearance: theme, text size, page width, formatting toolbar.
 - Editor: vim or standard keys, CapsLock as Escape, live results, sliders, autosave delay, what opens at start.
 - Math: significant digits, degrees or radians, fractions or decimals, decimal point or comma (2,5, with ; between arguments), default plot range.
-- Files: library folder, export folder, pdflatex command, system or built-in file dialogs.
+- Files: library folder, export folder, PDF export (pdflatex or built-in), pdflatex command, system or built-in file dialogs.
 Settings live in config.json in your user settings folder (%APPDATA%\opman, ~/Library/Application Support/opman, ~/.config/opman).)"},
     };
     return topics;

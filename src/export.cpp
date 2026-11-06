@@ -8,8 +8,41 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include <stb_image_write.h>
 
 namespace om {
+
+std::string imagePdf(const std::vector<std::string>& pages, int w, int h) {
+    std::string out = "%PDF-1.4\n";
+    std::vector<size_t> at;
+    auto obj = [&](const std::string& head, const std::string& stream = {}, bool hasStream = false) {
+        at.push_back(out.size());
+        out += std::to_string(at.size()) + " 0 obj\n<<" + head;
+        if (hasStream) out += " /Length " + std::to_string(stream.size()) + " >>\nstream\n" + stream + "\nendstream";
+        else out += " >>";
+        out += "\nendobj\n";
+    };
+    std::string kids;
+    for (size_t p = 0; p < pages.size(); p++) kids += std::to_string(3 + 3 * p) + " 0 R ";
+    obj(" /Type /Catalog /Pages 2 0 R");
+    obj(" /Type /Pages /Count " + std::to_string(pages.size()) + " /Kids [" + kids + "]");
+    const std::string draw = "q 595.28 0 0 841.89 0 0 cm /Im Do Q";
+    for (size_t p = 0; p < pages.size(); p++) {
+        int n = 3 + 3 * int(p), size = 0;
+        obj(" /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents " + std::to_string(n + 1) + " 0 R /Resources << /XObject << /Im " + std::to_string(n + 2) + " 0 R >> >>");
+        obj("", draw, true);
+        unsigned char* z = stbi_zlib_compress((unsigned char*)pages[p].data(), int(pages[p].size()), &size, 8);
+        obj(" /Type /XObject /Subtype /Image /Width " + std::to_string(w) + " /Height " + std::to_string(h) + " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode", std::string((char*)z, size), true);
+        STBIW_FREE(z);
+    }
+    size_t xref = out.size();
+    char line[32];
+    out += "xref\n0 " + std::to_string(at.size() + 1) + "\n0000000000 65535 f \n";
+    for (size_t a : at) std::snprintf(line, sizeof line, "%010zu 00000 n \n", a), out += line;
+    return out + "trailer\n<< /Size " + std::to_string(at.size() + 1) + " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+}
 
 // equation tags and references for export: the tag dropped, each [#ref] as its number "(n)"
 static Row eqPlain(const Row& row, const std::map<std::string, int>& nums) {

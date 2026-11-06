@@ -103,10 +103,11 @@ Also:
 `:export` takes a file name or just a format: `md` (default), `html`, `tex` or `pdf`. Without a path it writes
 `~/<title>.<ext>`.
 - **HTML**: one shareable file that works offline; math as MathML (browsers draw it themselves), images inlined, plots as SVG.
-- **PDF**: runs `pdflatex` in the background (needs a TeX distribution with amsmath, pgfplots, soul and ulem).
+- **PDF**: runs `pdflatex` in the background when it's installed (a TeX distribution with amsmath, pgfplots, soul and
+  ulem). Otherwise, or with Settings > Files > PDF export (`:set pdf=builtin`), the app draws A4 pages itself: nothing to
+  install and it looks like the app, but pages are pictures, so text can't be selected.
 - **LaTeX**: lists, quotes and tables become environments, lines of only math display math, plots pgfplots.
-- **Print**: `:print` (File > Print) sends a PDF to the default printer (`lp`; on Windows the PDF viewer's Print), or
-  opens the note in the browser's print dialog without pdflatex.
+- **Print**: `:print` (File > Print) sends a PDF to the default printer (`lp`; on Windows the PDF viewer's Print).
 
 ## Releases
 
