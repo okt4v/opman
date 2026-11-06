@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -54,6 +55,16 @@ std::string sectionTitle(const Row& row);                            // "=== Exe
 std::pair<int, int> sectionOf(const Doc& doc, int k);                // lines [a, b) of the section line k is in
 std::vector<std::pair<int, int>> linkSpans(const Row& row);          // "[[note title]]" in text: items [a, b), brackets included
 std::string linkTitle(const Row& row, std::pair<int, int> span);
+// equation numbers: "E = mc^2 #energy" tags a line (numbered in document order); "[#energy]" refers to it.
+// eqTag: the trailing "#name" as items [a, size), or {-1, -1}; eqRefs: "[#name]" spans; eqName: the name in either
+std::pair<int, int> eqTag(const Row& row);
+// an equation transformation step: "2x = 4 | :2". The bar is a Sym "|" (LaTeX \qquad|\;); stepBar gives its index in
+// a top-level line, or -1. What follows it is the step: shown, never calculated
+inline bool isStepBar(const Item& it) { return it.t == T::Sym && it.c == "|" && it.l == "\\qquad|\\;"; }
+int stepBar(const Row& row);
+std::vector<std::pair<int, int>> eqRefs(const Row& row);
+std::string eqName(const Row& row, std::pair<int, int> span);
+std::map<std::string, int> eqNumbers(const std::vector<Row>& doc);
 
 // constructors
 Item ch(std::string c, bool m);
@@ -102,12 +113,14 @@ struct Path {
 nlohmann::json pathJson(const Path& p);
 Path pathFromJson(const nlohmann::json& j);
 
-// files: one JSON per document in a folder
+// files: one JSON per document: name.opman ({format, meta, doc, path, media}), or corca's name.json
 namespace fs = std::filesystem;
 struct FileInfo {
-    std::string name;
+    std::string name;  // the file's full path
     nlohmann::json meta;
 };
+std::string base64(const std::string& bytes);
+std::string unbase64(const std::string& text);
 bool validName(const std::string& name);
 std::vector<FileInfo> listDocs(const fs::path& dir);
 bool readFile(const fs::path& file, nlohmann::json& out);

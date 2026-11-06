@@ -5,6 +5,8 @@
 #include "layout.hpp"
 #include "math.hpp"
 #include "vi.hpp"
+#include "dialog.hpp"
+#include "help.hpp"
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -18,9 +20,13 @@
 #include <cstring>
 #include <ctime>
 #include <array>
+#include <bit>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <map>
+#include <random>
+#include <thread>
 #include <unordered_map>
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_WINDOWS_UTF8
@@ -137,8 +143,10 @@ static std::string utf8(unsigned cp) {
     return s;
 }
 
+static bool g_capsEscape = true;  // setting: CapsLock remapped to Escape (caps:escape) works as Escape
 static void onKey(GLFWwindow*, int key, int scancode, int action, int mods) {
     if (key == GLFW_KEY_CAPS_LOCK) {
+        if (!g_capsEscape) return;
         // xkb "caps:escape" (sway, GNOME, KDE) remaps the keysym, but GLFW reports the physical key. A real CapsLock
         // flips the lock state, which shows in the mods of its press (turning off) or release (turning on); a key
         // that never touches the lock is an Escape. Fires on release, which is not noticeable.
@@ -170,16 +178,18 @@ static void onKey(GLFWwindow*, int key, int scancode, int action, int mods) {
     case GLFW_KEY_DOWN: k.sp = Key::Down; break;
     case GLFW_KEY_HOME: k.sp = Key::Home; break;
     case GLFW_KEY_END: k.sp = Key::End; break;
+    case GLFW_KEY_F1: k.sp = Key::F1; break;
     default: {
         if (!ctrl || alt) return;  // typed characters come through onChar; Ctrl+Alt is AltGr on Windows
         const char* name = glfwGetKeyName(key, scancode);  // the layout's letter, so Ctrl-z is z on every layout
         std::string s = name ? name : "";
+        if (key == GLFW_KEY_SPACE) s = " ";  // Ctrl-Space: open the suggestions
         if (s.size() != 1) {
             if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) s = std::string(1, char('a' + key - GLFW_KEY_A));
             else if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9) s = std::string(1, char('0' + key - GLFW_KEY_0));
             else return;
         }
-        s[0] = char(std::tolower((unsigned char)s[0]));
+        if (s != " ") s[0] = char(std::tolower((unsigned char)s[0]));
         if (s == "[") k.sp = Key::Esc;  // Ctrl-[ is Esc, as in vim
         else k.ch = s, k.ctrl = true;
     }
@@ -229,6 +239,7 @@ struct App {
     std::map<int, Plot> viewPlots;
     std::future<int> pdfJob;                          // pdflatex in the background
     fs::path pdfOut, pdfTmp;
+    bool printing = false;  // the running PDF export is for :print
     std::vector<std::string> history;                 // notes opened before, for Ctrl-o
     bool goingBack = false;
     mutable std::map<std::string, std::pair<fs::file_time_type, std::string>> texts;  // lowercase text per note
@@ -238,29 +249,107 @@ struct App {
     double changedAt = -1;
     bool sidebar = true, sideFocus = false, focusFilter = false, dark = true, quit = false, noSave = false;
     bool scrollToCaret = true, dragging = false;
-    int sideSel = 0, sort = 0;
+    int sideSel = 0, sort = 0, sideTab = 0;  // sideTab: 0 notes, 1 outline
+    bool showHelp = false, showSettings = false, showPalette = false;
+    std::string helpTopic;
+    char paletteQuery[128] = "", helpQuery[128] = "";
+    int paletteSel = 0;
+    bool panelFocused = false;  // a settings/help/browser window had the keyboard last frame: keys aren't the document's
     char filter[128] = "";
     ImVec2 caretPos{-1, -1};
 
-    // ---------- config and files ----------
+    // ---------- settings (config.json) ----------
+    float textSize = 18, pageWidth = 820, autosave = 0.5f;
+    bool toolbar = true, vim = true, results = true, sliders = true, openLast = true, nativeDialogs = true;
+    std::string exportDir, pdflatex = "pdflatex";
+    std::vector<std::string> recent;  // notes opened from outside the library folder, newest first
+
     void loadCfg() {
         readFile(cfgFile, cfg);
         if (!cfg.is_object()) cfg = json::object();
         sidebar = cfg.value("sidebar", true);
         sort = cfg.value("sort", 0);
         dark = cfg.value("theme", std::string("dark")) != "light";
+        textSize = std::clamp(cfg.value("textSize", 18.f), 12.f, 32.f);
+        pageWidth = std::clamp(cfg.value("pageWidth", 820.f), 500.f, 2000.f);
+        autosave = std::clamp(cfg.value("autosave", 0.5f), 0.f, 60.f);
+        toolbar = cfg.value("toolbar", true);
+        vim = cfg.value("keys", std::string("vim")) == "vim";
+        g_capsEscape = cfg.value("capsEscape", true);
+        results = cfg.value("results", true);
+        sliders = cfg.value("sliders", true);
+        openLast = cfg.value("openLast", true);
+        nativeDialogs = cfg.value("nativeDialogs", true);
+        exportDir = cfg.value("exportDir", std::string());
+        pdflatex = cfg.value("pdflatex", std::string("pdflatex"));
+        completeOpts.popup = cfg.value("completePopup", true);
+        completeOpts.minLetters = std::clamp(cfg.value("completeMinLetters", 1), 1, 4);
+        completeOpts.maxItems = std::clamp(cfg.value("completeMaxItems", 9), 3, 15);
+        completeOpts.accept = std::clamp(cfg.value("completeAccept", 0), 0, 2);
+        completeOpts.convert = cfg.value("completeConvert", true);
+        completeOpts.combos = cfg.value("completeCombos", true);
+        completeOpts.learn = cfg.value("completeLearn", true);
+        mathOpts.digits = std::clamp(cfg.value("digits", 10), 2, 15);
+        mathOpts.degrees = cfg.value("angles", std::string("radians")) == "degrees";
+        mathOpts.decimals = cfg.value("decimals", false);
+        mathOpts.plotX0 = cfg.value("plotX0", -10.0);
+        mathOpts.plotX1 = cfg.value("plotX1", 10.0);
+        if (!(mathOpts.plotX0 < mathOpts.plotX1)) mathOpts.plotX0 = -10, mathOpts.plotX1 = 10;
+        recent.clear();
+        if (cfg.contains("recent") && cfg["recent"].is_array())
+            for (auto& r : cfg["recent"])
+                if (r.is_string()) recent.push_back(r.get<std::string>());
         if (const char* d = std::getenv("OPMAN_DOCS")) dir = d;
-        else if (cfg.contains("dir") && cfg["dir"].is_string()) dir = fs::path(cfg["dir"].get<std::string>());
+        else if (cfg.contains("dir") && cfg["dir"].is_string() && !cfg["dir"].get<std::string>().empty()) dir = fs::path(cfg["dir"].get<std::string>());
         else dir = home() / "Documents" / "opman";
         std::error_code ec;
         fs::create_directories(dir, ec);
+        applySizes();
     }
     void saveCfg() {
         cfg["sidebar"] = sidebar;
         cfg["sort"] = sort;
         cfg["theme"] = dark ? "dark" : "light";
+        cfg["textSize"] = textSize;
+        cfg["pageWidth"] = pageWidth;
+        cfg["autosave"] = autosave;
+        cfg["toolbar"] = toolbar;
+        cfg["keys"] = vim ? "vim" : "standard";
+        cfg["capsEscape"] = g_capsEscape;
+        cfg["results"] = results;
+        cfg["sliders"] = sliders;
+        cfg["openLast"] = openLast;
+        cfg["nativeDialogs"] = nativeDialogs;
+        cfg["exportDir"] = exportDir;
+        cfg["pdflatex"] = pdflatex;
+        cfg["completePopup"] = completeOpts.popup;
+        cfg["completeMinLetters"] = completeOpts.minLetters;
+        cfg["completeMaxItems"] = completeOpts.maxItems;
+        cfg["completeAccept"] = completeOpts.accept;
+        cfg["completeConvert"] = completeOpts.convert;
+        cfg["completeCombos"] = completeOpts.combos;
+        cfg["completeLearn"] = completeOpts.learn;
+        cfg["digits"] = mathOpts.digits;
+        cfg["angles"] = mathOpts.degrees ? "degrees" : "radians";
+        cfg["decimals"] = mathOpts.decimals;
+        cfg["plotX0"] = mathOpts.plotX0;
+        cfg["plotX1"] = mathOpts.plotX1;
+        cfg["recent"] = recent;
+        if (!std::getenv("OPMAN_DOCS")) cfg["dir"] = dir.string();
         writeFile(cfgFile, cfg);
     }
+    void applySizes() {
+        L.textSize = textSize;
+        L.mathSize = textSize * 1.15f;
+    }
+    // settings that change results: recompute every line
+    void mathChanged() {
+        lineCache.clear();
+        changed(true);
+        saveCfg();
+    }
+
+    // ---------- files ----------
     static std::string str(const json& m, const char* k) { return m.contains(k) && m[k].is_string() ? m[k].get<std::string>() : ""; }
     static std::string titleOf(const json& m) {
         std::string t = str(m, "title");
@@ -270,6 +359,23 @@ struct App {
     static std::string lower(std::string s) {
         for (auto& c : s) c = char(std::tolower((unsigned char)c));
         return s;
+    }
+    bool inLibrary(const fs::path& f) const {
+        std::error_code ec;
+        return fs::equivalent(f.parent_path(), dir, ec);
+    }
+    // a file name from a title: no characters Windows forbids, unique in the folder ("Notes 2.opman")
+    fs::path freeName(const fs::path& folder, std::string title, const fs::path& self = {}) const {
+        for (auto& c : title)
+            if (std::strchr("/\\:*?\"<>|", c) || (unsigned char)c < 32) c = '-';
+        while (!title.empty() && (title.back() == '.' || title.back() == ' ')) title.pop_back();
+        if (title.empty()) title = "Untitled";
+        if (title.size() > 80) title.resize(80);
+        fs::path f = folder / (title + ".opman");
+        std::error_code ec;
+        for (int n = 2; fs::exists(f) && !(!self.empty() && fs::equivalent(f, self, ec)); n++)
+            f = folder / (title + " " + std::to_string(n) + ".opman");
+        return f;
     }
     std::vector<FileInfo> sortedFiles() const {
         std::vector<FileInfo> out;
@@ -284,16 +390,32 @@ struct App {
         });
         return out;
     }
+    // the library's notes and the recent ones from elsewhere
+    void listFiles() {
+        files = listDocs(dir);
+        std::erase_if(recent, [&](auto& r) { std::error_code ec; return !fs::exists(r, ec); });
+        for (auto& r : recent) {
+            if (std::any_of(files.begin(), files.end(), [&](auto& f) { std::error_code ec; return fs::equivalent(f.name, r, ec); })) continue;
+            json d;
+            if (readFile(r, d) && d.is_object()) files.push_back({r, d.contains("meta") && d["meta"].is_object() ? d["meta"] : json::object()});
+        }
+    }
+    void remember(const std::string& path) {
+        if (inLibrary(path)) return;
+        std::erase(recent, path);
+        recent.insert(recent.begin(), path);
+        if (recent.size() > 20) recent.resize(20);
+    }
 
     // a note's plain text, lowercase, read again when the file changes (search, backlinks)
     const std::string& noteText(const std::string& name) const {
         std::error_code ec;
-        auto t = fs::last_write_time(dir / name, ec);
+        auto t = fs::last_write_time(name, ec);
         auto& e = texts[name];
         if (e.first != t || e.second.empty()) {
             json d;
             std::string s;
-            if (readFile(dir / name, d) && d.is_object())
+            if (readFile(name, d) && d.is_object())
                 for (auto& r : docFromJson(d.value("doc", json::array()))) s += plain(r) + "\n";
             e = {t, lower(s)};
         }
@@ -324,84 +446,264 @@ struct App {
         return {{"autoTitle", docTitle(ed.doc)}, {"words", words}, {"lines", ed.doc.size()}, {"defines", definedNames(ed)}};
     }
 
+    // ---------- media: pictures travel inside the .opman file ----------
+    // While a note is open its pictures are files in a cache folder (by the note's id), so drawing and the exports
+    // read ordinary files; saving packs every picture the note shows back into the file, base64.
+    fs::path media;                                   // the open note's cache folder; image lines are relative to it
+    std::map<std::string, std::pair<uintmax_t, std::string>> packed;  // path -> (size, base64), not to re-encode
+
+    std::vector<std::string> imagePaths() const {
+        std::vector<std::string> out;
+        for (auto& r : ed.doc) {
+            std::string alt, path;
+            if (lineStyle(r).kind == Line::Image && imageRef(r, alt, path) && fs::path(path).is_relative()) out.push_back(path);
+        }
+        return out;
+    }
+    void unpackMedia(const json& d, const fs::path& noteFolder) {
+        std::error_code ec;
+        media = configDir() / "media" / str(meta, "id");
+        fs::create_directories(media, ec);
+        packed.clear();
+        if (d.contains("media") && d["media"].is_object())
+            for (auto& [rel, b64] : d["media"].items()) {
+                if (!b64.is_string() || rel.find("..") != std::string::npos || fs::path(rel).is_absolute()) continue;
+                std::string bytes = unbase64(b64.get<std::string>());
+                fs::path f = media / rel;
+                fs::create_directories(f.parent_path(), ec);
+                if (fs::file_size(f, ec) != bytes.size() || ec) std::ofstream(f, std::ios::binary) << bytes;
+                packed[rel] = {bytes.size(), b64.get<std::string>()};
+            }
+        for (auto& rel : imagePaths())  // an older note: its pictures sit next to it
+            if (!fs::exists(media / rel, ec) && fs::exists(noteFolder / rel, ec)) {
+                fs::create_directories((media / rel).parent_path(), ec);
+                fs::copy_file(noteFolder / rel, media / rel, ec);
+            }
+    }
+    json packMedia() {
+        json out = json::object();
+        std::error_code ec;
+        for (auto& rel : imagePaths()) {
+            uintmax_t size = fs::file_size(media / rel, ec);
+            if (ec) continue;
+            auto& p = packed[rel];
+            if (p.first != size || p.second.empty()) {
+                std::ifstream in(media / rel, std::ios::binary);
+                p = {size, base64(std::string(std::istreambuf_iterator<char>(in), {}))};
+            }
+            out[rel] = p.second;
+        }
+        return out;
+    }
+
+    json fileJson() {
+        return {{"format", "opman"}, {"version", 1}, {"meta", meta}, {"doc", docJson(ed.doc)}, {"path", pathJson(ed.curPath())},
+                {"media", packMedia()}};
+    }
+
     // writes only when the document changed, so moving the cursor doesn't bump "last edited"
-    void saveNow() {
+    void saveNow(bool force = false) {
         changedAt = -1;
         if (current.empty() || noSave) return;
         std::string j = docJson(ed.doc).dump();
-        if (j == savedJson) return;
+        if (j == savedJson && !force) return;
         savedJson = j;
         json st = stats();
         for (auto& [k, v] : st.items()) meta[k] = v;
         meta["edited"] = nowIso();
-        if (!writeFile(dir / current, {{"meta", meta}, {"doc", docJson(ed.doc)}, {"path", pathJson(ed.curPath())}})) {
-            message = "Could not write " + (dir / current).string();
+        if (!writeFile(current, fileJson())) {
+            message = "Could not write " + current;
             savedJson.clear();
             return;
+        }
+        // a library note's file name follows its title ("Untitled.opman" becomes "Vectors.opman")
+        if (inLibrary(current) && meta.value("autoName", false)) {
+            fs::path want = freeName(dir, titleOf(meta), current);
+            std::error_code ec;
+            if (want != fs::path(current) && !fs::exists(want, ec)) {
+                fs::rename(current, want, ec);
+                if (!ec) moved(current, want.string());
+            }
         }
         auto f = std::find_if(files.begin(), files.end(), [&](auto& x) { return x.name == current; });
         if (f != files.end()) f->meta = meta;
         else files.push_back({current, meta});
     }
+    // the open note's file has a new path
+    void moved(const std::string& from, const std::string& to) {
+        for (auto& f : files)
+            if (f.name == from) f.name = to;
+        for (auto& h : history)
+            if (h == from) h = to;
+        for (auto& r : recent)
+            if (r == from) r = to;
+        if (current == from) current = to;
+        cfg["lastDoc"] = current;
+        saveCfg();
+    }
 
     void openDoc(const std::string& name) {
         saveNow();
+        json d;
+        if (!readFile(name, d) || !d.is_object() || !d.contains("doc")) {
+            message = "Could not read " + name;
+            return;
+        }
         if (!current.empty() && current != name && !goingBack) {
             history.push_back(current);
             if (history.size() > 50) history.erase(history.begin());
         }
-        json d;
-        if (!readFile(dir / name, d) || !d.is_object()) {
-            message = "Could not read " + name;
-            return;
-        }
         current = name;
         meta = d.contains("meta") && d["meta"].is_object() ? d["meta"] : json::object();
+        if (str(meta, "id").empty()) meta["id"] = newId();
         ed.undoStack.clear();
         ed.redoStack.clear();
         ed.load(docFromJson(d.value("doc", json::array())), pathFromJson(d.value("path", json::object())));
+        if (!d.contains("format")) upgradePlots();
+        unpackMedia(d, fs::path(name).parent_path());
+        texs.clear();
         savedJson = lastJson = docJson(ed.doc).dump();
-        cfg["lastDoc"] = name;
+        if (fs::path(name).extension() == ".json") convert();  // corca's format: becomes name.opman
+        if (std::none_of(files.begin(), files.end(), [&](auto& f) { return f.name == current; })) files.push_back({current, meta});
+        remember(current);
+        cfg["lastDoc"] = current;
         saveCfg();
-        vi.mode = Mode::Normal;
+        vi.mode = vim ? Mode::Normal : Mode::Insert;
         views.clear();
         changed(true);
         findBacklinks();
+    }
+    // notes from before plot was a program function: a line starting with the text "plot " becomes a plot
+    void upgradePlots() {
+        for (auto& r : ed.doc)
+            if (r.size() > 5 && plain(Row(r.begin(), r.begin() + 5)) == "plot " && r[0].t == T::Ch) {
+                r.erase(r.begin(), r.begin() + 5);
+                r.insert(r.begin(), {named(T::Fn, "plot"), M(" ")});
+            }
+        ed.reindex();
+    }
+    // an open .json note becomes a .opman beside it; the .json moves into ".old" in that folder
+    void convert() {
+        fs::path from = current, to = freeName(from.parent_path(), titleOf(meta));
+        if (!writeFile(to, fileJson())) return;
+        std::error_code ec;
+        fs::create_directories(from.parent_path() / ".old", ec);
+        fs::rename(from, from.parent_path() / ".old" / from.filename(), ec);
+        std::erase_if(files, [&](auto& f) { return f.name == current; });
+        moved(current, to.string());
+    }
+    // every corca .json in the library becomes a .opman (once, at start)
+    void convertLibrary() {
+        for (auto& f : listDocs(dir))
+            if (fs::path(f.name).extension() == ".json") {
+                json d;
+                if (!readFile(f.name, d)) continue;
+                std::string keep = current;
+                current = f.name;
+                meta = d.contains("meta") && d["meta"].is_object() ? d["meta"] : json::object();
+                if (str(meta, "id").empty()) meta["id"] = newId();
+                meta["autoName"] = !meta.contains("title");
+                ed.load(docFromJson(d.value("doc", json::array())), pathFromJson(d.value("path", json::object())));
+                upgradePlots();
+                unpackMedia(d, dir);
+                convert();
+                if (cfg.value("lastDoc", std::string()) == fs::path(f.name).filename().string()) cfg["lastDoc"] = current;
+                current = keep;
+            }
+        current.clear();
+        meta = json::object();
+    }
+    static std::string newId() {
+        static std::mt19937_64 rng(std::random_device{}() ^ uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()));
+        char buf[20];
+        std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)rng());
+        return buf;
     }
 
     void newDoc(const std::string& title = "") {
         saveNow();
         std::string t = nowIso();
-        long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        std::string name = "doc-" + std::to_string(ms) + ".json";
-        json m = {{"created", t}, {"edited", t}, {"autoTitle", "Untitled"}, {"words", 0}, {"lines", 1}, {"defines", json::array()}};
+        fs::path file = freeName(dir, title.empty() ? "Untitled" : title);
+        json m = {{"created", t}, {"edited", t}, {"autoTitle", "Untitled"}, {"words", 0}, {"lines", 1}, {"defines", json::array()},
+                  {"id", newId()}, {"autoName", title.empty()}};
         if (!title.empty()) m["title"] = title;
-        if (!writeFile(dir / name, {{"meta", m}, {"doc", docJson(Doc{Row{}})}, {"path", pathJson({})}})) {
-            message = "Could not write " + (dir / name).string();
+        if (!writeFile(file, {{"format", "opman"}, {"version", 1}, {"meta", m}, {"doc", docJson(Doc{Row{}})}, {"path", pathJson({})}})) {
+            message = "Could not write " + file.string();
             return;
         }
-        files.push_back({name, m});
-        openDoc(name);
+        files.push_back({file.string(), m});
+        openDoc(file.string());
+    }
+
+    // Save As: the note continues in the new file (the old one stays as it was)
+    void saveAs(std::string to) {
+        if (to.empty()) return;
+        if (to.starts_with("~/")) to = (home() / to.substr(2)).string();
+        fs::path p = fs::absolute(to);
+        if (p.extension() != ".opman") p += ".opman";
+        json keepMeta = meta;
+        // a note that was only ever in the library under an automatic name moves; one you placed before is copied
+        bool move = inLibrary(current) && meta.value("autoName", false);
+        json st = stats();
+        for (auto& [k, v] : st.items()) meta[k] = v;
+        meta["autoName"] = false;
+        meta["edited"] = nowIso();
+        if (!writeFile(p, fileJson())) {
+            meta = keepMeta;
+            message = "Could not write " + p.string();
+            return;
+        }
+        std::error_code ec;
+        if (move && !fs::equivalent(current, p, ec)) {
+            fs::remove(current, ec);
+            std::erase_if(files, [&](auto& f) { return f.name == current; });
+            std::erase(history, current);
+        }
+        current = p.string();
+        savedJson = docJson(ed.doc).dump();
+        if (std::none_of(files.begin(), files.end(), [&](auto& f) { return f.name == current; })) files.push_back({current, meta});
+        remember(current);
+        cfg["lastDoc"] = current;
+        saveCfg();
+        message = "Saved as " + current;
+    }
+    void openPath(std::string path) {
+        if (path.starts_with("~/")) path = (home() / path.substr(2)).string();
+        std::error_code ec;
+        fs::path p = fs::absolute(path, ec);
+        if (!fs::exists(p, ec)) { message = "No such file: " + path; return; }
+        for (auto& f : files)
+            if (fs::equivalent(f.name, p, ec)) return openDoc(f.name);
+        openDoc(p.string());
     }
 
     void openMostRecent() {
         std::string last = str(cfg, "lastDoc");
-        if (std::any_of(files.begin(), files.end(), [&](auto& f) { return f.name == last; })) return openDoc(last);
-        int keep = sort;
-        sort = 0;
-        auto s = sortedFiles();
-        sort = keep;
-        if (!s.empty()) return openDoc(s[0].name);
+        if (openLast && std::any_of(files.begin(), files.end(), [&](auto& f) { return f.name == last; })) return openDoc(last);
+        if (openLast) {
+            int keep = sort;
+            sort = 0;
+            auto s = sortedFiles();
+            sort = keep;
+            if (!s.empty()) return openDoc(s[0].name);
+        }
         newDoc();
     }
 
-    // ponytail: "trash" is a .trash folder inside the documents folder; system trash APIs differ per OS
+    // ponytail: "trash" is a .trash folder in the library; system trash APIs differ per OS
     void trash(const std::string& name) {
         std::error_code ec;
         fs::create_directories(dir / ".trash", ec);
-        fs::rename(dir / name, dir / ".trash" / name, ec);
+        fs::path to = dir / ".trash" / fs::path(name).filename();
+        fs::rename(name, to, ec);
+        if (ec) {  // another drive: copy, then remove
+            ec.clear();
+            fs::copy_file(name, to, fs::copy_options::overwrite_existing, ec);
+            if (!ec) fs::remove(name, ec);
+        }
         if (ec) { message = "Could not move " + name + " to the trash"; return; }
         std::erase_if(files, [&](auto& f) { return f.name == name; });
+        std::erase(recent, name);
         if (name == current) {
             current.clear();
             openMostRecent();
@@ -409,10 +711,73 @@ struct App {
         message = "Moved to " + (dir / ".trash").string();
     }
 
+    // ---------- asking for a path: the system dialog, else the built-in browser ----------
+    struct Browser {
+        bool open = false, save = false, folders = false;
+        std::string title, ext;  // ext: ".opman", ".md"…; empty: any
+        fs::path at;
+        char name[256] = "";
+        std::function<void(std::string)> done;
+    } browser;
+    void askPath(bool save, const std::string& title, const fs::path& start, const dialog::Filters& filters, std::function<void(std::string)> done,
+                 bool folders = false) {
+        if (nativeDialogs && dialog::available() && !std::getenv("OPMAN_KEYS")) {
+            auto r = folders ? dialog::folder(title, start.string())
+                   : save    ? dialog::save(title, start.string(), filters)
+                             : dialog::open(title, start.string(), filters);
+            if (r) done(*r);
+            return;
+        }
+        browser = {};
+        browser.open = true, browser.save = save, browser.folders = folders, browser.title = title, browser.done = std::move(done);
+        if (!filters.empty() && filters[0].second.size() > 1 && filters[0].second[0] == '*') browser.ext = filters[0].second.substr(1);
+        std::error_code ec;
+        fs::path s = start.empty() ? dir : start;
+        if (fs::is_directory(s, ec)) browser.at = s;
+        else {
+            browser.at = s.parent_path().empty() ? dir : s.parent_path();
+            std::snprintf(browser.name, sizeof browser.name, "%s", s.filename().string().c_str());
+        }
+    }
+    static dialog::Filters noteFilter() { return {{"opman notes", "*.opman"}, {"corca notes", "*.json"}}; }
+    void openDialog() {
+        askPath(false, "Open note", dir, noteFilter(), [this](std::string p) { openPath(p); });
+    }
+    void saveAsDialog() {
+        fs::path start = current.empty() ? freeName(dir, titleOf(meta)) : fs::path(current).parent_path() / fs::path(current).filename();
+        askPath(true, "Save note as", start, {{"opman notes", "*.opman"}}, [this](std::string p) { saveAs(p); });
+    }
+    void exportDialog(const std::string& ext) {
+        std::string t = titleOf(meta);
+        for (auto& c : t) if (std::strchr("/\\:*?\"<>|", c)) c = '-';
+        fs::path start = (exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + ext);
+        static const std::map<std::string, std::string> names = {{"md", "Markdown"}, {"html", "Web page"}, {"tex", "LaTeX"}, {"pdf", "PDF"}};
+        askPath(true, "Export as " + names.at(ext), start, {{names.at(ext), "*." + ext}}, [this, ext](std::string p) {
+            if (fs::path(p).extension() != "." + ext) p += "." + ext;
+            exportTo(p);
+        });
+    }
+
     void run(const std::string& cmd) {
         std::string name = cmd.substr(0, cmd.find(' ')), arg = cmd.size() > name.size() ? cmd.substr(name.size() + 1) : "";
         if (name == "sidebar") { sidebar = !sidebar; sideFocus = false; saveCfg(); }
-        else if (name == "w") { saveNow(); message = "\"" + titleOf(meta) + "\" written"; }
+        else if (name == "w" && !arg.empty()) saveAs(arg);
+        else if (name == "w") { saveNow(true); message = "\"" + titleOf(meta) + "\" saved to " + current; }
+        else if (name == "saveas") { if (arg.empty()) saveAsDialog(); else saveAs(arg); }
+        else if (name == "open") { if (arg.empty()) openDialog(); else openPath(arg); }
+        else if (name == "help") { showHelp = true; helpTopic = arg; }
+        else if (name == "settings") showSettings = true;
+        else if (name == "palette") { showPalette = true; paletteQuery[0] = 0; paletteSel = 0; }
+        else if (name == "outline") { sidebar = true; sideTab = 1; saveCfg(); }
+        else if (name == "zoom") {
+            textSize = arg == "in" ? textSize + 1 : arg == "out" ? textSize - 1 : 18;
+            textSize = std::clamp(textSize, 12.f, 32.f);
+            applySizes();
+            saveCfg();
+            message = "Text size " + std::to_string(int(textSize));
+        }
+        else if (name.starts_with("s/") || name.starts_with("%s/")) substitute(cmd);
+        else if (name == "folder") revealFolder();
         else if (name == "q") quit = true;
         else if (name == "q!") quit = noSave = true;
         else if (name == "wq" || name == "x") { saveNow(); quit = true; }
@@ -420,14 +785,24 @@ struct App {
         else if (name == "rename") {
             if (arg.empty()) meta.erase("title");
             else meta["title"] = arg;
+            if (inLibrary(current)) meta["autoName"] = true;  // the file name follows
             savedJson.clear();
             saveNow();
             findBacklinks();
         } else if (name == "trash") { if (!current.empty()) trash(current); }
         else if (name == "set") {
-            if (arg == "dark" || arg == "light") { dark = arg == "dark"; saveCfg(); }
-            else message = "Unknown option: " + arg + " (dark, light)";
+            int n = 0;
+            if (arg == "dark" || arg == "light") dark = arg == "dark";
+            else if (arg == "degrees" || arg == "radians") mathOpts.degrees = arg == "degrees";
+            else if (arg == "decimals" || arg == "fractions") mathOpts.decimals = arg == "decimals";
+            else if (arg == "vim" || arg == "standard") { vim = arg == "vim"; vi.mode = vim ? Mode::Normal : Mode::Insert; }
+            else if (std::sscanf(arg.c_str(), "digits=%d", &n) == 1) mathOpts.digits = std::clamp(n, 2, 15);
+            else { message = "Unknown option: " + arg + " (dark light · degrees radians · decimals fractions · digits=N · vim standard)"; return; }
+            mathChanged();
+            message = "Set " + arg;
         } else if (name == "export") exportTo(arg);
+        else if (name == "print") print();
+        else if (name == "tour") tour();
         else if (name == "image") addImage(arg);
         else if (name == "rule") insertLines({"---"}, 0);
         else if (name == "section") {  // :section [title]; the default numbers the exercises
@@ -454,12 +829,78 @@ struct App {
             std::string line = "|";
             for (int k = 0; k < std::clamp(c, 1, 20); k++) line += "  |";
             insertLines(std::vector<std::string>(std::clamp(r, 1, 100), line), 2);
+        } else if (name == "row" || name == "col") {  // :row above|below|delete, :col left|right|delete
+            char op = name == "row" ? (arg == "above" ? 'k' : arg == "delete" ? 'r' : 'j') : (arg == "left" ? 'h' : arg == "delete" ? 'c' : 'l');
+            ed.snap();
+            if (!ed.gridOp(op)) message = "Not in a table or matrix";
+            changed();
         } else if (name == "e") {
+            std::error_code ec;
+            if (!arg.empty() && fs::is_regular_file(arg.starts_with("~/") ? home() / arg.substr(2) : fs::path(arg), ec)) return openPath(arg);
+            if (arg.empty()) return openDialog();
             std::string q = lower(arg);
             for (auto& f : sortedFiles())
                 if (f.name == arg || lower(titleOf(f.meta)).find(q) != std::string::npos) return openDoc(f.name);
             message = "No document matches \"" + arg + "\"";
         }
+    }
+
+    // :s/old/new/[g] on the cursor's line, :%s/old/new/[g] everywhere (text, smartcase like /)
+    void substitute(const std::string& cmd) {
+        bool all = cmd[0] == '%';
+        std::vector<std::string> part;
+        std::string cur;
+        for (size_t j = all ? 2 : 1; j < cmd.size(); j++) {
+            if (cmd[j] == '\\' && j + 1 < cmd.size() && cmd[j + 1] == '/') cur += '/', j++;
+            else if (cmd[j] == '/') part.push_back(cur), cur.clear();
+            else cur += cmd[j];
+        }
+        part.push_back(cur);  // "", old, new, flags
+        if (part.size() < 3 || part[1].empty()) { message = "Use :s/old/new/ or :%s/old/new/g"; return; }
+        bool global = part.size() > 3 && part[3].find('g') != std::string::npos;
+        int here = ed.lineOf(ed.topOf(ed.cur.row)), count = 0;
+        auto ms = Vi::matches(ed, part[1]);
+        ed.snap();
+        for (int k = int(ed.doc.size()) - 1; k >= 0; k--) {
+            if (!all && k != here) continue;
+            std::vector<Vi::Match> line;
+            for (auto& m : ms)
+                if (m.line == k && (global || line.empty())) line.push_back(m);
+            for (auto m = line.rbegin(); m != line.rend(); ++m) {
+                Row& r = ed.doc[k];
+                bool math = r[m->a].t == T::Ch && r[m->a].m;
+                uint16_t f = r[m->a].t == T::Ch ? r[m->a].f : 0;
+                r.erase(r.begin() + m->a, r.begin() + m->b);
+                Row ins;
+                for (size_t i = 0; i < part[2].size();) {
+                    unsigned char b = part[2][i];
+                    size_t n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+                    Item it = ch(part[2].substr(i, n), math);
+                    it.f = f;
+                    ins.push_back(it);
+                    i += n;
+                }
+                r.insert(r.begin() + m->a, ins.begin(), ins.end());
+                count++;
+            }
+        }
+        ed.cur = {&ed.doc[here], 0};
+        ed.reindex();
+        changed();
+        message = count ? std::to_string(count) + (count == 1 ? " replacement" : " replacements") : "Not found: " + part[1];
+    }
+
+    // the open note's folder in the file manager
+    void revealFolder() {
+        std::string f = fs::path(current).parent_path().string();
+#ifdef _WIN32
+        std::string cmd = "explorer \"" + f + "\"";
+#elif defined(__APPLE__)
+        std::string cmd = "open \"" + f + "\"";
+#else
+        std::string cmd = "xdg-open \"" + f + "\" >/dev/null 2>&1 &";
+#endif
+        std::thread([cmd] { (void)std::system(cmd.c_str()); }).detach();
     }
 
     // new text lines below the cursor's line; the cursor goes to item `at` of the first
@@ -477,7 +918,7 @@ struct App {
         changed();
     }
 
-    // an image file: copied into the documents folder's media/, so notes stay self-contained
+    // an image file: copied into the note (saved inside the .opman file)
     void addImage(std::string src) {
         if (src.starts_with("~/")) src = (home() / src.substr(2)).string();
         std::string ext = lower(fs::path(src).extension().string());
@@ -486,11 +927,11 @@ struct App {
             return;
         }
         std::error_code ec;
-        fs::create_directories(dir / "media", ec);
+        fs::create_directories(media / "media", ec);
         std::string stem = fs::path(src).stem().string();
         for (auto& c : stem) if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') c = '-';  // LaTeX-safe file names
-        fs::path to = dir / "media" / (stem + ext);
-        for (int n = 2; fs::exists(to) && !fs::equivalent(src, to, ec); n++) to = dir / "media" / (stem + "-" + std::to_string(n) + ext);
+        fs::path to = media / "media" / (stem + ext);
+        for (int n = 2; fs::exists(to) && !fs::equivalent(src, to, ec); n++) to = media / "media" / (stem + "-" + std::to_string(n) + ext);
         if (!fs::exists(to)) fs::copy_file(src, to, ec);
         if (ec) { message = "Could not copy " + src + ": " + ec.message(); return; }
         insertLines({"![](media/" + to.filename().string() + ")"}, 2);
@@ -501,17 +942,17 @@ struct App {
         std::string t = titleOf(meta);
         for (auto& c : t) if (std::strchr("/\\:*?\"<>| ", c)) c = '-';
         if (arg.empty()) arg = "md";
-        if (arg == "md" || arg == "tex" || arg == "pdf" || arg == "html") arg = (home() / (t + "." + arg)).string();
+        if (arg == "md" || arg == "tex" || arg == "pdf" || arg == "html") arg = ((exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + arg)).string();
         fs::path out = arg.starts_with("~/") ? home() / arg.substr(2) : fs::path(arg);
         std::string ext = lower(out.extension().string());
         if (ext != ".tex" && ext != ".pdf") {
             std::ofstream f(out, std::ios::binary);
-            bool ok = ext == ".html" || ext == ".htm" ? bool(f << html(ed, dir, titleOf(meta))) : bool(f << markdown(ed.doc, dir));
+            bool ok = ext == ".html" || ext == ".htm" ? bool(f << html(ed, media, titleOf(meta))) : bool(f << markdown(ed.doc, media));
             message = ok ? "Exported to " + out.string() : "Could not write " + out.string();
             return;
         }
         if (pdfJob.valid()) { message = "A PDF export is still running"; return; }
-        std::string tex = latex(ed, dir);
+        std::string tex = latex(ed, media);
         fs::path file = out;
         std::error_code ec;
         fs::path tmp = fs::temp_directory_path(ec) / "opman-export";
@@ -519,7 +960,7 @@ struct App {
         if (!(std::ofstream(file, std::ios::binary) << tex)) { message = "Could not write " + file.string(); return; }
         if (ext == ".tex") { message = "Exported to " + out.string(); return; }
         fs::remove(tmp / "note.pdf", ec);
-        std::string q = "\"", cmd = "pdflatex -interaction=nonstopmode -halt-on-error -output-directory " + q + tmp.string() + q + " " + q +
+        std::string q = "\"", cmd = (pdflatex.empty() ? "pdflatex" : pdflatex) + " -interaction=nonstopmode -halt-on-error -output-directory " + q + tmp.string() + q + " " + q +
                                     file.string() + q + " > " + q + (tmp / "out.txt").string() + q + " 2>&1";
 #ifdef _WIN32
         cmd = "\"" + cmd + "\"";  // cmd.exe strips the outer quotes
@@ -529,10 +970,72 @@ struct App {
         message = "Exporting PDF…";
     }
 
+    // :tour: a new note typed by the tour's key script (in vim mode, whatever the setting)
+    void tour() {
+        newDoc("Tour");
+        bool std0 = vi.standard;
+        vi.standard = false;
+        vi.mode = Mode::Normal;
+        for (auto& k : Vi::parse(tourKeys())) vi.key(ed, k);
+        vi.standard = std0;
+        vi.mode = std0 ? Mode::Insert : Mode::Normal;
+        vi.cmds.clear();
+        showHelp = false;
+        changed(true);
+    }
+
+    // :print: a PDF to the default printer (lp; on Windows the PDF viewer's Print verb). Without pdflatex, or if lp
+    // fails, the note opens in the browser with its print dialog
+    void print() {
+        std::error_code ec;
+        fs::path tmp = fs::temp_directory_path(ec) / "opman-print";
+        fs::create_directories(tmp, ec);
+        printing = true;
+        exportTo((tmp / "note.pdf").string());
+        if (!pdfJob.valid()) printing = false, printHtml();
+        else message = "Preparing to print…";
+    }
+    void printHtml() {
+        std::error_code ec;
+        fs::path f = fs::temp_directory_path(ec) / "opman-print" / "note.html";
+        fs::create_directories(f.parent_path(), ec);
+        std::string h = html(ed, media, titleOf(meta));
+        h.insert(h.rfind("</body>"), "<script>addEventListener('load', () => setTimeout(print, 600))</script>\n");  // after KaTeX
+        if (!(std::ofstream(f, std::ios::binary) << h)) { message = "Could not write " + f.string(); return; }
+        openExternal(f.string());
+        message = "Opened in the browser to print";
+    }
+    static void openExternal(const std::string& f) {
+#ifdef _WIN32
+        std::string cmd = "start \"\" \"" + f + "\"";
+#elif defined(__APPLE__)
+        std::string cmd = "open \"" + f + "\"";
+#else
+        std::string cmd = "xdg-open \"" + f + "\" >/dev/null 2>&1 &";
+#endif
+        std::thread([cmd] { (void)std::system(cmd.c_str()); }).detach();
+    }
+
     void pdfDone() {  // polled each frame; the PDF's existence is the result
         if (!pdfJob.valid() || pdfJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
         pdfJob.get();
         std::error_code ec;
+        if (printing) {
+            printing = false;
+            if (!fs::exists(pdfTmp / "note.pdf")) return printHtml();
+            fs::copy_file(pdfTmp / "note.pdf", pdfOut, fs::copy_options::overwrite_existing, ec);
+            std::string f = pdfOut.string();
+#ifdef _WIN32
+            std::string cmd = "powershell -NoProfile -Command \"Start-Process -FilePath '" + f + "' -Verb Print\"";
+#else
+            std::string cmd = "lp \"" + f + "\" >/dev/null 2>&1";
+#endif
+            message = "Sent to the printer";
+            std::thread([cmd, f] {
+                if (std::system(cmd.c_str()) != 0) openExternal(f);  // no lp or no printer: open the PDF to print from there
+            }).detach();
+            return;
+        }
         if (!fs::exists(pdfTmp / "note.pdf")) { message = "pdflatex failed, see " + (pdfTmp / "note.log").string(); return; }
         fs::copy_file(pdfTmp / "note.pdf", pdfOut, fs::copy_options::overwrite_existing, ec);
         message = ec ? "Could not write " + pdfOut.string() : "Exported to " + pdfOut.string();
@@ -542,7 +1045,7 @@ struct App {
         auto [it, fresh] = texs.try_emplace(path);
         if (!fresh) return it->second;
         int w, h, n;
-        fs::path p = fs::path(path).is_relative() ? dir / path : fs::path(path);
+        fs::path p = fs::path(path).is_relative() ? media / path : fs::path(path);
         if (unsigned char* px = stbi_load(p.string().c_str(), &w, &h, &n, 4)) {
             GLuint t;
             glGenTextures(1, &t);
@@ -578,7 +1081,7 @@ struct App {
                     LineCache c;
                     if (f != lineCache.end()) c = std::move(f->second);
                     else if (lineStyle(ed.doc[k]).kind == Line::Plot) c.plot = plot(ed, ed.doc[k]);
-                    else c.ghost = ghost(ed, ed.doc[k]);
+                    else if (results) c.ghost = ghost(ed, ed.doc[k]);
                     ghosts[k] = c.ghost;
                     plots[k] = c.plot;
                     next[key] = std::move(c);
@@ -612,8 +1115,21 @@ struct App {
         if (g_keys.empty()) return;
         auto keys = std::move(g_keys);
         g_keys.clear();
-        if (ImGui::GetIO().WantTextInput) return;  // a sidebar text field has them
+        if (ImGui::GetIO().WantTextInput || panelFocused) return;  // a text field or a window has them
+        vi.standard = !vim;
         for (auto& k : keys) {
+            // app shortcuts, in both key modes
+            if (k.sp == Key::F1) { showHelp = !showHelp; continue; }
+            if (k.ctrl && k.shift && k.ch == "p") { run("palette"); continue; }
+            if (k.ctrl && k.shift && k.ch == "s") { saveAsDialog(); continue; }
+            if (k.ctrl && k.shift && k.ch == "o") { openDialog(); continue; }
+            if (k.ctrl && k.shift && k.ch == "n") { newDoc(); continue; }
+            if (k.ctrl && k.ch == ",") { showSettings = !showSettings; continue; }
+            if (k.ctrl && (k.ch == "=" || k.ch == "+")) { run("zoom in"); continue; }
+            if (k.ctrl && k.ch == "-") { run("zoom out"); continue; }
+            if (k.ctrl && k.ch == "0") { run("zoom reset"); continue; }
+            if (!vim && k.ctrl && !k.shift && k.ch == "o" && vi.mode == Mode::Insert) { openDialog(); continue; }
+            if (!vim && k.ctrl && !k.shift && k.ch == "p" && vi.mode == Mode::Insert) { run("print"); continue; }
             if (k.ctrl && k.ch == "w") {  // Ctrl-w: focus the file list (or back)
                 sideFocus = !sideFocus;
                 if (sideFocus) sidebar = true;
@@ -657,6 +1173,16 @@ struct App {
         s[ImGuiCol_ScrollbarBg] = c(p.bg, 0);
         s[ImGuiCol_ScrollbarGrab] = c(p.line);
         s[ImGuiCol_TextSelectedBg] = c(p.sel);
+        // settings, help, palette: the accent for what is on or chosen
+        s[ImGuiCol_TitleBg] = s[ImGuiCol_TitleBgActive] = s[ImGuiCol_TitleBgCollapsed] = c(p.side);
+        s[ImGuiCol_CheckMark] = s[ImGuiCol_SliderGrab] = c(p.fn);
+        s[ImGuiCol_SliderGrabActive] = c(p.fn, 0.8f);
+        s[ImGuiCol_Tab] = c(p.bg, 0);
+        s[ImGuiCol_TabHovered] = c(p.line);
+        s[ImGuiCol_TabSelected] = c(p.fn, 0.25f);
+        s[ImGuiCol_TabSelectedOverline] = c(p.fn);
+        s[ImGuiCol_Separator] = c(p.line);
+        s[ImGuiCol_ModalWindowDimBg] = c(0xFF000000, 0.35f);
     }
     static ImU32 alpha(ImU32 c, float a) { return (c & 0x00FFFFFF) | (ImU32((c >> IM_COL32_A_SHIFT & 0xFF) * a) << IM_COL32_A_SHIFT); }
 
@@ -767,6 +1293,130 @@ struct App {
     }
 
     // drag pans, the wheel zooms around the mouse, a double-click goes back to the line's own ranges
+    // ---------- 3D plots: an orthographic view of the box [x0,x1]×[y0,y1]×[z0,z1], turned by dragging ----------
+    std::map<int, std::array<float, 3>> turns;  // per plot line: yaw, pitch, zoom (ponytail: by line index, like views)
+    float drawPlot3D(const Plot& pl, float x, float y, float w, int k) {
+        const Palette& p = pal();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float h = std::min(420.f, w * 0.7f);
+        auto [it, fresh] = turns.try_emplace(k, std::array<float, 3>{-0.65f, 0.45f, 1.f});
+        auto& tn = it->second;
+        ImGui::SetCursorScreenPos({x, y});
+        ImGui::PushID(k);
+        ImGui::InvisibleButton("plot3d", {w, h});
+        ImGui::PopID();
+        bool reset = false;
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+            ImGuiIO& io = ImGui::GetIO();
+            if (io.MouseWheel != 0) tn[2] = std::clamp(tn[2] * std::pow(1.12f, io.MouseWheel), 0.3f, 4.f);
+            if (ImGui::IsItemActive()) tn[0] += io.MouseDelta.x * 0.01f, tn[1] = std::clamp(tn[1] + io.MouseDelta.y * 0.01f, -1.5f, 1.5f);
+            if (ImGui::IsMouseDoubleClicked(0)) reset = true;
+            if (!ImGui::IsItemActive()) ImGui::SetTooltip("Drag to turn · wheel to zoom · double-click to reset");
+        }
+        dl->AddRectFilled({x, y}, {x + w, y + h}, p.side, 8);
+        float cy0 = std::cos(tn[0]), sy0 = std::sin(tn[0]), cp = std::cos(tn[1]), sp = std::sin(tn[1]);
+        float scale = std::min(w, h) * 0.36f * tn[2];
+        ImVec2 c{x + w / 2, y + h / 2 + h * 0.04f};
+        // box coordinates in [-1, 1] (z a little flatter), then yaw about z and pitch towards the viewer
+        auto norm = [&](double X, double Y, double Z) {
+            return std::array<float, 3>{float((X - pl.x0) / (pl.x1 - pl.x0) * 2 - 1), float((Y - pl.y0) / (pl.y1 - pl.y0) * 2 - 1),
+                                        float(((Z - pl.z0) / (pl.z1 - pl.z0) * 2 - 1) * 0.75)};
+        };
+        auto view = [&](std::array<float, 3> v) {  // screen x, screen y, depth (bigger is nearer)
+            float rx = v[0] * cy0 - v[1] * sy0, ry = v[0] * sy0 + v[1] * cy0;
+            float up = v[2] * cp + ry * sp, depth = -ry * cp + v[2] * sp;
+            return std::array<float, 3>{c.x + rx * scale, c.y - up * scale, depth};
+        };
+        auto P = [&](std::array<float, 3> v) { auto s = view(v); return ImVec2{s[0], s[1]}; };
+        dl->PushClipRect({x, y}, {x + w, y + h}, true);
+        // the box: back edges first, labels at the ends of three axes
+        float e = 0.75f;
+        std::array<std::array<float, 3>, 8> corner;
+        for (int i = 0; i < 8; i++) corner[i] = {i & 1 ? 1.f : -1.f, i & 2 ? 1.f : -1.f, i & 4 ? e : -e};
+        for (int a = 0; a < 8; a++)
+            for (int b = a + 1; b < 8; b++)
+                if (std::popcount(unsigned(a ^ b)) == 1) dl->AddLine(P(corner[a]), P(corner[b]), alpha(p.line, 0.9f), 1);
+        auto lbl = [&](std::array<float, 3> v, const std::string& t) {
+            ImVec2 q = P(v);
+            L.drawText(t, q.x - L.textWidth(t, 11) / 2, q.y + 4, 11, p.muted, ui);
+        };
+        auto num = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.3g", std::fabs(v) < 1e-12 ? 0.0 : v); return std::string(b); };
+        lbl({-1, -1.12f, -e}, num(pl.x0)), lbl({1, -1.12f, -e}, num(pl.x1)), lbl({0, -1.25f, -e}, "x");
+        lbl({1.12f, -1, -e}, num(pl.y0)), lbl({1.12f, 1, -e}, num(pl.y1)), lbl({1.25f, 0, -e}, "y");
+        lbl({-1.1f, -1.1f, -e}, num(pl.z0)), lbl({-1.1f, -1.1f, e}, num(pl.z1)), lbl({-1.15f, -1.15f, 0}, "z");
+        // surfaces: quads far to near, coloured by height and shaded by their tilt to the light
+        struct Quad {
+            ImVec2 v[4];
+            float depth;
+            ImU32 col;
+        };
+        std::vector<Quad> quads;
+        static const ImVec4 RAMP[] = {{0.27f, 0.0f, 0.33f, 1}, {0.23f, 0.32f, 0.55f, 1}, {0.13f, 0.57f, 0.55f, 1}, {0.37f, 0.79f, 0.38f, 1}, {0.99f, 0.91f, 0.14f, 1}};
+        for (auto& sf : pl.surfaces) {
+            int n = sf.n;
+            auto Z = [&](int i, int j) { return std::clamp(sf.z[j * n + i], pl.z0, pl.z1); };
+            for (int j = 0; j + 1 < n; j++)
+                for (int i = 0; i + 1 < n; i++) {
+                    double zs[4] = {sf.z[j * n + i], sf.z[j * n + i + 1], sf.z[(j + 1) * n + i + 1], sf.z[(j + 1) * n + i]};
+                    if (std::any_of(zs, zs + 4, [](double v) { return !std::isfinite(v); })) continue;
+                    double X0 = pl.x0 + (pl.x1 - pl.x0) * i / (n - 1), X1 = pl.x0 + (pl.x1 - pl.x0) * (i + 1) / (n - 1);
+                    double Y0 = pl.y0 + (pl.y1 - pl.y0) * j / (n - 1), Y1 = pl.y0 + (pl.y1 - pl.y0) * (j + 1) / (n - 1);
+                    std::array<float, 3> w4[4] = {norm(X0, Y0, Z(i, j)), norm(X1, Y0, Z(i + 1, j)), norm(X1, Y1, Z(i + 1, j + 1)), norm(X0, Y1, Z(i, j + 1))};
+                    Quad q;
+                    float d = 0;
+                    for (int m = 0; m < 4; m++) {
+                        auto s3 = view(w4[m]);
+                        q.v[m] = {s3[0], s3[1]};
+                        d += s3[2];
+                    }
+                    q.depth = d / 4;
+                    float t = float(((zs[0] + zs[1] + zs[2] + zs[3]) / 4 - pl.z0) / (pl.z1 - pl.z0));
+                    t = std::clamp(t, 0.f, 0.9999f) * 4;
+                    int r = int(t);
+                    ImVec4 a = RAMP[r], b = RAMP[r + 1];
+                    float f = t - r;
+                    // normal of the quad (in box space) against a light from the upper front
+                    float ux = w4[2][0] - w4[0][0], uy = w4[2][1] - w4[0][1], uz = w4[2][2] - w4[0][2];
+                    float vx = w4[1][0] - w4[3][0], vy = w4[1][1] - w4[3][1], vz = w4[1][2] - w4[3][2];
+                    float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx, nl = std::sqrt(nx * nx + ny * ny + nz * nz) + 1e-9f;
+                    float light = 0.55f + 0.45f * std::fabs((nx * 0.3f + ny * -0.4f + nz * 0.86f) / nl);
+                    q.col = ImGui::ColorConvertFloat4ToU32({(a.x + (b.x - a.x) * f) * light, (a.y + (b.y - a.y) * f) * light,
+                                                            (a.z + (b.z - a.z) * f) * light, 0.94f});
+                    quads.push_back(q);
+                }
+        }
+        std::sort(quads.begin(), quads.end(), [](auto& a, auto& b) { return a.depth < b.depth; });
+        for (auto& q : quads) {
+            dl->AddQuadFilled(q.v[0], q.v[1], q.v[2], q.v[3], q.col);
+            dl->AddQuad(q.v[0], q.v[1], q.v[2], q.v[3], IM_COL32(0, 0, 0, 40), 0.6f);
+        }
+        static const ImU32 COLS[] = {IM_COL32(0x3b, 0x82, 0xf6, 255), IM_COL32(0xe5, 0x48, 0x4d, 255), IM_COL32(0x2f, 0x9e, 0x5b, 255),
+                                     IM_COL32(0xf5, 0x9e, 0x0b, 255), IM_COL32(0x8b, 0x5c, 0xf6, 255), IM_COL32(0x14, 0xb8, 0xa6, 255)};
+        for (size_t s = 0; s < pl.curves.size(); s++) {
+            std::vector<ImVec2> seg;
+            auto flush = [&] {
+                if (seg.size() > 1) dl->AddPolyline(seg.data(), int(seg.size()), COLS[s % 6], 0, 2.4f);
+                seg.clear();
+            };
+            for (auto& q : pl.curves[s].pts) {
+                if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2])) { flush(); continue; }
+                seg.push_back(P(norm(q[0], q[1], std::clamp(q[2], pl.z0, pl.z1))));
+            }
+            flush();
+        }
+        dl->PopClipRect();
+        float ly = y + 10;  // legend
+        for (auto& sf : pl.surfaces) L.drawText("z = " + sf.label, x + 12, ly + 11, 13, p.fg, ui), ly += 18;
+        for (size_t s = 0; s < pl.curves.size(); s++, ly += 18) {
+            dl->AddRectFilled({x + 12, ly + 5}, {x + 26, ly + 8}, COLS[s % 6], 1);
+            L.drawText(pl.curves[s].label, x + 32, ly + 11, 13, p.fg, ui);
+        }
+        if (!pl.error.empty()) L.drawText(pl.error, x + 12, y + h - 12, 13, IM_COL32(0xe5, 0x48, 0x4d, 255), ui);
+        if (reset) turns.erase(k);
+        return h;
+    }
+
     float drawPlot(const Plot& pl, float x, float y, float w, int k) {
         const Palette& p = pal();
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -776,6 +1426,9 @@ struct App {
         ImGui::PushID(k);
         ImGui::InvisibleButton("plot", {b.x - a.x, b.y - a.y});
         ImGui::PopID();
+        // pl may be viewPlots[k]: a new view is applied after drawing (erasing it now would leave pl dangling)
+        std::optional<std::array<double, 4>> newView;
+        bool reset = false;
         if (ImGui::IsItemHovered()) {
             ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);  // the wheel zooms the plot, not the page
             std::array<double, 4> v{pl.x0, pl.x1, pl.y0, pl.y1};
@@ -793,8 +1446,8 @@ struct App {
                 v = {v[0] - dx, v[1] - dx, v[2] + dy, v[3] + dy};
                 moved = true;
             }
-            if (ImGui::IsMouseDoubleClicked(0)) views.erase(k), viewPlots.erase(k);
-            else if (moved) views[k] = v, viewPlots[k] = plot(ed, ed.doc[k], v.data());
+            if (ImGui::IsMouseDoubleClicked(0)) reset = true;
+            else if (moved) newView = v;
             if (!ImGui::IsItemActive()) ImGui::SetTooltip("Drag to pan · wheel to zoom · double-click to reset");
         }
         dl->AddRectFilled({x, y}, {x + w, y + h}, p.side, 8);
@@ -850,13 +1503,15 @@ struct App {
             L.drawText(pl.series[s].label, a.x + 28, ly + 11, 13, p.fg, ui);
         }
         if (!pl.error.empty()) L.drawText(pl.error, a.x + 8, b.y - 8, 13, IM_COL32(0xe5, 0x48, 0x4d, 255), ui);
+        if (reset) views.erase(k), viewPlots.erase(k);
+        else if (newView) views[k] = *newView, viewPlots[k] = plot(ed, ed.doc[k], newView->data());
         return h;
     }
 
     void drawDoc() {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 origin = ImGui::GetCursorScreenPos();
-        float avail = ImGui::GetContentRegionAvail().x, colW = std::min(820.f, avail);
+        float avail = ImGui::GetContentRegionAvail().x, colW = std::min(pageWidth, avail);
         float x0 = origin.x + std::max(0.f, (avail - colW) / 2) + 32, y = origin.y + 48, maxW = 0;
         L.dl = dl;
         L.ed = &ed;
@@ -865,6 +1520,7 @@ struct App {
         const Palette& p = pal();
         float blockW = colW - 64;
         bool slid = false;  // a slider changed the doc during this frame
+        L.eqNums = eqNumbers(ed.doc);  // ponytail: recounted every frame; cache on changes if long notes get slow
         for (size_t k = 0; k < ed.doc.size(); k++) {
             const Row& row = ed.doc[k];
             Line kind = lineStyle(row).kind;
@@ -904,17 +1560,23 @@ struct App {
                 if (last) dl->AddLine({bx, y + h}, {r, y + h}, p.line, 1.2f);
             }
             L.drawLine(row, x0, base);
+            if (auto t = eqTag(row); t.first >= 0) {  // the equation's number at the right edge
+                auto f = L.eqNums.find(eqName(row, t));
+                std::string n = "(" + std::to_string(f == L.eqNums.end() ? 0 : f->second) + ")";
+                L.drawText(n, x0 + blockW - L.textWidth(n, L.textSize), base, L.textSize, p.fg, ui);
+            }
             if (kind == Line::Image) h += drawImage(row, x0, y + h, blockW, true) + 8;
             if (kind == Line::Plot && k < plots.size() && plots[k]) {
                 if (views.count(int(k)) && !viewPlots.count(int(k))) viewPlots[int(k)] = plot(ed, row, views[int(k)].data());
-                h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], x0, y + h, blockW, int(k)) + 12;
+                if (plots[k]->is3d()) h += drawPlot3D(*plots[k], x0, y + h, blockW, int(k)) + 12;
+                else h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], x0, y + h, blockW, int(k)) + 12;
             }
             float w = b.w;
             if (k < ghosts.size() && ghosts[k]) {
                 L.drawText(ghosts[k]->text, x0 + b.w + 0.5f * L.textSize, base, L.textSize * 0.9f, alpha(p.muted, 0.85f));
                 w += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
             }
-            if (kind == Line::Text) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
+            if (kind == Line::Text && sliders) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
             maxW = std::max(maxW, w);
             y += h;
         }
@@ -967,6 +1629,14 @@ struct App {
             if (ImGui::GetIO().KeyCtrl && !ed.inSlot())
                 for (auto sp : linkSpans(*ed.cur.row))
                     if (ed.cur.i >= sp.first && ed.cur.i < sp.second) return run("link " + linkTitle(*ed.cur.row, sp));
+            if (ImGui::GetIO().KeyCtrl && !ed.inSlot())  // Ctrl-click on [#tag]: go to that equation
+                for (auto sp : eqRefs(*ed.cur.row))
+                    if (ed.cur.i >= sp.first && ed.cur.i <= sp.second) {
+                        std::string name = eqName(*ed.cur.row, sp);
+                        for (auto& r : ed.doc)
+                            if (auto t = eqTag(r); t.first >= 0 && eqName(r, t) == name) ed.cur = {&r, 0}, scrollToCaret = true;
+                        return;
+                    }
             Line kind = lineStyle(*ed.cur.row).kind;  // a click on a checkbox ticks it
             if ((kind == Line::Todo || kind == Line::Done) && ed.topOf(ed.cur.row) == ed.cur.row &&
                 ImGui::GetMousePos().x < x0 + 1.3f * L.textSize && ImGui::GetMousePos().x > x0)
@@ -977,6 +1647,562 @@ struct App {
             vi.mouse(ed, hit(ImGui::GetMousePos()), true);
         }
         if (!ImGui::IsMouseDown(0)) dragging = false;
+        // right-click in a table or matrix: add and remove rows and columns
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(1) && !ImGui::IsAnyItemHovered()) {
+            vi.mouse(ed, hit(ImGui::GetMousePos()), false);
+            if (ed.inGrid()) ImGui::OpenPopup("grid");
+        }
+        if (ImGui::BeginPopup("grid")) {
+            bool m = ed.inSlot();
+            ImGui::TextDisabled(m ? "Matrix" : "Table");
+            static const std::pair<const char*, const char*> OPS[] = {{"Add row above", "row above"}, {"Add row below", "row below"},
+                                                                      {"Add column left", "col left"}, {"Add column right", "col right"},
+                                                                      {nullptr, nullptr}, {"Delete row", "row delete"}, {"Delete column", "col delete"}};
+            for (auto& [label, cmd] : OPS)
+                if (!label) ImGui::Separator();
+                else if (ImGui::MenuItem(label)) run(cmd);
+            ImGui::EndPopup();
+        }
+    }
+
+
+    // ---------- windows: settings, help, palette, file browser ----------
+    // a centred window over the editor; Esc closes it
+    bool beginPanel(const char* name, bool& open, ImVec2 size) {
+        ImVec2 d = ImGui::GetIO().DisplaySize;
+        size = {std::min(size.x, d.x - 40), std::min(size.y, d.y - 60)};
+        ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos({d.x / 2, d.y / 2}, ImGuiCond_Appearing, {0.5f, 0.5f});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16, 14});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, 7});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(pal().pop));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(alpha(pal().line, 0.7f)));
+        bool vis = ImGui::Begin(name, &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+        bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        panelFocused = panelFocused || focused;
+        if (focused && ImGui::IsKeyPressed(ImGuiKey_Escape)) open = false;
+        return vis;
+    }
+    void endPanel() {
+        ImGui::End();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(4);
+    }
+    void section(const char* t) {
+        ImGui::Spacing();
+        ImGui::PushFont(bold, 13);
+        ImGui::TextDisabled("%s", t);
+        ImGui::PopFont();
+        ImGui::Separator();
+    }
+    void hint(const char* t) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t);
+    }
+
+    void drawSettings() {
+        if (!showSettings) return;
+        if (!beginPanel("Settings", showSettings, {620, 620})) return endPanel();
+        bool cfgDirty = false, math = false;
+        auto check = [&](const char* label, bool& v, const char* tip = nullptr, bool isMath = false) {
+            if (ImGui::Checkbox(label, &v)) cfgDirty = true, math = math || isMath;
+            if (tip) hint(tip);
+        };
+        if (ImGui::BeginTabBar("tabs")) {
+            if (ImGui::BeginTabItem("Appearance")) {
+                section("Theme");
+                int theme = dark ? 0 : 1;
+                if (ImGui::RadioButton("Dark", &theme, 0)) dark = true, cfgDirty = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Light", &theme, 1)) dark = false, cfgDirty = true;
+                section("Text");
+                ImGui::SetNextItemWidth(260);
+                if (ImGui::SliderFloat("Text size", &textSize, 12, 32, "%.0f px")) applySizes(), cfgDirty = true;
+                hint("Also Ctrl-= and Ctrl-- (Ctrl-0 resets)");
+                ImGui::SetNextItemWidth(260);
+                if (ImGui::SliderFloat("Page width", &pageWidth, 500, 2000, "%.0f px")) cfgDirty = true;
+                hint("The widest the writing column gets; a narrow window is always filled");
+                section("Window");
+                check("Formatting buttons in the toolbar", toolbar);
+                check("Sidebar", sidebar, "Ctrl-\\ shows and hides it");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Editor")) {
+                section("Keys");
+                int keys = vim ? 0 : 1;
+                if (ImGui::RadioButton("Vim (modes: i to type, Esc to stop)", &keys, 0)) vim = true, cfgDirty = true;
+                if (ImGui::RadioButton("Standard (always typing, Ctrl-z/c/x/v, Esc closes the popup)", &keys, 1)) vim = false, cfgDirty = true;
+                check("CapsLock remapped to Escape works as Escape", g_capsEscape,
+                      "When your system maps CapsLock to Escape (caps:escape), opman sees the physical CapsLock key; this makes it Escape");
+                section("While you write");
+                check("Live results after each line", results, "The faint \"= 17\" at the end of a line; Tab writes it in", true);
+                check("Sliders on lines like a = 2", sliders, "Drag to change the number; results and plots follow");
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderFloat("Autosave after", &autosave, 0.2f, 10, "%.1f s idle")) cfgDirty = true;
+                hint("Notes save themselves this long after you stop typing (Ctrl-s saves at once)");
+                section("Start");
+                check("Open the last note at start (otherwise a new note)", openLast);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Autocomplete")) {
+                section("Suggestions popup");
+                check("Show suggestions while typing", completeOpts.popup,
+                      "Off: the popup only opens when you press Ctrl-Space (functions, symbols, results after =)");
+                ImGui::BeginDisabled(!completeOpts.popup);
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Letters before it opens", &completeOpts.minLetters, 1, 4)) cfgDirty = true;
+                hint("How much of a word you type before suggestions appear: 1 opens at once, 3 waits for \"sin\"");
+                ImGui::EndDisabled();
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Most entries shown", &completeOpts.maxItems, 3, 15)) cfgDirty = true;
+                ImGui::TextUnformatted("Accept a suggestion with");
+                ImGui::SameLine(220);
+                if (ImGui::RadioButton("Enter", &completeOpts.accept, 0)) cfgDirty = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Tab", &completeOpts.accept, 1)) cfgDirty = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Both", &completeOpts.accept, 2)) cfgDirty = true;
+                hint("Enter: Enter takes the highlighted entry for a math word (Tab still takes results).\n"
+                     "Tab: Enter always starts a new line unless you moved through the list with the arrows.\n"
+                     "Ctrl-1…9 picks an entry directly, and Esc closes the popup, in every mode.");
+                check("Rank entries by what you use most", completeOpts.learn, "Off: always the same order for the same letters");
+                section("Automatic conversion in math");
+                check("Math words turn into symbols", completeOpts.convert,
+                      "sin, sqrt, alpha, pi, infty… become their function or symbol once you type past them (sqrt8 → √8)");
+                check("Symbol combinations", completeOpts.combos, "-> → · <= ≤ · >= ≥ · != ≠ · => ⇒ · +- ± · ~= ≈ · ... …");
+                section("Results");
+                check("Live results after each line", results, "The faint \"= 17\" at the end of a line; Tab writes it in (also in Editor)", true);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Math")) {
+                section("Results");
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Significant digits", &mathOpts.digits, 2, 15)) cfgDirty = math = true;
+                hint("Decimal results are rounded to this many significant digits: 3.141592654 at 10, 3.142 at 4");
+                int ang = mathOpts.degrees ? 1 : 0;
+                ImGui::TextUnformatted("Angles");
+                ImGui::SameLine(160);
+                if (ImGui::RadioButton("Radians", &ang, 0)) mathOpts.degrees = false, cfgDirty = math = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Degrees", &ang, 1)) mathOpts.degrees = true, cfgDirty = math = true;
+                hint("Degrees: sin(30) = 1/2, arctan(1) = 45");
+                int dec = mathOpts.decimals ? 1 : 0;
+                ImGui::TextUnformatted("Live results");
+                ImGui::SameLine(160);
+                if (ImGui::RadioButton("Exact (3/4)", &dec, 0)) mathOpts.decimals = false, cfgDirty = math = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Decimal (0.75)", &dec, 1)) mathOpts.decimals = true, cfgDirty = math = true;
+                section("Plots");
+                float r[2] = {float(mathOpts.plotX0), float(mathOpts.plotX1)};
+                ImGui::SetNextItemWidth(260);
+                if (ImGui::InputFloat2("Default x range", r, "%g") && r[0] < r[1]) mathOpts.plotX0 = r[0], mathOpts.plotX1 = r[1], cfgDirty = math = true;
+                hint("Used when a plot line gives no range such as −3 < x < 3");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Files")) {
+                section("Library");
+                ImGui::TextWrapped("New notes are saved in %s", dir.string().c_str());
+                if (ImGui::Button("Change library folder…"))
+                    askPath(false, "Library folder", dir, {}, [this](std::string f) {
+                        saveNow();
+                        dir = f;
+                        saveCfg();
+                        listFiles();
+                    }, true);
+                ImGui::SameLine();
+                if (ImGui::Button("Open in file manager")) {
+                    std::string keep = current;
+                    current = (dir / "x").string();
+                    revealFolder();
+                    current = keep;
+                }
+                section("Export");
+                ImGui::TextWrapped("Quick exports (:export pdf) go to %s", (exportDir.empty() ? home() : fs::path(exportDir)).string().c_str());
+                if (ImGui::Button("Change export folder…"))
+                    askPath(false, "Export folder", exportDir.empty() ? home() : fs::path(exportDir), {}, [this](std::string f) {
+                        exportDir = f;
+                        saveCfg();
+                    }, true);
+                static char tex[256];
+                std::snprintf(tex, sizeof tex, "%s", pdflatex.c_str());
+                ImGui::SetNextItemWidth(260);
+                if (ImGui::InputText("pdflatex command", tex, sizeof tex)) pdflatex = tex, cfgDirty = true;
+                hint("The program that turns LaTeX into PDF: pdflatex, or a full path such as C:\\texlive\\bin\\pdflatex.exe");
+                section("Dialogs");
+                check("Use the system's open and save dialogs", nativeDialogs,
+                      "Off: opman's own file browser. On Linux the system dialogs need zenity or kdialog");
+                if (nativeDialogs && !dialog::available()) ImGui::TextDisabled("No system dialog found here: the built-in browser is used.");
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        endPanel();
+        vi.standard = !vim;
+        if (cfgDirty) saveCfg();
+        if (math) mathChanged();
+    }
+
+    // the help: topics on the left, the selected one (or every match of the search) on the right
+    void drawHelpBody(const char* body, const std::string& q) {
+        const Palette& p = pal();
+        std::string b = body;
+        size_t i = 0;
+        while (i <= b.size()) {
+            size_t e = b.find('\n', i);
+            if (e == std::string::npos) e = b.size();
+            std::string line = b.substr(i, e - i);
+            i = e + 1;
+            if (!q.empty() && lower(line).find(q) == std::string::npos && !line.starts_with("## ")) continue;
+            if (line.empty()) { ImGui::Spacing(); continue; }
+            if (line.starts_with("## ")) {
+                ImGui::Spacing();
+                ImGui::PushFont(bold, 15);
+                ImGui::TextUnformatted(line.c_str() + 3);
+                ImGui::PopFont();
+            } else if (line.starts_with("`")) {  // `keys` `more keys` description
+                std::string rest = line;
+                float x = ImGui::GetCursorPosX();
+                while (rest.starts_with("`")) {
+                    size_t c = rest.find('`', 1);
+                    if (c == std::string::npos) break;
+                    std::string k = rest.substr(1, c - 1);
+                    ImGui::PushFont(L.mono, 13);
+                    ImVec2 sz = ImGui::CalcTextSize(k.c_str()), a = ImGui::GetCursorScreenPos();
+                    ImGui::GetWindowDrawList()->AddRectFilled({a.x - 3, a.y - 1}, {a.x + sz.x + 3, a.y + sz.y + 1}, alpha(p.fn, 0.15f), 4);
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(p.fn), "%s", k.c_str());
+                    ImGui::PopFont();
+                    ImGui::SameLine(0, 10);
+                    rest = rest.substr(c + 1);
+                    while (rest.starts_with(" ")) rest.erase(0, 1);
+                }
+                ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), x + 150));
+                ImGui::TextWrapped("%s", rest.c_str());
+            } else if (line.starts_with("- ")) {
+                ImGui::Bullet();
+                ImGui::TextWrapped("%s", line.c_str() + 2);
+            } else ImGui::TextWrapped("%s", line.c_str());
+        }
+    }
+    void drawHelp() {
+        if (!showHelp) return;
+        auto& topics = helpTopics();
+        static int sel = 0;
+        if (!helpTopic.empty()) {  // :help files
+            for (size_t t = 0; t < topics.size(); t++)
+                if (lower(topics[t].title).find(lower(helpTopic)) != std::string::npos) { sel = int(t); break; }
+            helpTopic.clear();
+        }
+        if (!beginPanel("Help", showHelp, {900, 680})) return endPanel();
+        std::string q = lower(helpQuery);
+        ImGui::BeginChild("topics", {210, 0});
+        if (ImGui::Button("Open the tour", {-1, 0})) run("tour");
+        ImGui::Spacing();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##q", "Search help…", helpQuery, sizeof helpQuery);
+        ImGui::Spacing();
+        for (size_t t = 0; t < topics.size(); t++) {
+            bool hit = q.empty() || lower(topics[t].title).find(q) != std::string::npos || lower(topics[t].body).find(q) != std::string::npos;
+            if (!hit) continue;
+            if (ImGui::Selectable(topics[t].title, q.empty() && int(t) == sel)) sel = int(t), helpQuery[0] = 0;
+        }
+        ImGui::EndChild();
+        ImGui::SameLine(0, 18);
+        ImGui::BeginChild("body", {0, 0});
+        ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 10);
+        if (q.empty()) {
+            ImGui::PushFont(bold, 22);
+            ImGui::TextUnformatted(topics[sel].title);
+            ImGui::PopFont();
+            ImGui::Spacing();
+            drawHelpBody(topics[sel].body, "");
+        } else {
+            bool any = false;
+            for (auto& t : topics) {
+                if (lower(t.body).find(q) == std::string::npos && lower(t.title).find(q) == std::string::npos) continue;
+                any = true;
+                ImGui::PushFont(bold, 17);
+                ImGui::TextUnformatted(t.title);
+                ImGui::PopFont();
+                drawHelpBody(t.body, lower(t.title).find(q) != std::string::npos ? "" : q);
+                ImGui::Spacing();
+                ImGui::Separator();
+            }
+            if (!any) ImGui::TextDisabled("Nothing about \"%s\"", helpQuery);
+        }
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+        endPanel();
+    }
+
+    // ---------- command palette: every action, setting, note and help topic by name ----------
+    struct Action {
+        std::string name, keys;
+        std::function<void()> run;
+    };
+    std::vector<Action> actions() {
+        std::vector<Action> a = {
+            {"New note", "Ctrl-Shift-n", [this] { newDoc(); }},
+            {"Open note…", "Ctrl-Shift-o", [this] { openDialog(); }},
+            {"Save", "Ctrl-s", [this] { run("w"); }},
+            {"Save as…", "Ctrl-Shift-s", [this] { saveAsDialog(); }},
+            {"Export as Markdown…", "", [this] { exportDialog("md"); }},
+            {"Export as web page (HTML)…", "", [this] { exportDialog("html"); }},
+            {"Export as LaTeX…", "", [this] { exportDialog("tex"); }},
+            {"Export as PDF…", "", [this] { exportDialog("pdf"); }},
+            {"Show in file manager", ":folder", [this] { revealFolder(); }},
+            {"Rename note…", ":rename", [this] { exCmd("rename "); }},
+            {"Move note to trash", ":trash", [this] { run("trash"); }},
+            {"Go back to the previous note", "Ctrl-o", [this] { run("back"); }},
+            {"Settings", "Ctrl-,", [this] { showSettings = true; }},
+            {"Help", "F1", [this] { showHelp = true; }},
+            {"Toggle sidebar", "Ctrl-\\", [this] { run("sidebar"); }},
+            {"Outline of this note", ":outline", [this] { run("outline"); }},
+            {"Find", "/", [this] { vi.mode = Mode::Command, vi.prompt = '/', vi.cmdline.clear(); }},
+            {"Find and replace", ":%s/old/new/g", [this] { exCmd("%s/"); }},
+            {"Open the tour (an example note)", ":tour", [this] { run("tour"); }},
+            {"Print…", ":print · Ctrl-p (standard keys)", [this] { run("print"); }},
+            {"Insert table", "Space |", [this] { run("table 3 2"); }},
+            {"Table/matrix: add row below", ":row below · Shift-Enter", [this] { run("row below"); }},
+            {"Table/matrix: add row above", ":row above", [this] { run("row above"); }},
+            {"Table/matrix: add column right", ":col right", [this] { run("col right"); }},
+            {"Table/matrix: add column left", ":col left", [this] { run("col left"); }},
+            {"Table/matrix: delete row", ":row delete", [this] { run("row delete"); }},
+            {"Table/matrix: delete column", ":col delete", [this] { run("col delete"); }},
+            {"Insert section (new set of variables)", "Space =", [this] { run("section"); }},
+            {"Insert divider", "Space /", [this] { run("rule"); }},
+            {"Insert picture…", ":image", [this] {
+                 askPath(false, "Insert picture", home(), {{"Pictures", "*.png *.jpg *.jpeg *.gif *.bmp"}}, [this](std::string f) { addImage(f); });
+             }},
+            {"Math mode on/off", "Ctrl-m", [this] { ed.mathMode = !ed.mathMode; }},
+            {dark ? "Light theme" : "Dark theme", "", [this] { dark = !dark; saveCfg(); }},
+            {"Bigger text", "Ctrl-=", [this] { run("zoom in"); }},
+            {"Smaller text", "Ctrl--", [this] { run("zoom out"); }},
+            {"Reset text size", "Ctrl-0", [this] { run("zoom reset"); }},
+            {mathOpts.degrees ? "Angles in radians" : "Angles in degrees", "", [this] { run(mathOpts.degrees ? "set radians" : "set degrees"); }},
+            {mathOpts.decimals ? "Exact results (fractions)" : "Decimal results", "", [this] { run(mathOpts.decimals ? "set fractions" : "set decimals"); }},
+            {vim ? "Standard keys (no vim modes)" : "Vim keys", "", [this] { run(vim ? "set standard" : "set vim"); }},
+            {results ? "Hide live results" : "Show live results", "", [this] { results = !results; mathChanged(); }},
+            {"Quit", ":q", [this] { quit = true; }},
+        };
+        for (auto& t : helpTopics()) {
+            std::string title = t.title;
+            a.push_back({"Help: " + title, "", [this, title] { showHelp = true; helpTopic = title; }});
+        }
+        for (auto& f : files) {
+            std::string n = f.name;
+            a.push_back({"Open: " + titleOf(f.meta), "", [this, n] { openDoc(n); }});
+        }
+        return a;
+    }
+    void exCmd(const std::string& start) {  // the : line, typed in for the user to finish
+        vi.mode = Mode::Command;
+        vi.prompt = ':';
+        vi.cmdline = start;
+    }
+    void drawPalette() {
+        if (!showPalette) return;
+        ImVec2 d = ImGui::GetIO().DisplaySize;
+        float w = std::min(620.f, d.x - 40);
+        ImGui::SetNextWindowPos({d.x / 2 - w / 2, 70}, ImGuiCond_Always);
+        ImGui::SetNextWindowSizeConstraints({w, 0}, {w, FLT_MAX});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10, 10});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(pal().pop));
+        ImGui::Begin("##palette", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-1);
+        bool typed = ImGui::InputTextWithHint("##pq", "Type a command, setting, note or help topic…", paletteQuery, sizeof paletteQuery);
+        if (typed) paletteSel = 0;
+        auto all = actions();
+        std::string q = lower(paletteQuery);
+        std::vector<std::pair<int, size_t>> hits;  // score, index: word starts first, then anywhere, then letters in order
+        for (size_t j = 0; j < all.size(); j++) {
+            std::string n = lower(all[j].name);
+            int sc = q.empty() ? 1 : n.starts_with(q) ? 4 : n.find(" " + q) != std::string::npos ? 3 : n.find(q) != std::string::npos ? 2 : 0;
+            if (!sc && q.size() > 1) {
+                size_t at = 0;
+                bool ok = true;
+                for (char c : q) if ((at = n.find(c, at)) == std::string::npos) { ok = false; break; } else at++;
+                sc = ok;
+            }
+            if (sc && (!q.empty() || !all[j].name.starts_with("Open: ") || hits.size() < 40)) hits.push_back({sc, j});
+        }
+        std::stable_sort(hits.begin(), hits.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        if (hits.size() > 12) hits.resize(12);
+        int n = int(hits.size());
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) paletteSel = n ? (paletteSel + 1) % n : 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) paletteSel = n ? (paletteSel + n - 1) % n : 0;
+        paletteSel = std::clamp(paletteSel, 0, std::max(0, n - 1));
+        int chosen = -1;
+        for (int j = 0; j < n; j++) {
+            auto& act = all[hits[j].second];
+            ImGui::PushID(j);
+            if (ImGui::Selectable("##a", j == paletteSel, 0, {0, 24})) chosen = j;
+            ImGui::SameLine(8);
+            ImGui::TextUnformatted(act.name.c_str());
+            if (!act.keys.empty()) {
+                ImGui::SameLine(w - 20 - ImGui::CalcTextSize(act.keys.c_str()).x);
+                ImGui::TextDisabled("%s", act.keys.c_str());
+            }
+            ImGui::PopID();
+        }
+        if (!n) ImGui::TextDisabled("No match");
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) chosen = paletteSel;
+        bool close = ImGui::IsKeyPressed(ImGuiKey_Escape) || (!ImGui::IsWindowFocused() && !ImGui::IsWindowAppearing());
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(3);
+        if (chosen >= 0 && chosen < n) {
+            showPalette = false;
+            all[hits[chosen].second].run();
+            changed();
+        } else if (close) showPalette = false;
+    }
+
+    // ---------- the built-in file browser (when there is no system dialog) ----------
+    void drawBrowser() {
+        if (!browser.open) return;
+        bool open = true;
+        if (!beginPanel((browser.title + "###browser").c_str(), open, {640, 520})) { endPanel(); browser.open = open; return; }
+        std::error_code ec;
+        static char path[1024];
+        std::snprintf(path, sizeof path, "%s", browser.at.string().c_str());
+        if (ImGui::Button("↑ Up")) browser.at = browser.at.parent_path();
+        ImGui::SameLine();
+        if (ImGui::Button("Home")) browser.at = home();
+        ImGui::SameLine();
+        if (ImGui::Button("Library")) browser.at = dir;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##path", path, sizeof path, ImGuiInputTextFlags_EnterReturnsTrue) && fs::is_directory(path, ec)) browser.at = path;
+        std::vector<fs::directory_entry> dirs, list;
+        for (auto& e : fs::directory_iterator(browser.at, fs::directory_options::skip_permission_denied, ec)) {
+            std::string n = e.path().filename().string();
+            if (n.starts_with(".")) continue;
+            if (e.is_directory(ec)) dirs.push_back(e);
+            else if (!browser.folders && (browser.ext.empty() || browser.ext.find(lower(e.path().extension().string())) != std::string::npos ||
+                                          (browser.ext == ".opman" && e.path().extension() == ".json")))
+                list.push_back(e);
+        }
+        auto byName = [](auto& a, auto& b) { return lower(a.path().filename().string()) < lower(b.path().filename().string()); };
+        std::sort(dirs.begin(), dirs.end(), byName);
+        std::sort(list.begin(), list.end(), byName);
+        std::string pick;
+        ImGui::BeginChild("entries", {0, -ImGui::GetFrameHeightWithSpacing() - 6}, ImGuiChildFlags_Borders);
+        for (auto& e : dirs) {
+            std::string n = "▸ " + e.path().filename().string();
+            if (ImGui::Selectable(n.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick) && ImGui::IsMouseDoubleClicked(0)) browser.at = e.path();
+        }
+        for (auto& e : list) {
+            std::string n = e.path().filename().string();
+            bool sel = n == browser.name;
+            if (ImGui::Selectable(n.c_str(), sel, ImGuiSelectableFlags_AllowDoubleClick)) {
+                std::snprintf(browser.name, sizeof browser.name, "%s", n.c_str());
+                if (ImGui::IsMouseDoubleClicked(0)) pick = e.path().string();
+            }
+        }
+        if (dirs.empty() && list.empty()) ImGui::TextDisabled("Empty folder");
+        ImGui::EndChild();
+        if (!browser.folders) {
+            ImGui::SetNextItemWidth(-160);
+            bool enter = ImGui::InputTextWithHint("##name", "File name", browser.name, sizeof browser.name, ImGuiInputTextFlags_EnterReturnsTrue);
+            if (enter && browser.name[0]) pick = (browser.at / browser.name).string();
+            ImGui::SameLine();
+        }
+        if (ImGui::Button(browser.folders ? "Choose this folder" : browser.save ? "Save" : "Open", {browser.folders ? 0.f : 70.f, 0})) {
+            if (browser.folders) pick = browser.at.string();
+            else if (browser.name[0]) pick = (browser.at / browser.name).string();
+        }
+        if (!browser.folders) ImGui::SameLine();
+        if (ImGui::Button("Cancel")) open = false;
+        endPanel();
+        if (!pick.empty()) {
+            if (browser.save && !browser.ext.empty() && fs::path(pick).extension().empty()) pick += browser.ext.substr(0, browser.ext.find(' '));
+            if (!browser.save && !browser.folders && !fs::exists(pick, ec)) { message = "No such file: " + pick; return; }
+            auto done = browser.done;
+            browser.open = false;
+            done(pick);
+            return;
+        }
+        browser.open = open;
+    }
+
+    void fileMenu() {
+        if (ImGui::MenuItem("New note", "Ctrl-Shift-n")) newDoc();
+        if (ImGui::MenuItem("Open…", "Ctrl-Shift-o")) openDialog();
+        if (ImGui::BeginMenu("Open recent")) {
+            int keep = sort;
+            sort = 0;
+            auto list = sortedFiles();
+            sort = keep;
+            for (size_t j = 0; j < list.size() && j < 12; j++)
+                if (ImGui::MenuItem((titleOf(list[j].meta) + "##r" + std::to_string(j)).c_str(), ago(str(list[j].meta, "edited")).c_str()))
+                    openDoc(list[j].name);
+            if (list.empty()) ImGui::TextDisabled("No notes yet");
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Save", "Ctrl-s")) run("w");
+        if (ImGui::MenuItem("Save as…", "Ctrl-Shift-s")) saveAsDialog();
+        if (ImGui::BeginMenu("Export")) {
+            if (ImGui::MenuItem("Markdown (.md)…")) exportDialog("md");
+            if (ImGui::MenuItem("Web page (.html)…")) exportDialog("html");
+            if (ImGui::MenuItem("LaTeX (.tex)…")) exportDialog("tex");
+            if (ImGui::MenuItem("PDF (.pdf)…")) exportDialog("pdf");
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem("Print…", vim ? ":print" : "Ctrl-p")) run("print");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Rename…")) exCmd("rename ");
+        if (ImGui::MenuItem("Show in file manager")) revealFolder();
+        if (ImGui::MenuItem("Move to trash")) run("trash");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Command palette", "Ctrl-Shift-p")) showPalette = true, paletteQuery[0] = 0, paletteSel = 0;
+        if (ImGui::MenuItem("Settings", "Ctrl-,")) showSettings = true;
+        if (ImGui::MenuItem("Help", "F1")) showHelp = true;
+        ImGui::Separator();
+        if (ImGui::MenuItem("Quit", ":q")) quit = true;
+    }
+
+    // headings and sections of the open note, for the sidebar's Outline tab
+    void drawOutline() {
+        const Palette& p = pal();
+        bool any = false;
+        int here = ed.lineOf(ed.topOf(ed.cur.row));
+        for (size_t k = 0; k < ed.doc.size(); k++) {
+            LineStyle st = lineStyle(ed.doc[k]);
+            int depth = st.kind == Line::H1 ? 0 : st.kind == Line::H2 ? 1 : st.kind == Line::H3 ? 2 : st.kind == Line::Section ? 0 : -1;
+            if (depth < 0) continue;
+            any = true;
+            std::string t = st.kind == Line::Section ? "§ " + sectionTitle(ed.doc[k]) : plain(Row(ed.doc[k].begin() + st.len, ed.doc[k].end()));
+            if (t.empty() || t == "§ ") t += "(untitled)";
+            int next = int(ed.doc.size());
+            for (size_t j = k + 1; j < ed.doc.size(); j++) {
+                Line q = lineStyle(ed.doc[j]).kind;
+                if (q == Line::H1 || q == Line::H2 || q == Line::H3 || q == Line::Section) { next = int(j); break; }
+            }
+            ImGui::SetCursorPosX(10 + depth * 14.f);
+            ImGui::PushID(int(k));
+            if (st.kind == Line::Section) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(p.fn));
+            if (ImGui::Selectable(t.c_str(), here >= int(k) && here < next, 0, {ImGui::GetContentRegionAvail().x - 8, 0})) {
+                ed.cur = {&ed.doc[k], 0};
+                if (!vim) ed.cur.i = int(ed.doc[k].size());
+                scrollToCaret = true;
+                sideFocus = false;
+            }
+            if (st.kind == Line::Section) ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        if (!any) {
+            ImGui::SetCursorPosX(12);
+            ImGui::TextDisabled("No headings or sections yet.");
+            ImGui::SetCursorPosX(12);
+            ImGui::TextDisabled("Start a line with # or ===.");
+        }
     }
 
     void drawPopup() {
@@ -1025,8 +2251,10 @@ struct App {
             L.drawText(e.name, t1.x + 10, base, 14, p.fg, ui);
             std::string catText = lower(e.cat);
             for (auto& ch : catText) ch = char(std::toupper((unsigned char)ch));
-            bool tab = e.insert || e.cat == "Program", takes = sel && (tab || vi.enterPicks(ed));  // a text word needs ↓ first
-            std::string kbd = takes ? (tab ? "Tab" : "Enter") : j < 9 ? "Ctrl " + std::to_string(j + 1) : "";
+            bool tab = e.insert || e.cat == "Program", takes = sel && (tab || vi.navigated || vi.enterPicks(ed));  // a text word needs ↓ first
+            int acc = completeOpts.accept;
+            std::string kbd = !takes ? (j < 9 ? "Ctrl " + std::to_string(j + 1) : "")
+                            : tab || acc == 1 ? "Tab" : acc == 2 ? "Enter/Tab" : "Enter";
             float kw = L.textWidth(kbd, 11), cw = L.textWidth(catText, 11);
             L.drawText(kbd, a.x + w - kw - 8, base - 1, 11, p.muted, ui);
             L.drawText(catText, a.x + w - kw - cw - 22, base - 1, 11, cc, bold);
@@ -1043,11 +2271,26 @@ struct App {
         const Palette& p = pal();
         ImGui::PushFont(ui, 14);
         ImGui::SetCursorPos({10, 10});
-        ImGui::TextDisabled("%s", dir.filename().string().c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\nset with OPMAN_DOCS or \"dir\" in %s", dir.string().c_str(), cfgFile.string().c_str());
+        for (int t = 0; t < 2; t++) {  // Notes | Outline
+            if (t) ImGui::SameLine(0, 4);
+            bool on = sideTab == t;
+            ImGui::PushStyleColor(ImGuiCol_Button, on ? ImGui::ColorConvertU32ToFloat4(p.line) : ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(on ? p.fg : p.muted));
+            if (ImGui::Button(t ? "Outline" : "Notes")) sideTab = t;
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", t ? "Headings and sections of this note (:outline)" : ("Notes in " + dir.string() + " and ones opened elsewhere").c_str());
+        }
         ImGui::SameLine(ImGui::GetWindowWidth() - 36);
         if (ImGui::Button("+")) newDoc();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("New document (:new)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("New note  (Ctrl-Shift-n · :new)");
+        if (sideTab == 1) {
+            ImGui::BeginChild("outline", {0, 0});
+            drawOutline();
+            ImGui::EndChild();
+            ImGui::PopFont();
+            return;
+        }
         ImGui::SetCursorPosX(10);
         ImGui::SetNextItemWidth(ImGui::GetWindowWidth() - 120);
         if (focusFilter) {
@@ -1091,6 +2334,7 @@ struct App {
                 sub = (s0 ? "…" : "") + t.substr(s0, s1 - s0);
                 std::replace(sub.begin(), sub.end(), '\n', ' ');
             }
+            if (q.empty() && !inLibrary(f.name)) sub += "  ·  " + fs::path(f.name).parent_path().filename().string();
             L.drawText(sub, a.x + 10, a.y + 34, 12, p.muted, ui);
             dl->PopClipRect();
             if (hov) ImGui::SetTooltip("%s\n%s", titleOf(f.meta).c_str(), f.name.c_str());
@@ -1140,7 +2384,9 @@ struct App {
         uint16_t f = fmtHere();
         Line kind = lineStyle(*ed.topOf(ed.cur.row)).kind;
         bool act = false;
+        float limit = FLT_MAX;  // buttons past it don't fit: hidden (the palette has them all)
         auto btn = [&](const char* id, const char* tip, bool on, auto icon, float w = 30) {
+            if (x + w > limit) { x += w + 2; return false; }
             ImGui::SetCursorScreenPos({x, o.y + 5});
             bool click = ImGui::InvisibleButton(id, {w, h - 10});
             bool hov = ImGui::IsItemHovered();
@@ -1153,7 +2399,7 @@ struct App {
         };
         auto sep = [&] {
             x += 5;
-            dl->AddLine({x, o.y + 11}, {x, o.y + h - 11}, p.line);
+            if (x < limit) dl->AddLine({x, o.y + 11}, {x, o.y + h - 11}, p.line);
             x += 7;
         };
         auto text = [&](const char* t, ImFont* fo, float size, bool slant = false) {
@@ -1165,6 +2411,14 @@ struct App {
         auto lines = [&](ImVec2 c, ImU32 col, float x0) {
             for (int i = -1; i <= 1; i++) dl->AddLine({c.x + x0, c.y + i * 5.f}, {c.x + 8, c.y + i * 5.f}, col, 1.5f);
         };
+        if (btn("menu", "File: new, open, save as, export, settings, help", false, [&](ImVec2 c, ImU32 col) {
+                for (int i = -1; i <= 1; i++) dl->AddLine({c.x - 7, c.y + i * 5.f}, {c.x + 7, c.y + i * 5.f}, col, 1.6f);
+            }))
+            ImGui::OpenPopup("filemenu");
+        if (ImGui::BeginPopup("filemenu")) {
+            fileMenu();
+            ImGui::EndPopup();
+        }
         // sidebar
         if (btn("side", "Sidebar  (Ctrl-\\ · Space e)", sidebar, [&](ImVec2 c, ImU32 col) {
                 dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 3, 0, 1.5f);
@@ -1172,8 +2426,11 @@ struct App {
             }))
             run("sidebar");
         sep();
-        if (btn("undo", "Undo  (u)", false, text("↶", L.math, 20))) ed.undo();
-        if (btn("redo", "Redo  (Ctrl-r)", false, text("↷", L.math, 20))) ed.redo();
+        float right = o.x + W - 3 * 32 - 12;  // palette, help, settings keep their place; formatting is cut off before them
+        limit = right;
+        if (toolbar) {
+        if (btn("undo", vim ? "Undo  (u)" : "Undo  (Ctrl-z)", false, text("↶", L.math, 20))) ed.undo();
+        if (btn("redo", vim ? "Redo  (Ctrl-r)" : "Redo  (Ctrl-y)", false, text("↷", L.math, 20))) ed.redo();
         sep();
         if (btn("b", "Bold  (Ctrl-b · Space b)", f & Bold, text("B", bold, 16))) vi.format(ed, Bold);
         if (btn("i", "Italic  (Ctrl-i · Space i)", f & Italic, text("I", ui, 16, true))) vi.format(ed, Italic);
@@ -1252,7 +2509,29 @@ struct App {
                 dl->AddLine({c.x - 8, c.y - 2}, {c.x + 8, c.y - 2}, col, 1.5f);
                 dl->AddLine({c.x, c.y - 7}, {c.x, c.y + 7}, col, 1.5f);
             }))
-            run("table 3 2");
+            ImGui::OpenPopup("tablesize");
+        if (ImGui::BeginPopup("tablesize")) {  // pick a size by hovering a grid, like a word processor
+            static int hr = 3, hc = 2;
+            ImDrawList* pd = ImGui::GetWindowDrawList();
+            const int R = 8, C = 8;
+            const float cell = 20;
+            ImVec2 o = ImGui::GetCursorScreenPos(), mp = ImGui::GetMousePos();
+            bool pick = ImGui::InvisibleButton("grid", {C * cell, R * cell});
+            if (ImGui::IsItemHovered()) hc = std::clamp(int((mp.x - o.x) / cell) + 1, 1, C), hr = std::clamp(int((mp.y - o.y) / cell) + 1, 1, R);
+            for (int r = 0; r < R; r++)
+                for (int c = 0; c < C; c++) {
+                    ImVec2 a{o.x + c * cell + 2, o.y + r * cell + 2}, b{a.x + cell - 4, a.y + cell - 4};
+                    bool on = r < hr && c < hc;
+                    pd->AddRectFilled(a, b, on ? p.sel : p.side, 2);
+                    pd->AddRect(a, b, on ? p.fn : p.line, 2);
+                }
+            ImGui::Text("%d × %d  (rows × columns)", hr, hc);
+            if (pick) {
+                run("table " + std::to_string(hr) + " " + std::to_string(hc));
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
         if (btn("sec", "New section: its own variables, for the next exercise  (Space = · :section [title] · type ===)",
                 kind == Line::Section, text("§", bold, 17)))
             run("section");
@@ -1274,23 +2553,29 @@ struct App {
             if (vi.mode == Mode::Normal) vi.key(ed, Vi::parse("a")[0]);
             changed();
         }
-        if (btn("img", "Image: drag a picture onto the window  (:image path)", kind == Line::Image, [&](ImVec2 c, ImU32 col) {
+        if (btn("img", "Picture: choose one, or drag it onto the window  (:image path)", kind == Line::Image, [&](ImVec2 c, ImU32 col) {
                 dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 2, 0, 1.5f);
                 ImVec2 m[] = {{c.x - 6, c.y + 5}, {c.x - 1, c.y - 1}, {c.x + 2, c.y + 2}, {c.x + 4, c.y}, {c.x + 7, c.y + 5}};
                 dl->AddPolyline(m, 5, col, 0, 1.4f);
                 dl->AddCircleFilled({c.x + 3, c.y - 3.5f}, 1.6f, col);
             }))
-            message = "Drag a picture onto the window, or :image <path>";
+            askPath(false, "Insert picture", home(), {{"Pictures", "*.png *.jpg *.jpeg *.gif *.bmp"}}, [this](std::string f) { addImage(f); });
         sep();
         if (btn("m", "Math mode: everything typed is math  (Ctrl-m · Space m)", ed.mathMode, text("∑", L.math, 18))) ed.mathMode = !ed.mathMode;
-        // theme, at the right edge
-        x = std::max(x, o.x + W - 40);
-        if (btn("theme", dark ? "Light theme  (:set light)" : "Dark theme  (:set dark)", false, [&](ImVec2 c, ImU32 col) {
-                dl->AddCircle(c, 7, col, 0, 1.5f);
-                dl->PathArcTo(c, 7, -IM_PI / 2, IM_PI / 2);
-                dl->PathFillConvex(col);
+        }
+        limit = FLT_MAX;
+        x = right + 8;
+        if (btn("pal", "Command palette: find any action, setting or note  (Ctrl-Shift-p)", showPalette, text("⌘", L.math, 17)))
+            showPalette = true, paletteQuery[0] = 0, paletteSel = 0;
+        if (btn("help", "Help  (F1)", showHelp, text("?", bold, 16))) showHelp = !showHelp;
+        if (btn("set", "Settings  (Ctrl-,)", showSettings, [&](ImVec2 c, ImU32 col) {
+                dl->AddCircle(c, 4, col, 0, 1.6f);
+                for (int i = 0; i < 8; i++) {
+                    float t = i * IM_PI / 4;
+                    dl->AddLine({c.x + 5.5f * std::cos(t), c.y + 5.5f * std::sin(t)}, {c.x + 8 * std::cos(t), c.y + 8 * std::sin(t)}, col, 2.2f);
+                }
             }))
-            run(dark ? "set light" : "set dark");
+            showSettings = !showSettings;
         if (act) changed();
     }
 
@@ -1304,6 +2589,7 @@ struct App {
         std::string left = vi.mode == Mode::Insert ? "-- INSERT --" : vi.mode == Mode::Visual ? "-- VISUAL --"
                          : vi.mode == Mode::VisualLine ? "-- VISUAL LINE --" : vi.mode == Mode::Command ? vi.prompt + vi.cmdline : "";
         if (sideFocus) left = "-- FILES --  j/k move · Enter open · / filter · Esc back";
+        if (!vim && vi.mode == Mode::Insert) left.clear();  // standard keys: always typing, no mode to show
         float x = a.x + 12;
         {  // Ctrl-m toggle beside the mode: filled when everything typed is math
             std::string t = ed.mathMode ? "MATH" : "TEXT";
@@ -1327,7 +2613,9 @@ struct App {
                        x + 4, base, 12, p.fg, ui);
         else if (!msg.empty()) L.drawText(msg, x + 16, base, 14, p.muted, ui);
         else if (left.empty())
-            L.drawText("i insert · Esc normal · Space formatting · Ctrl-m math · :w save · :e find · / search · :export · Ctrl-w files", x + 4, base, 12, alpha(p.muted, 0.8f), ui);
+            L.drawText(vim ? "i insert · Esc normal · Space formatting · Ctrl-m math · Ctrl-Shift-p commands · F1 help"
+                           : "Ctrl-m math · Tab takes a result · Ctrl-z undo · Ctrl-f find · Ctrl-Shift-p commands · F1 help",
+                       x + 4, base, 12, alpha(p.muted, 0.8f), ui);
         int k = ed.lineOf(ed.topOf(ed.cur.row)) + 1;
         std::string right = titleOf(meta) + (docJson(ed.doc).dump() == savedJson ? "" : " [+]") + "   " + std::to_string(k) + "/" +
                             std::to_string(ed.doc.size());
@@ -1337,8 +2625,9 @@ struct App {
 
     void frame() {
         input();
+        panelFocused = false;  // the panels drawn below set it again
         pdfDone();
-        if (changedAt >= 0 && nowSec() - changedAt > 0.5) saveNow();
+        if (changedAt >= 0 && nowSec() - changedAt > std::max(0.2f, autosave)) saveNow();
         if (!vi.message.empty() || !message.empty()) {}
         applyColors();
         ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1374,6 +2663,10 @@ struct App {
         ImGui::End();
         ImGui::PopStyleVar(2);
         drawPopup();
+        drawSettings();
+        drawHelp();
+        drawPalette();
+        drawBrowser();
     }
 };
 
@@ -1392,7 +2685,6 @@ static void applyStyle() {
 }
 
 int main(int argc, char** argv) {
-    (void)argc, (void)argv;
     if (!glfwInit()) return 1;
 #ifdef __APPLE__
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -1445,9 +2737,23 @@ int main(int argc, char** argv) {
     app.L.mono = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14);
     if (!app.L.mono) app.L.mono = app.ui;
     app.loadCfg();
-    app.files = listDocs(app.dir);
-    app.openMostRecent();
+    app.convertLibrary();
+    app.listFiles();
+    fs::path arg = argc > 1 ? fs::path(argv[1]) : fs::path();  // UTF-8 on Windows too (packaging/opman.manifest)
+    std::error_code ec;
+    if (!arg.empty() && fs::is_regular_file(arg, ec)) app.openPath(arg.string());  // opman note.opman (a double-click)
+    else app.openMostRecent();
     const char* keys = std::getenv("OPMAN_KEYS");
+    // OPMAN_MOUSE="m 600 400; d; u; d; u; w -2": one mouse step per frame after the keys (move to x y in window
+    // coordinates, button down/up, wheel), for testing plots and sliders
+    std::vector<std::string> mouse;
+    if (const char* m = std::getenv("OPMAN_MOUSE")) {
+        std::string all = m, step;
+        for (char c : all + ";") {
+            if (c == ';') { if (!step.empty()) mouse.push_back(step); step.clear(); }
+            else if (c != ' ' || !step.empty()) step += c;
+        }
+    }
     double shotAt = std::getenv("OPMAN_SHOT_AFTER") ? std::atof(std::getenv("OPMAN_SHOT_AFTER")) : 1.5;
     int frames = 0;
 
@@ -1459,6 +2765,15 @@ int main(int argc, char** argv) {
             keys = nullptr;
         }
         frames++;
+        if (frames > 4 && !mouse.empty()) {
+            std::string st = mouse.front();
+            mouse.erase(mouse.begin());
+            float mx, my, wv;
+            if (std::sscanf(st.c_str(), "m %f %f", &mx, &my) == 2) io.AddMousePosEvent(mx, my);
+            else if (st == "d" || st == "u") io.AddMouseButtonEvent(0, st == "d");
+            else if (st == "rd" || st == "ru") io.AddMouseButtonEvent(1, st == "rd");
+            else if (std::sscanf(st.c_str(), "w %f", &wv) == 1) io.AddMouseWheelEvent(0, wv);
+        }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         // UI scale on Windows/X11 (pixel coordinates); Wayland/macOS scale through the framebuffer (from opcan)

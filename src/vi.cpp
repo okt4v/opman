@@ -24,7 +24,9 @@ std::optional<std::pair<int, int>> Vi::visualLines(const Editor& ed) const {
 // one undo step per insert session (commands that already changed the doc snapped before that change)
 void Vi::mouse(Editor& ed, Cur p, bool drag) {
     if (!drag) {
-        ed.cur = dragFrom = p;
+        ed.cur = p;
+        ed.snapToCell();  // a click on a table border lands in a cell
+        dragFrom = ed.cur;
         ed.range.reset();
         if (mode != Mode::Insert) mode = Mode::Normal;
     } else if (mode == Mode::Insert) ed.selectBetween(dragFrom, p);
@@ -54,6 +56,13 @@ std::vector<Key> Vi::parse(const std::string& s) {
             else if (t == "Space") k.ch = " ";
             else if (t == "Tab") k.sp = Key::Tab;
             else if (t == "BS") k.sp = Key::Backspace;
+            else if (t == "F1") k.sp = Key::F1;
+            else if (t == "Down") k.sp = Key::Down;
+            else if (t == "Up") k.sp = Key::Up;
+            else if (t == "Left") k.sp = Key::Left;
+            else if (t == "Right") k.sp = Key::Right;
+            else if (t.starts_with("C-S-")) k.ctrl = k.shift = true, k.ch = t.substr(4);
+            else if (t == "C-Space") k.ctrl = true, k.ch = " ";
             else if (t.starts_with("C-")) k.ctrl = true, k.ch = t.substr(2);
             else k.ch = "<" + t + ">";  // ponytail: not a key name, typed literally as one string
         } else {
@@ -168,6 +177,7 @@ void Vi::key(Editor& ed, const Key& k) {
         rec.push_back(k);
     }
     key1(ed, k);
+    if (standard && mode != Mode::Insert && mode != Mode::Command) mode = Mode::Insert, pending.clear(), ed.range.reset();
     if (!replaying && mode == Mode::Normal && pending.empty() && ed.changes != recFrom) last = rec, recFrom = ed.changes;
 }
 
@@ -183,6 +193,8 @@ void Vi::key1(Editor& ed, const Key& k) {
     else {
         // arrows and friends double as motions outside Insert mode
         std::string c = k.ch;
+        if (mode == Mode::Normal && !k.shift && (k.sp == Key::Left || k.sp == Key::Right) && ed.cellMove(k.sp == Key::Left ? -1 : 1, 0))
+            return refresh(ed);  // tables: arrows go cell to cell
         if (k.sp == Key::Left || k.sp == Key::Backspace) c = "h";
         else if (k.sp == Key::Right) c = "l";
         else if (k.sp == Key::Up) c = "k";
@@ -209,27 +221,44 @@ void Vi::insertKey(Editor& ed, const Key& k) {
     };
     auto sel = ed.selRange();
     int n = int(items.size());
+    // a Ctrl-Space popup lasts while you type letters of its word
+    if (ed.forced && (k.ctrl || k.sp != Key::None || !isLetter(k.ch)) && !(k.ctrl && k.ch == " ") && k.sp != Key::Up && k.sp != Key::Down &&
+        !(k.ctrl && (k.ch == "n" || k.ch == "p")))
+        ed.forced = false;
     if (k.ctrl) {
+        if (k.ch == " ") { ed.forced = true, ed.dismissed.clear(); return; }  // open the popup (also when it's off in settings)
         if (k.ch.size() == 1 && k.ch[0] >= '1' && k.ch[0] <= '9') pickItem(ed, k.ch[0] - '1');
         else if (n && (k.ch == "n" || k.ch == "p")) ed.pick = (ed.pick + (k.ch == "n" ? 1 : n - 1)) % n, navigated = true;
         else if (k.ch == "a") ed.selectAll();
         else if (k.ch == "v" && getClip) { ed.deleteSelection(); pasteText(ed, getClip()); }
+        else if (k.ch == "z") k.shift ? ed.redo() : ed.undo();
+        else if (k.ch == "y") ed.redo();
+        else if ((k.ch == "c" || k.ch == "x") && sel) {
+            const Row& r = *ed.cur.row;
+            copied = markdown(Row(r.begin() + sel->first, r.begin() + sel->second));
+            if (setClip) setClip(copied);
+            if (k.ch == "x") ed.snap(), ed.deleteSelection();
+        } else if (k.ch == "f") mode = Mode::Command, prompt = '/', cmdline.clear();
         return;
     }
     switch (k.sp) {
     case Key::Esc:
         ed.range.reset();
         ed.dismissed = ed.popupKey();
-        mode = Mode::Normal;
+        if (!standard) mode = Mode::Normal;
         return;
     case Key::Enter:
-        if (k.shift) { if (!ed.addMatrixRow()) ed.enter(); }
-        else if (n && !items[0].insert && enterPicks(ed)) pickItem(ed, ed.pick);
+        if (k.shift) { if (!ed.addMatrixRow() && !ed.gridOp('j')) ed.enter(); }  // a matrix or table row
+        else if (n && !items[0].insert && (navigated || (completeOpts.accept != 1 && enterPicks(ed)))) pickItem(ed, ed.pick);
         else { ed.deleteSelection(); if (!ed.listEnter()) ed.enter(); }
         return;
     case Key::Tab:
-        if (n && (items[0].insert || navigated || items[ed.pick].cat == "Program")) pickItem(ed, ed.pick);
-        else if (auto g = ghostHere(); g && !k.shift) ed.insertItems(g->insert);
+        if (n && (items[0].insert || navigated || items[ed.pick].cat == "Program" || (completeOpts.accept != 0 && enterPicks(ed))))
+            pickItem(ed, ed.pick);
+        else if (auto g = ghostHere(); g && !k.shift) {
+            if (auto t = eqTag(*ed.cur.row); t.first >= 0 && !ed.inSlot()) ed.cur.i = t.first - 1;  // before the "#tag"
+            ed.insertItems(g->insert);
+        }
         else if (!ed.inSlot() && lineStyle(*ed.cur.row).kind == Line::Table) {  // next cell (Shift-Tab: previous)
             Row& r = *ed.cur.row;
             auto cells = tableCells(r);
@@ -242,8 +271,8 @@ void Vi::insertKey(Editor& ed, const Key& k) {
                 ed.listEnter();
                 return;
             }
-            int a = cells[c].first;
-            ed.cur.i = a < len(&r) && isSpace(r[a]) ? a + 1 : a;
+            ed.cur.i = cells[c].second;
+            ed.snapToCell();  // after the cell's text, like the arrows
         } else ed.exitSlot();
         return;
     case Key::Up: case Key::Down:
@@ -253,6 +282,7 @@ void Vi::insertKey(Editor& ed, const Key& k) {
     case Key::Left: case Key::Right:
         if (k.shift) ed.extendSelection(k.sp == Key::Left ? -1 : 1);
         else if (sel) { ed.cur.i = k.sp == Key::Left ? sel->first : sel->second; ed.range.reset(); }
+        else if (ed.cellMove(k.sp == Key::Left ? -1 : 1, 0)) {}  // tables: cell to cell
         else if (k.sp == Key::Left) ed.left();
         else ed.right();
         return;
@@ -481,7 +511,11 @@ void Vi::normalKey(Editor& ed, const std::string& c0, const Key& k) {
     if (m == "d" || m == "c" || m == "y") { pending = (hasCount ? std::to_string(count) : "") + m; return; }
     if (m == "i") return toInsert(ed);
     if (m == "a") { ed.cur.i = std::min(i + 1, len(row)); return toInsert(ed); }
-    if (m == "I") { ed.cur.i = 0; return toInsert(ed); }
+    if (m == "I") {  // in a table: the first cell, not before its pipe
+        auto cells = ed.inSlot() ? std::vector<std::pair<int, int>>{} : tableCells(*row);
+        ed.cur.i = lineStyle(*row).kind == Line::Table && !cells.empty() ? std::min(cells[0].first + 1, cells[0].second) : 0;
+        return toInsert(ed);
+    }
     if (m == "A") { ed.cur.i = len(row); return toInsert(ed); }
     if (m == "o" || m == "O") {
         ed.snap();
@@ -651,8 +685,11 @@ void Vi::commandKey(Editor& ed, const Key& k) {
             return;
         }
         std::string name = c.substr(0, c.find(' '));
-        static const std::vector<std::string> known = {"w", "q", "q!", "wq", "x", "e", "new", "rename", "trash", "set", "export", "image", "table", "rule", "section"};
-        if (std::find(known.begin(), known.end(), name) == known.end()) { message = "Not an editor command: " + c; return; }
+        static const std::vector<std::string> known = {"w", "q", "q!", "wq", "x", "e", "new", "rename", "trash", "set", "export",
+                                                       "image", "table", "rule", "section", "row", "col", "print", "tour", "saveas", "open", "help", "settings",
+                                                       "palette", "outline", "zoom", "folder"};
+        bool subst = name.starts_with("s/") || name.starts_with("%s/");
+        if (!subst && std::find(known.begin(), known.end(), name) == known.end()) { message = "Not an editor command: " + c; return; }
         cmds.push_back(c);
         return;
     }

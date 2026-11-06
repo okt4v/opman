@@ -78,6 +78,12 @@ Section "opman" SecMain
   WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
+  ; .opman files open in opman (double-click, "Open with")
+  WriteRegStr HKCU "Software\Classes\.opman" "" "opman.note"
+  WriteRegStr HKCU "Software\Classes\opman.note" "" "opman math note"
+  WriteRegStr HKCU "Software\Classes\opman.note\DefaultIcon" "" "$INSTDIR\opman.exe,0"
+  WriteRegStr HKCU "Software\Classes\opman.note\shell\open\command" "" '"$INSTDIR\opman.exe" "%1"'
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'  ; SHCNE_ASSOCCHANGED
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
@@ -95,6 +101,9 @@ Section "un.opman" UnSecMain
   Delete "$DESKTOP\${APP}.lnk"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\${APP}"
+  DeleteRegKey HKCU "Software\Classes\opman.note"
+  DeleteRegKey HKCU "Software\Classes\.opman"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd
 
 ; off by default: settings only, the notes folder is the user's

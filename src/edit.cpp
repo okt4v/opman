@@ -80,7 +80,9 @@ Reduced Planck|hbar planck|ℏ|\hbar|Constant)";
 
 static const char* FNS = "sin sine,cos cosine,tan tangent,cot cotangent,sec secant,csc cosecant,arcsin,arccos,arctan,sinh,cosh,tanh,"
                          "log logarithm,ln natural logarithm,exp exponential,det determinant,dim dimension,ker kernel,max maximum,"
-                         "min minimum,sup supremum,inf infimum,gcd,arg argument";
+                         "min minimum,sup supremum,inf infimum,gcd,lcm,arg argument,round,sign,mod modulo remainder,mean average,"
+                         "median,stdev standard deviation,var variance,sum total,count,nCr choose binomial combinations,"
+                         "nPr permutations,fit regression trend";
 
 static std::vector<std::string> split(const std::string& s, char sep) {
     std::vector<std::string> out;
@@ -115,8 +117,13 @@ static std::vector<Entry> buildCatalog() {
     add("Big union", "bigcup union", big("⋃", "\\bigcup", true), "Set");
     add("Big intersection", "bigcap intersection", big("⋂", "\\bigcap", true), "Set");
     add("Limit", "limit lim", node(T::Lim), "Calculus");
+    auto grid = [](int r, int c) { return std::vector<std::vector<Row>>(r, std::vector<Row>(c)); };
     add("Matrix", "matrix pmatrix", mat("(", ")", two()), "Structure");
+    add("Matrix 3×3", "matrix 3x3 pmatrix", mat("(", ")", grid(3, 3)), "Structure");
+    add("Column vector", "vector column matrix", mat("(", ")", grid(3, 1)), "Structure");
+    add("Row vector", "vector row matrix", mat("(", ")", grid(1, 3)), "Structure");
     add("Determinant", "determinant vmatrix", mat("|", "|", two()), "Structure");
+    add("Determinant 3×3", "determinant 3x3 vmatrix", mat("|", "|", grid(3, 3)), "Structure");
     for (auto& line : split(SYMS, '\n')) {
         auto f = split(line, '|');
         add(f[0], f[1], sym(f[2], f[3]), f[4]);
@@ -176,6 +183,8 @@ static bool isSubseq(const std::string& q, const std::string& s) {
     return j == q.size();
 }
 
+CompleteOpts completeOpts;
+
 // ponytail: linear scan with prefix scoring; fine for a few hundred entries
 std::vector<Entry> Editor::search(const std::string& q) const {
     std::string ql = lower(q);
@@ -189,7 +198,7 @@ std::vector<Entry> Editor::search(const std::string& q) const {
             best = std::max(best, s);
         }
         auto u = usage.find(e.name);
-        if (best) scored.push_back({best + std::min(u == usage.end() ? 0 : u->second, 10) * 2, &e});
+        if (best) scored.push_back({best + (completeOpts.learn ? std::min(u == usage.end() ? 0 : u->second, 10) * 2 : 0), &e});
     }
     std::stable_sort(scored.begin(), scored.end(), [](auto& a, auto& b) { return a.first > b.first; });
     std::vector<Entry> hits;
@@ -307,15 +316,20 @@ std::string Editor::popupKey() const { return nlohmann::json::array({pathJson(cu
 std::vector<Entry> Editor::suggestions() {
     if (popupKey() == dismissed) return {};
     std::string w = pendingWord();
-    if (w.empty()) return evalSuggestions(*this);
-    auto hits = search(w);
+    if (!forced && (!completeOpts.popup || (!w.empty() && int(w.size()) < completeOpts.minLetters))) return {};
+    auto cap = [](std::vector<Entry> v) {
+        if (int(v.size()) > completeOpts.maxItems) v.resize(completeOpts.maxItems);
+        return v;
+    };
+    if (w.empty()) return cap(evalSuggestions(*this));
+    auto hits = cap(search(w));
     // program functions only for a word alone at the start of a top-level line, so "plot" in a sentence stays text
     bool alone = !inSlot() && cur.i == int(w.size()) && cur.i == int(cur.row->size());
     if (!alone) std::erase_if(hits, [](auto& e) { return e.cat == "Program"; });
     // a plain text word with nothing to offer but "Variable notes" gets no popup, so Enter still makes a new line
     bool textWord = w.size() > 1 && !(*cur.row)[cur.i - 1].m;
     bool onlyVars = std::all_of(hits.begin(), hits.end(), [](auto& e) { return e.cat == "Variable" || e.cat == "Constant"; });
-    return textWord && onlyVars ? std::vector<Entry>{} : hits;
+    return textWord && onlyVars && !forced ? std::vector<Entry>{} : hits;
 }
 
 void Editor::insertNode(Item n) {
@@ -356,7 +370,7 @@ void Editor::applySuggestion(const Entry& e) {
 // a math word you typed past (e.g. "sin" then "(") becomes its node; returns the created node if it has slots
 Item* Editor::autoConvert() {
     std::string w = pendingWord();
-    const Entry* e = autoEntry(w);
+    const Entry* e = completeOpts.convert ? autoEntry(w) : nullptr;
     if (!e || !(*cur.row)[cur.i - 1].m) return nullptr;
     applySuggestion(*e);
     if (e->make.s.empty()) return nullptr;
@@ -374,7 +388,7 @@ static std::string jsC(const Item& it) { return it.t == T::Ch ? it.c : (it.t == 
 
 void Editor::insertChar(std::string c) {
     if (c == "(" && !inSlot()) {
-        const Entry* e = autoEntry(pendingWord());
+        const Entry* e = completeOpts.convert ? autoEntry(pendingWord()) : nullptr;
         if (e && e->cat == "Function")  // "det(" or "sin(" typed as text turns into the function
             for (int k = cur.i - int(pendingWord().size()); k < cur.i; k++) (*cur.row)[k].m = true;
     }
@@ -427,13 +441,25 @@ void Editor::insertChar(std::string c) {
     if (c == "^" && p && p->node->t == T::Big && p->slot == 0) { cur = {&p->node->s[1], 0}; return; }
     if (mathCtx && (c == "^" || c == "_")) return insertNode(node(c == "^" ? T::Sup : T::Sub));
     if (mathCtx && c == "(") return insertNode(paren("(", ")"));
+    if (mathCtx && c == "{") return insertNode(paren("{", "}"));  // a set: L = {2; 3; 5}
     if (c == ")" && p && (p->node->o == "(" || p->node->t == T::Sqrt) && i == int(row.size())) return exitSlot();
     if (c == "|" && p && p->node->o == "|" && i == int(row.size())) return exitSlot();
+    if (c == "}" && p && p->node->o == "{" && i == int(row.size())) return exitSlot();
     if (mathCtx && c == "'") return insertNode(sym("′", "'"));
     if (c == "|" && !inSlot() && lineStyle(row).kind == Line::Table) {
         row.insert(row.begin() + i, ch("|", false));
         cur.i++;
         return;
+    }
+    if (mathCtx && c == "|" && p && p->node->o == "{") return insertNode(sym("|", "\\mid"));  // {x | x > 0}: "such that"
+    if (mathCtx && c == "|" && !p && prev && isSpace(*prev) && stepBar(row) < 0) {  // 2x = 4 |:2  a transformation step
+        bool rel = std::any_of(row.begin(), row.begin() + i, [](const Item& x) { return isRel(&x); });
+        const Item* q = prevNonSpace(row, i);
+        if (rel && q && !isRel(q) && !isOp(q)) {
+            row.insert(row.begin() + i, sym("|", "\\qquad|\\;"));
+            cur.i++;
+            return;
+        }
     }
     if (mathCtx && c == "|" && !(prev && prev->t == T::Ch && prev->c == "|")) return insertNode(paren("|", "|"));
     if (mathCtx && c == "/") {
@@ -483,6 +509,7 @@ bool Editor::openIntegral(const Row& row, int i) const {
 }
 
 void Editor::combine() {
+    if (!completeOpts.combos) return;
     Row& row = *cur.row;
     int i = cur.i;
     for (int n : {3, 2}) {
@@ -561,6 +588,7 @@ void Editor::vertical(int d) {
         cur = {a, int(a->size())};
         return;
     }
+    if (cellMove(0, d)) return;  // table to table: the same column
     Row* top = topOf(cur.row);
     int k = lineOf(top) + d;
     if (k >= 0 && k < int(doc.size())) cur = {&doc[k], std::min(top == cur.row ? cur.i : 0, int(doc[k].size()))};
@@ -643,6 +671,143 @@ bool Editor::addMatrixCol() {
     n->cols++;
     reindex();
     cur = {&n->s[r * n->cols + c + 1], 0};
+    return true;
+}
+
+// the cell holding position i (a border belongs to the cell on its left), and where the cursor goes in a cell:
+// after its text, or in the middle of an empty one
+static int cellAt(const std::vector<std::pair<int, int>>& cells, int i) {
+    for (int c = 0; c < int(cells.size()); c++)
+        if (i <= cells[c].second) return c;
+    return int(cells.size()) - 1;
+}
+static int cellCaret(const Row& r, std::pair<int, int> cell) {
+    auto [a, b] = cell;
+    int e = b;
+    while (e > a && isSpace(r[e - 1])) e--;
+    if (e > a) return e;
+    return a < b ? a + 1 : a;
+}
+static bool tableTop(const Editor& ed) { return !ed.inSlot() && lineStyle(*ed.cur.row).kind == Line::Table; }
+
+bool Editor::cellMove(int dx, int dy) {
+    if (!tableTop(*this)) return false;
+    auto cells = tableCells(*cur.row);
+    if (cells.empty()) return false;
+    int c = cellAt(cells, cur.i);
+    if (dx) {
+        int to = std::clamp(c + dx, 0, int(cells.size()) - 1);
+        cur.i = cellCaret(*cur.row, cells[to]);
+        return true;
+    }
+    int k = lineOf(cur.row) + dy;
+    if (k < 0 || k >= int(doc.size()) || lineStyle(doc[k]).kind != Line::Table) return false;  // leaving the table
+    auto there = tableCells(doc[k]);
+    if (there.empty()) return false;
+    cur = {&doc[k], cellCaret(doc[k], there[std::min(c, int(there.size()) - 1)])};
+    return true;
+}
+
+void Editor::snapToCell() {
+    if (!tableTop(*this)) return;
+    auto cells = tableCells(*cur.row);
+    if (cells.empty()) return;
+    auto [a, b] = cells[cellAt(cells, cur.i)];
+    int s = a, e = b;
+    while (s < b && isSpace((*cur.row)[s])) s++;
+    while (e > s && isSpace((*cur.row)[e - 1])) e--;
+    if (s == e || cur.i < s || cur.i > e) cur.i = cellCaret(*cur.row, {a, b});
+}
+
+bool Editor::inGrid() const {
+    if (auto f = parents.find(cur.row); f != parents.end()) return f->second.node->t == T::Mat;
+    return lineStyle(*cur.row).kind == Line::Table;
+}
+
+bool Editor::gridOp(char op) {
+    if (auto f = parents.find(cur.row); f != parents.end()) {  // a matrix cell
+        Parent p = f->second;
+        if (p.node->t != T::Mat) return false;
+        Item& m = *p.node;
+        int cols = m.cols, rows = matRows(m), r = p.slot / cols, c = p.slot % cols, to = p.slot;
+        if (op == 'k' || op == 'j') {
+            int at = op == 'k' ? r : r + 1;
+            m.s.insert(m.s.begin() + at * cols, cols, Row{});
+            to = at * cols + c;
+        } else if (op == 'h' || op == 'l') {
+            int at = op == 'h' ? c : c + 1;
+            for (int k = rows - 1; k >= 0; k--) m.s.insert(m.s.begin() + k * cols + at, Row{});
+            m.cols++;
+            to = r * m.cols + at;
+        } else if (op == 'r' && rows > 1) {
+            m.s.erase(m.s.begin() + r * cols, m.s.begin() + (r + 1) * cols);
+            to = std::min(r, rows - 2) * cols + c;
+        } else if (op == 'c' && cols > 1) {
+            for (int k = rows - 1; k >= 0; k--) m.s.erase(m.s.begin() + k * cols + c);
+            m.cols--;
+            to = r * m.cols + std::min(c, m.cols - 1);
+        } else return true;  // the last row or column stays
+        reindex();
+        cur = {&m.s[to], int(m.s[to].size())};
+        return true;
+    }
+    Row& line = *cur.row;
+    if (lineStyle(line).kind != Line::Table) return false;
+    int k = lineOf(&line), t0 = k, t1 = k;
+    while (t0 > 0 && lineStyle(doc[t0 - 1]).kind == Line::Table) t0--;
+    while (t1 + 1 < int(doc.size()) && lineStyle(doc[t1 + 1]).kind == Line::Table) t1++;
+    auto cells = tableCells(line);
+    int c = 0;
+    while (c + 1 < int(cells.size()) && cells[c].second < cur.i) c++;
+    auto pipes = [](const Row& r) {
+        std::vector<int> out;
+        for (int j = 0; j < int(r.size()); j++)
+            if (r[j].t == T::Ch && !r[j].m && r[j].c == "|") out.push_back(j);
+        return out;
+    };
+    auto cellStart = [&](int line, int col) {  // the cursor spot in a cell: after its leading space
+        auto cs = tableCells(doc[line]);
+        if (cs.empty()) return int(doc[line].size());
+        int a = cs[std::min(col, int(cs.size()) - 1)].first;
+        return a < int(doc[line].size()) && isSpace(doc[line][a]) ? a + 1 : a;
+    };
+    if (op == 'k' || op == 'j') {
+        int at = op == 'k' ? k : k + 1;
+        doc.insert(doc.begin() + at, Row{});
+        tableRow(doc[op == 'k' ? k + 1 : k], doc[at]);
+        cur = {&doc[at], cellStart(at, c)};
+    } else if (op == 'r') {
+        if (t0 == t1) doc[k].clear();  // the only row: an empty line
+        else doc.erase(doc.begin() + k);
+        int to = std::min(k, int(doc.size()) - 1);
+        reindex();
+        cur = {&doc[to], lineStyle(doc[to]).kind == Line::Table ? cellStart(to, c) : 0};
+        return true;
+    } else if (op == 'h' || op == 'l') {
+        for (int j = t0; j <= t1; j++) {
+            auto ps = pipes(doc[j]);
+            if (ps.empty()) continue;
+            int at = op == 'h' ? std::min(c, int(ps.size()) - 1) : std::min(c + 1, int(ps.size()) - 1);  // the pipe to insert after
+            Row add = {ch(" ", false), ch(" ", false), ch("|", false)};
+            doc[j].insert(doc[j].begin() + ps[at] + 1, add.begin(), add.end());
+        }
+        cur = {&doc[k], 0};
+        reindex();
+        cur.i = cellStart(k, op == 'h' ? c : c + 1);
+        return true;
+    } else if (op == 'c') {
+        if (cells.size() < 2) return true;
+        for (int j = t0; j <= t1; j++) {
+            auto ps = pipes(doc[j]);
+            if (c + 1 < int(ps.size())) doc[j].erase(doc[j].begin() + ps[c], doc[j].begin() + ps[c + 1]);
+            else if (c < int(ps.size()) && c > 0) doc[j].erase(doc[j].begin() + ps[c - 1] + 1, doc[j].end()), doc[j].push_back(ch("|", false));
+        }
+        cur = {&doc[k], 0};
+        reindex();
+        cur.i = cellStart(k, std::max(0, c - (c + 1 >= int(cells.size()) ? 1 : 0)));
+        return true;
+    }
+    reindex();
     return true;
 }
 
@@ -785,6 +950,7 @@ void Editor::tableRow(const Row& from, Row& to) {
     cur = {&to, 2};
     reindex();
 }
+
 
 bool Editor::listEnter() {
     if (inSlot()) return false;

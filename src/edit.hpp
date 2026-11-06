@@ -31,6 +31,18 @@ struct Entry {
     std::optional<Row> insert;
 };
 
+// how completion behaves (Settings > Autocomplete)
+struct CompleteOpts {
+    bool popup = true;        // suggestions open as you type; off: only Ctrl-Space opens them
+    int minLetters = 1;       // letters of a word before the popup opens
+    int maxItems = 9;         // entries shown
+    int accept = 0;           // key that takes the first suggestion: 0 Enter (math words), 1 Tab, 2 both
+    bool convert = true;      // math words (sin, sqrt, alpha…) become their symbol once you type past them
+    bool combos = true;       // -> <= != … become → ≤ ≠ in math
+    bool learn = true;        // entries you pick often move up
+};
+extern CompleteOpts completeOpts;
+
 extern const std::vector<Entry> CATALOG;
 extern const std::map<std::string, unsigned> CATS;  // category colour, 0xRRGGBB
 
@@ -50,6 +62,7 @@ struct Editor {
     std::string lastSnapKind;
     double lastSnapAt = -1e9;
     std::string dismissed;  // popupKey() the popup was dismissed at
+    bool forced = false;    // Ctrl-Space opened the popup: it stays open for the word being typed
     int pick = 0;
     std::map<std::string, int> usage;
 
@@ -89,6 +102,14 @@ struct Editor {
     void home(bool end);
     bool addMatrixRow();
     bool addMatrixCol();
+    // rows and columns of the table or matrix the cursor is in: 'k' row above, 'j' row below, 'h' column left,
+    // 'l' column right, 'r' delete row, 'c' delete column. False when the cursor is in neither
+    bool gridOp(char op);
+    // tables move like a spreadsheet: a cell left/right (dx) or the same column up/down (dy). False when the cursor
+    // isn't on a table row (or there's no cell that way: stays put and returns true for dx)
+    bool cellMove(int dx, int dy);
+    void snapToCell();  // a cursor on a border, in padding or past the last | goes into its cell
+    bool inGrid() const;
 
     // selection: always a range of one row
     std::optional<std::pair<int, int>> selRange() const;

@@ -36,6 +36,7 @@ else()
   set(OPMAN_BIN_DEST ${CMAKE_INSTALL_BINDIR})
   set(OPMAN_RES_DEST ${CMAKE_INSTALL_DATADIR}/opman)
   install(FILES ${OPMAN_PKG}/opman.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications COMPONENT opman)
+  install(FILES ${OPMAN_PKG}/opman-mime.xml DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages RENAME opman.xml COMPONENT opman)
   install(FILES ${OPMAN_PKG}/opman.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps COMPONENT opman)
 endif()
 

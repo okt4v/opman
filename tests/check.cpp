@@ -1,6 +1,7 @@
 // Self-checks: corca's test.js scenarios (typing model, evaluation) plus the vi layer. Run: ./build/opman_check
 #include "edit.hpp"
 #include "math.hpp"
+#include "help.hpp"
 #include "vi.hpp"
 #include <cmath>
 #include <cstdio>
@@ -470,6 +471,62 @@ static void checkVi() {
         CHECK_EQ(latexText(e.doc[0], 0, int(e.doc[0].size())), "\\textsubscript{ab} $50\\%$");
     }
 
+    // standard keys: always typing; Esc stays in Insert, Ctrl-z undoes, Ctrl-x cuts the selection
+    {
+        Editor e;
+        Vi v;
+        v.standard = true;
+        v.mode = Mode::Insert;
+        std::string clip;
+        v.setClip = [&](const std::string& c) { clip = c; };
+        keys(e, v, "hello world<Esc>");
+        CHECK(v.mode == Mode::Insert);
+        CHECK_EQ(plain(e.doc[0]), "hello world");
+        keys(e, v, "<C-a><C-x>");
+        CHECK_EQ(plain(e.doc[0]), "");
+        CHECK_EQ(clip, "hello world");
+        keys(e, v, "<C-z>");
+        CHECK_EQ(plain(e.doc[0]), "hello world");
+    }
+
+    // statistics, table columns as lists, and the result settings (digits, degrees, decimals)
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "imean(2, 4, 9)<Esc>omedian(5, 1, 3, 8)<Esc>ostdev(2, 4, 4, 4, 5, 5, 7, 9)<Esc>onCr(5, 2)<Esc>omod(17, 5)<Esc>"
+                   "olcm(4, 6)<Esc>");
+        CHECK_EQ(ghost(e, e.doc[0])->text, "= 5");
+        CHECK_EQ(ghost(e, e.doc[1])->text, "= 4");
+        CHECK_EQ(ghost(e, e.doc[2])->text, "= 4√14/7 ≈ 2.138089935");  // √(32/7), found exactly
+        CHECK_EQ(ghost(e, e.doc[3])->text, "= 10");
+        CHECK_EQ(ghost(e, e.doc[4])->text, "= 2");
+        CHECK_EQ(ghost(e, e.doc[5])->text, "= 12");
+        keys(e, v, "o<Esc>cc| t | h |<Esc>o<Esc>cc| 1 | 10 |<Esc>o<Esc>cc| 2 | 20 |<Esc>o<Esc>cc| 3 | 45 |<Esc>o<Esc>ccmean(h)<Esc>osum(t)<Esc>");
+        CHECK_EQ(ghost(e, e.doc[10])->text, "= 25");
+        CHECK_EQ(ghost(e, e.doc[11])->text, "= 6");
+        keys(e, v, "o<Esc>cc| mass |<Esc>o<Esc>cc| 2 |<Esc>o<Esc>cc| 5 |<Esc>o<Esc>ccmax(mass)<Esc>");
+        CHECK_EQ(ghost(e, e.doc.back())->text, "= 5");  // a column name of several letters
+        mathOpts.digits = 4;
+        CHECK_EQ(ghost(e, e.doc[2])->text, "= 4√14/7 ≈ 2.138");
+        mathOpts.digits = 10;
+        mathOpts.degrees = true;
+        keys(e, v, "osin(30)<Esc>");
+        CHECK_EQ(ghost(e, e.doc.back())->text, "= 1/2");
+        mathOpts.decimals = true;
+        CHECK_EQ(ghost(e, e.doc.back())->text, "= 0.5");
+        mathOpts = {};
+        // exact forms of decimals: roots, π, quadratic roots; sin(1) stays a decimal
+        keys(e, v, "o<C-m>sqrt8<Esc><C-m>oarctan(1)<Esc>osin(1)<Esc>o<C-m>(1+sqrt(5<Tab>)/2<Esc><C-m>");
+        int n = int(e.doc.size());
+        CHECK_EQ(ghost(e, e.doc[n - 4])->text, "= 2√2 ≈ 2.828427125");
+        CHECK_EQ(ghost(e, e.doc[n - 3])->text, "= π/4 ≈ 0.7853981634");
+        CHECK_EQ(ghost(e, e.doc[n - 2])->text, "= 0.8414709848");
+        CHECK_EQ(ghost(e, e.doc[n - 1])->text, "= (1 + √5)/2 ≈ 1.618033989");
+        keys(e, v, "o<C-m>sqrt(2)*sqrt(3)<Tab><Esc><C-m>");  // Tab writes "= √6"; no hint repeats it
+        CHECK_EQ(plain(e.doc.back()), "√2·√3 = √6");
+        CHECK(!ghost(e, e.doc.back()));
+    }
+
     // sections: each === starts a fresh set of definitions, so two exercises can both use x
     {
         Editor e;
@@ -504,7 +561,7 @@ static void checkVi() {
         Vi v;
         keys(e, v, "i| a | b |<Esc>0");
         keys(e, v, "a<Tab>X<Tab>Y<Tab>Z<Esc>");
-        CHECK_EQ(plain(e.doc[0]), "| a | Xb |");
+        CHECK_EQ(plain(e.doc[0]), "| a | bX |");  // after the cell's text, like the arrows
         CHECK_EQ(plain(e.doc[1]), "| Y | Z |");
     }
 
@@ -557,6 +614,197 @@ static void checkVi() {
         CHECK(h.find("Image not found: media/p.png") != std::string::npos && h.find("class=section>Part 2") != std::string::npos);
         std::string md = markdown(e.doc, "/n");
         CHECK(md.find("![pic](/n/media/p.png)") != std::string::npos && md.find("**Part 2**") != std::string::npos);
+    }
+
+    // the tour note types cleanly: its calculations have answers, its plots draw
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, tourKeys());
+        int ghosts = 0, plots = 0;
+        for (auto& r : e.doc) {
+            if (ghost(e, r)) ghosts++;
+            if (lineStyle(r).kind == Line::Plot) {
+                Plot pl = plot(e, r);
+                CHECK(pl.error.empty() && (pl.is3d() || !pl.series.empty()));
+                plots++;
+            }
+        }
+        CHECK(ghosts >= 5 && plots == 4 && v.mode == Mode::Normal);
+    }
+
+    // braces in math: a set like L = {2; 3; 5}, set-builder {x | x > 0}; in text { stays text
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>L={2; 3; 5}<Esc>oL = {x | x > 0}<Esc><C-m>oa {b}<Esc>");
+        CHECK(e.doc[0].size() == 3 && e.doc[0][2].t == T::Paren && e.doc[0][2].o == "{");
+        CHECK_EQ(plain(e.doc[0]), "L={2; 3; 5}");
+        CHECK(noSpaces(lineTex(e.doc[1])).find("\\left\\{x\\midx>0\\right\\}") != std::string::npos);
+        CHECK_EQ(plain(e.doc[2]), "a {b}");
+        CHECK(e.doc[2][2].t == T::Ch);
+    }
+
+    // equation transformation steps: "2x = 4 | :2" — the step is shown, not calculated; |x| after = is still abs
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>3x+1=7 |−1<Esc>ob = 2 | *3<Esc>ob+1<Esc>o2 = |x|<Esc>");
+        CHECK(stepBar(e.doc[0]) == 7 && !ghost(e, e.doc[0]));
+        CHECK(noSpaces(lineTex(e.doc[0])).find("=7\\qquad|\\;-1") != std::string::npos);
+        CHECK(stepBar(e.doc[1]) >= 0 && !ghost(e, e.doc[1]));
+        CHECK_EQ(ghost(e, e.doc[2])->text, "= 3");  // b = 2 still defines b
+        CHECK(stepBar(e.doc[3]) < 0 && e.doc[3].back().t == T::Paren);
+    }
+
+    // autocomplete settings: popup off (Ctrl-Space opens it), letters before it opens, accept key, conversions
+    {
+        Editor e;
+        Vi v;
+        completeOpts.popup = false;
+        keys(e, v, "i<C-m>si");
+        CHECK(v.items.empty());
+        keys(e, v, "<C-Space>");
+        CHECK(!v.items.empty());
+        keys(e, v, "n");  // typing on keeps it open for the word
+        CHECK(!v.items.empty() && v.items[0].name.find("sin") != std::string::npos);
+        keys(e, v, "<Esc>");
+        completeOpts = {};
+        completeOpts.minLetters = 3;
+        keys(e, v, "o<C-m>co");
+        CHECK(v.items.empty());
+        keys(e, v, "s");
+        CHECK(!v.items.empty());
+        completeOpts.maxItems = 3;
+        keys(e, v, "<BS>s");
+        CHECK(v.items.size() <= 3);
+        keys(e, v, "<Esc>");
+        completeOpts = {};
+        completeOpts.accept = 1;  // Tab: Enter makes a new line
+        keys(e, v, "o<C-m>alph<CR>");
+        CHECK_EQ(plain(e.doc[e.doc.size() - 2]), "alph");
+        keys(e, v, "<Esc>oalph<Tab><Esc><C-m>");
+        CHECK_EQ(plain(e.doc.back()), "α");
+        completeOpts = {};
+        completeOpts.convert = false, completeOpts.combos = false;
+        keys(e, v, "o<C-m>sin -> 2<Esc>");
+        CHECK_EQ(plain(e.doc.back()), "sin -> 2");
+        completeOpts = {};
+        keys(e, v, "oa -> 2<Esc><C-m>");  // math is still on from the line before
+        CHECK_EQ(plain(e.doc.back()), "a → 2");
+    }
+
+    // equation numbers: "#tag" at the end of a line, "[#tag]" refers to it; the tag isn't math, Tab answers before it
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>A = 2 #area<Esc>o<C-m>2+3 #sum<Tab><Esc>oBy [#area], [#sum] and [#x].<Esc>");
+        CHECK_EQ(plain(e.doc[1]), "2+3 = 5 #sum");
+        auto nums = eqNumbers(e.doc);
+        CHECK(nums.size() == 2 && nums["area"] == 1 && nums["sum"] == 2);
+        CHECK(eqRefs(e.doc[2]).size() == 3 && eqName(e.doc[2], eqRefs(e.doc[2])[1]) == "sum");
+        CHECK(eqTag(e.doc[2]).first < 0);
+        std::string h = html(e, "/n", "T"), t = latex(e, "/n");
+        CHECK(h.find("2+3=5 \\tag{2}") != std::string::npos && h.find("By (1), (2) and (?).") != std::string::npos);
+        CHECK(t.find("A=2 \\tag{1}") != std::string::npos && t.find("#area") == std::string::npos);
+    }
+
+    // tables move like a spreadsheet: arrows go cell to cell (after the text), up/down keep the column, clicks on a
+    // border land in a cell; vim's h/l still move by character
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i| name | value |<Esc>o<Esc>cc| a | 12 |<Esc>o<Esc>cc|  |  |<Esc>");
+        auto at = [&](int line, const char* text) {  // the cursor is on `line`, right after `text`
+            std::string before;
+            for (int j = 0; j < e.cur.i; j++) before += (*e.cur.row)[j].c;
+            return e.cur.row == &e.doc[line] && before.ends_with(text);
+        };
+        e.cur = {&e.doc[0], 3};  // inside "name"
+        keys(e, v, "<Right>");
+        CHECK(at(0, "| name | value"));
+        keys(e, v, "<Right>");  // the last column: stays
+        CHECK(at(0, "| name | value"));
+        keys(e, v, "<Down>");
+        CHECK(at(1, "| a | 12"));
+        keys(e, v, "<Left>");
+        CHECK(at(1, "| a"));
+        keys(e, v, "<Down>");  // an empty cell: in its middle
+        CHECK(at(2, "| "));
+        keys(e, v, "ix<Esc>");
+        CHECK_EQ(plain(e.doc[2]), "| x |  |");
+        keys(e, v, "<Up><Up>a<Right>!<Esc>");  // Insert mode too
+        CHECK_EQ(plain(e.doc[0]), "| name | value! |");
+        e.cur = {&e.doc[1], int(e.doc[1].size())};  // past the last |
+        v.mouse(e, e.cur, false);
+        CHECK(at(1, "| a | 12"));
+        e.cur = {&e.doc[1], 0};  // before the first |
+        v.mouse(e, e.cur, false);
+        CHECK(at(1, "| a"));
+        keys(e, v, "<Esc>0l");  // h/l: one character
+        CHECK(e.cur.i == 1);
+    }
+
+    // tables and matrices grow and shrink: rows above/below, columns left/right, deletes; I lands in the first cell
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i| a | b |<Esc>o<Esc>cc| 1 | 2 |<Esc>");
+        CHECK(e.gridOp('l'));  // cursor in the last cell of row 2: a column after it
+        CHECK_EQ(plain(e.doc[0]), "| a | b |  |");
+        CHECK_EQ(plain(e.doc[1]), "| 1 | 2 |  |");
+        keys(e, v, "ix<Esc>");
+        CHECK_EQ(plain(e.doc[1]), "| 1 | 2 | x |");
+        CHECK(e.gridOp('k'));  // a row above row 2
+        CHECK(e.doc.size() == 3 && plain(e.doc[1]) == "|  |  |  |");
+        CHECK(e.gridOp('r'));
+        CHECK(e.doc.size() == 2);
+        e.cur = {&e.doc[0], 3};  // in "a"
+        CHECK(e.gridOp('c'));
+        CHECK_EQ(plain(e.doc[0]), "| b |  |");
+        CHECK_EQ(plain(e.doc[1]), "| 2 | x |");
+        keys(e, v, "<Esc>IZ<Esc>");
+        CHECK_EQ(plain(e.doc[0]), "| Zb |  |");
+        keys(e, v, "o<Esc>cc<C-m>matrix<Down><CR>1<Esc>");
+        Item* m = &e.doc[1][0];
+        CHECK(m->t == T::Mat && m->cols == 3 && matRows(*m) == 3);
+        e.cur = {&m->s[0], 1};
+        CHECK(e.inGrid() && e.gridOp('j') && matRows(*m) == 4 && e.cur.row == &m->s[3]);
+        CHECK(e.gridOp('c') && m->cols == 2 && e.gridOp('r') && matRows(*m) == 3);
+        CHECK(!Editor().gridOp('j'));
+    }
+
+    // plot kinds: fit through a table, parametric, polar, implicit; 3D surfaces and space curves; fit() as a calculation
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i| t | h |<Esc>o<Esc>cc| 1 | 3 |<Esc>o<Esc>cc| 2 | 5 |<Esc>o<Esc>cc| 3 | 7 |<Esc>o<Esc>ccplot<Tab>table, fit<Esc>");
+        Plot pl = plot(e, e.doc[4]);
+        CHECK(pl.series.size() == 2 && pl.series[1].label.starts_with("fit: y = 2x + 1") && !pl.series[1].pts.empty());
+        keys(e, v, "ofit(t, h)<Esc>ofit(t, h, exp)<Esc>");
+        CHECK_EQ(ghost(e, e.doc[5])->text, "= 2t + 1   (R² = 1)");
+        CHECK(ghost(e, e.doc[6]) && ghost(e, e.doc[6])->text.find("e^(") != std::string::npos);
+        keys(e, v, "oplot<Tab>(cos(t), sin(t)), r = 2, x^2 + y^2 = 9<Esc>");
+        pl = plot(e, e.doc[7]);
+        CHECK(pl.error.empty() && pl.series.size() == 3 && !pl.is3d());
+        auto onCircle = [](const Plot::Series& s, double r) {
+            int n = 0;
+            for (auto& [x, y] : s.pts)
+                if (std::isfinite(x) && std::isfinite(y)) {
+                    if (std::fabs(std::hypot(x, y) - r) > 0.05) return false;
+                    n++;
+                }
+            return n > 50;
+        };
+        CHECK(onCircle(pl.series[0], 1) && onCircle(pl.series[1], 2) && onCircle(pl.series[2], 3));
+        keys(e, v, "oplot<Tab>x y, −2 < x < 2<Esc>oplot<Tab>(cos(t), sin(t), t)<Esc>");
+        pl = plot(e, e.doc[8]);
+        CHECK(pl.is3d() && pl.surfaces.size() == 1 && pl.surfaces[0].n * pl.surfaces[0].n == int(pl.surfaces[0].z.size()));
+        CHECK(pl.y0 == -2 && pl.y1 == 2 && pl.z0 < -2.5 && pl.z1 > 2.5);
+        pl = plot(e, e.doc[9]);
+        CHECK(pl.is3d() && pl.curves.size() == 1 && pl.curves[0].pts.size() == 600);
+        std::string h = html(e, "/n", "T"), t = latex(e, "/n");
+        CHECK(h.find("<polygon") != std::string::npos && t.find("\\addplot3[surf") != std::string::npos);
     }
 
     // program functions: plot/table/section/divider come from the popup for a word alone on its line; the word "plot"

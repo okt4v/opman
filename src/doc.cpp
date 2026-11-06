@@ -4,6 +4,7 @@
 #include <fstream>
 #include <map>
 #include <regex>
+#include <set>
 #include <sstream>
 
 namespace om {
@@ -90,6 +91,8 @@ std::vector<bool> mathMask(const Row& row, bool top) {
         for (size_t k = j + 1; k < row.size(); k++)
             if (!isSpace(row[k])) { out[j] = isMath(row[k]); break; }
     }
+    if (auto t = top ? eqTag(row) : std::pair{-1, -1}; t.first >= 0)  // an equation tag is a label, not math
+        for (int j = t.first - 1; j < int(row.size()); j++) out[j] = false;
     return out;
 }
 
@@ -148,7 +151,12 @@ static std::string texItem(const Item& it) {
     case T::Const: return (isLetter(it.c) ? "\\mathrm{" + it.c + "}" : texName(it.c, "\\mathrm")) + " ";
     case T::Unit: return "\\,\\mathrm{" + it.c + "}";
     case T::Sym: return it.l + " ";
-    case T::Fn: return it.c == "plot" ? "\\operatorname{plot} " : "\\" + it.c + " ";
+    case T::Fn: {  // LaTeX's own operators; the rest (mean, nCr, plot) as \\operatorname
+        static const std::set<std::string> known = {"sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos", "arctan", "sinh",
+                                                    "cosh", "tanh", "log", "ln", "exp", "det", "dim", "ker", "max", "min", "sup",
+                                                    "inf", "gcd", "arg", "lim"};
+        return known.count(it.c) ? "\\" + it.c + " " : "\\operatorname{" + it.c + "} ";
+    }
     case T::Frac: return "\\frac{" + tex(it.s[0]) + "}{" + tex(it.s[1]) + "}";
     case T::Sup: return "^{" + tex(it.s[0]) + "}";
     case T::Sub: return "_{" + tex(it.s[0]) + "}";
@@ -396,6 +404,51 @@ std::string linkTitle(const Row& row, std::pair<int, int> span) {
     return s;
 }
 
+static bool nameChar(const Item& it) {  // a letter, digit, _ or -, typed as text or math
+    return (it.t == T::Ch || it.t == T::Var) && it.c.size() == 1 && (std::isalnum((unsigned char)it.c[0]) || it.c == "_" || it.c == "-");
+}
+
+std::pair<int, int> eqTag(const Row& row) {
+    int n = int(row.size()), e = n;
+    while (e > 0 && isSpace(row[e - 1])) e--;
+    int j = e;
+    while (j > 0 && nameChar(row[j - 1])) j--;
+    if (j == e || j < 2 || row[j - 1].t != T::Ch || row[j - 1].c != "#" || !isSpace(row[j - 2])) return {-1, -1};
+    return {j - 1, n};
+}
+
+int stepBar(const Row& row) {
+    for (int j = 0; j < int(row.size()); j++)
+        if (isStepBar(row[j])) return j;
+    return -1;
+}
+
+std::vector<std::pair<int, int>> eqRefs(const Row& row) {
+    std::vector<std::pair<int, int>> out;
+    auto at = [&](int j, const char* c) { return j < int(row.size()) && row[j].t == T::Ch && row[j].c == c; };
+    for (int j = 0; j + 3 < int(row.size()); j++) {
+        if (!at(j, "[") || !at(j + 1, "#")) continue;
+        int e = j + 2;
+        while (e < int(row.size()) && nameChar(row[e])) e++;
+        if (e > j + 2 && at(e, "]")) out.push_back({j, e + 1}), j = e;
+    }
+    return out;
+}
+
+std::string eqName(const Row& row, std::pair<int, int> span) {
+    std::string s;
+    for (int j = span.first; j < span.second; j++)
+        if (nameChar(row[j])) s += row[j].c;
+    return s;
+}
+
+std::map<std::string, int> eqNumbers(const std::vector<Row>& doc) {
+    std::map<std::string, int> out;
+    for (auto& r : doc)
+        if (auto t = eqTag(r); t.first >= 0) out.try_emplace(eqName(r, t), int(out.size()) + 1);
+    return out;
+}
+
 LineStyle lineStyle(const Row& row) {
     std::string s;  // the leading plain characters, enough for the longest prefix
     for (size_t i = 0; i < row.size() && i < 12 && row[i].t == T::Ch; i++) s += row[i].c;
@@ -550,8 +603,41 @@ Path pathFromJson(const json& j) {
 }
 
 // ---------- files ----------
+std::string base64(const std::string& in) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8 | (unsigned char)in[i + 2];
+        out += {T[v >> 18], T[v >> 12 & 63], T[v >> 6 & 63], T[v & 63]};
+    }
+    if (i + 1 == in.size()) {
+        unsigned v = (unsigned char)in[i] << 16;
+        out += {T[v >> 18], T[v >> 12 & 63], '=', '='};
+    } else if (i + 2 == in.size()) {
+        unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8;
+        out += {T[v >> 18], T[v >> 12 & 63], T[v >> 6 & 63], '='};
+    }
+    return out;
+}
+
+std::string unbase64(const std::string& in) {
+    std::string out;
+    unsigned v = 0;
+    int bits = 0;
+    for (char c : in) {
+        int d = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52
+              : c == '+' ? 62 : c == '/' ? 63 : -1;
+        if (d < 0) continue;  // '=' padding, line breaks
+        v = v << 6 | d;
+        if ((bits += 6) >= 8) out += char(v >> (bits -= 8) & 0xFF);
+    }
+    return out;
+}
+
+// notes: name.opman, or corca's name.json (read, and converted to .opman by the app)
 bool validName(const std::string& name) {
-    static const std::regex re(R"(^[\w.-]+\.json$)");
+    static const std::regex re(R"(^[^.].*\.(opman|json)$)");
     return std::regex_match(name, re);
 }
 
@@ -584,7 +670,8 @@ std::vector<FileInfo> listDocs(const fs::path& dir) {
         std::string name = e.path().filename().string();
         if (!e.is_regular_file(ec) || !validName(name)) continue;
         json j;
-        out.push_back({name, readFile(e.path(), j) && j.contains("meta") && j["meta"].is_object() ? j["meta"] : json::object()});
+        if (!readFile(e.path(), j) || !j.is_object() || !j.contains("doc")) continue;  // some other JSON
+        out.push_back({e.path().string(), j.contains("meta") && j["meta"].is_object() ? j["meta"] : json::object()});
     }
     return out;
 }

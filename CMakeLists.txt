@@ -59,13 +59,17 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)  # math italic letters live above U+FFFF
 
 # core = everything but the window; shared by the app and the self-checks
-add_library(opman_core STATIC src/doc.cpp src/edit.cpp src/math.cpp src/vi.cpp src/export.cpp)
+add_library(opman_core STATIC src/doc.cpp src/edit.cpp src/math.cpp src/vi.cpp src/export.cpp src/help.cpp)
 target_include_directories(opman_core PUBLIC src)
 target_link_libraries(opman_core PUBLIC nlohmann_json::nlohmann_json)
 
-add_executable(opman src/main.cpp src/layout.cpp)
+add_executable(opman src/main.cpp src/layout.cpp src/dialog.cpp)
 target_link_libraries(opman PRIVATE opman_core imgui)
-target_include_directories(opman PRIVATE ${stb_SOURCE_DIR})  # stb_image: pictures in notes
+# stb_image: pictures in notes; portable-file-dialogs (vendored, WTFPL): the system open/save dialogs
+target_include_directories(opman PRIVATE ${stb_SOURCE_DIR} third_party)
+if(WIN32)
+  target_link_libraries(opman PRIVATE ole32 comdlg32 shell32 uuid)
+endif()
 
 add_executable(opman_check tests/check.cpp)
 target_link_libraries(opman_check PRIVATE opman_core)

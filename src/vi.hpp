@@ -9,7 +9,7 @@ namespace om {
 enum class Mode { Normal, Insert, Visual, VisualLine, Command };
 
 struct Key {
-    enum Sp : uint8_t { None, Esc, Enter, Tab, Backspace, Delete, Left, Right, Up, Down, Home, End } sp = None;
+    enum Sp : uint8_t { None, Esc, Enter, Tab, Backspace, Delete, Left, Right, Up, Down, Home, End, F1 } sp = None;
     std::string ch;  // typed character (UTF-8) for None; with ctrl, the lowercase letter/digit of the chord
     bool ctrl = false, shift = false;
 };
@@ -24,6 +24,9 @@ struct Vi {
     std::vector<Entry> items;         // the completion popup (Insert mode only)
     bool navigated = false;           // the popup's selection was moved (arrows, Ctrl-n/p): Enter and Tab take it
     bool hlsearch = false;            // highlight the last search's matches (until Esc or :noh)
+    // standard keys instead of vim: always typing (Esc only closes the popup), Ctrl-z/y undo/redo, Ctrl-c/x copy/cut,
+    // Ctrl-f find
+    bool standard = false;
     // system clipboard, set by the app (empty in tests): yanks and deletes are copied out as Markdown; p/P and
     // Insert Ctrl-v paste text that was copied elsewhere
     std::function<std::string()> getClip;

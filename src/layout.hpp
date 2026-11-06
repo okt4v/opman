@@ -4,6 +4,7 @@
 #pragma once
 #include "edit.hpp"
 #include <imgui.h>
+#include <map>
 
 namespace om {
 
@@ -35,6 +36,7 @@ struct Layout {
     std::vector<Stop> stops;     // filled by draw calls
     std::vector<float> tabs;     // table lines: x of each cell border, relative to the line (empty: natural widths)
     bool tableHeader = false;    // the table line being drawn is its table's first (bold)
+    std::map<std::string, int> eqNums;  // equation numbers of the document (set by the app each frame)
 
     // a top-level line: text with math runs
     Box measureLine(const Row& row);

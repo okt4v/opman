@@ -82,7 +82,8 @@ int opClass(const Item& it) {
     if (!((it.t == T::Ch && it.m) || it.t == T::Sym) || it.c.empty()) return 0;
     if (std::string(REL).find(it.c) != std::string::npos) return 2;
     if (std::string(BIN).find(it.c) != std::string::npos) return 1;
-    return it.c == "," ? 3 : 0;
+    if (it.t == T::Sym && it.l == "\\mid") return 2;  // {x | x > 0}: spaced like a relation
+    return it.c == "," || it.c == ";" ? 3 : 0;
 }
 
 struct Impl {
@@ -146,6 +147,25 @@ struct Impl {
     ImU32 col(Ctx c, ImU32 natural) const { return c.col ? c.col : natural; }
     float axis(Ctx c) const { return 0.25f * c.size; }
 
+    // equation tags and references away from the cursor: a tag is hidden (the app numbers the line at the right edge),
+    // a reference shows its number. Per item: "" as is, "\x01" hidden, else the text drawn in its place
+    std::vector<std::string> eqShow(const Row& row, Ctx c) {
+        std::vector<std::string> out;
+        if (!c.top || !L.ed || L.ed->topOf(L.ed->cur.row) == &row) return out;
+        auto t = eqTag(row);
+        auto refs = eqRefs(row);
+        if (t.first < 0 && refs.empty()) return out;
+        out.resize(row.size());
+        if (t.first >= 0)
+            for (int j = t.first - 1; j < t.second; j++) out[j] = "\x01";
+        for (auto sp : refs) {
+            auto f = L.eqNums.find(eqName(row, sp));
+            for (int j = sp.first; j < sp.second; j++) out[j] = "\x01";
+            out[sp.first] = f == L.eqNums.end() ? "(?)" : "(" + std::to_string(f->second) + ")";
+        }
+        return out;
+    }
+
     // ---------- rows ----------
     RowLay lay(const Row& row, Ctx c) {
         RowLay r;
@@ -160,12 +180,20 @@ struct Impl {
         Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
         r.total = {0, c.top ? 0.75f * t.ts : 0, c.top ? 0.25f * t.ts : 0};
         size_t cell = 0;
+        auto eq = eqShow(row, c);
+        int tag = c.top ? eqTag(row).first : -1;
         for (size_t j = 0; j < n; j++) {
             r.xs[j] = x;
             const Item& it = row[j];
             Box b;
             float w;
-            if (int(j) < t.ls.len) {  // the Markdown prefix: drawn as one decoration in its last item's place
+            if (!eq.empty() && !eq[j].empty()) {
+                w = eq[j] == "\x01" ? 0 : textWidth(eq[j], t.ts);
+                b = {w, 0.72f * t.ts, 0.24f * t.ts};
+            } else if (tag >= 0 && int(j) >= tag - 1) {  // the tag while editing: small plain text
+                w = isSpace(it) ? 0.3f * t.ts : textWidth(it.c, t.ts * 0.85f);
+                b = {w, 0.72f * t.ts, 0.24f * t.ts};
+            } else if (int(j) < t.ls.len) {  // the Markdown prefix: drawn as one decoration in its last item's place
                 w = int(j) == t.ls.len - 1 ? decoWidth(t) : 0;
                 b = {w, 0.72f * t.ts, 0.24f * t.ts};
             } else if (c.top && pipe(it, t)) {  // a cell border: snaps to the column stop, drawn by the app as a grid line
@@ -214,13 +242,14 @@ struct Impl {
             return {0, k < row.size() && row[k].t == T::Paren ? 0 : 0.1667f * em};
         }
         if (it.t == T::Big || it.t == T::Lim) return {0, 0.1667f * em};
+        if (isStepBar(it)) return {1.5f * em, 0.3f * em};  // 2x = 4    | :2
         int cls = opClass(it);
         if (cls == 2) return {0.2778f * em, 0.2778f * em};
         if (cls == 3) return {0, 0.1667f * em};
         if (cls == 1) {
             int p = int(j) - 1;
             while (p >= 0 && isSpace(row[p])) p--;
-            bool prefix = p < 0 || !mask[p] || opClass(row[p]) != 0;
+            bool prefix = p < 0 || !mask[p] || opClass(row[p]) != 0 || isStepBar(row[p]);  // "| −1": a sign
             return prefix ? std::pair{0.f, 0.f} : std::pair{0.2222f * em, 0.2222f * em};
         }
         return {0, 0};
@@ -258,9 +287,26 @@ struct Impl {
         }
         Box prev{0, 0.72f * mc.size, 0.24f * mc.size};
         auto links = c.top ? linkSpans(row) : std::vector<std::pair<int, int>>{};
+        auto eq = eqShow(row, c);
+        auto refs = c.top ? eqRefs(row) : std::vector<std::pair<int, int>>{};
+        auto tag = c.top ? eqTag(row) : std::pair{-1, -1};
+        int bar = c.top ? stepBar(row) : -1;
         for (size_t j = t.ls.len; j < row.size(); j++) {
             const Item& it = row[j];
             if (c.top && pipe(it, t)) continue;
+            if (!eq.empty() && !eq[j].empty()) {
+                if (eq[j] != "\x01") glyph(L.text, t.ts, eq[j], x + r.xs[j], base, col(c, L.pal->fn));
+                continue;
+            }
+            if (int(j) >= tag.first - 1 && tag.first >= 0) {  // the tag, while editing its line
+                if (!isSpace(it)) glyph(L.text, t.ts * 0.85f, it.c, x + r.xs[j], base, col(c, L.pal->muted));
+                continue;
+            }
+            bool ref = std::any_of(refs.begin(), refs.end(), [&](auto sp) { return int(j) >= sp.first && int(j) < sp.second; });
+            if (ref) {
+                glyph(L.text, t.ts, it.c, x + r.xs[j], base, col(c, L.pal->fn));
+                continue;
+            }
             int link = 0;  // 1: a link's title, 2: its brackets
             for (auto [a, b] : links)
                 if (int(j) >= a && int(j) < b) link = int(j) < a + 2 || int(j) >= b - 2 ? 2 : 1;
@@ -273,7 +319,10 @@ struct Impl {
                 glyph(textFont(it, t), textSize(it, t), it.c, gx, base + textRise(it, t), tc, it.f & Italic);
                 if (L.dl && ((it.f & Underline) || link == 1)) L.dl->AddRectFilled({gx, base + 0.1f * t.ts}, {gx + gw, base + 0.1f * t.ts + th}, tc);
                 if (L.dl && ((it.f & Strike) || done)) L.dl->AddRectFilled({gx, base - 0.3f * t.ts}, {gx + gw, base - 0.3f * t.ts + th}, tc);
-            } else if (!isSpace(it)) item(it, mc, prev, true, x + r.xs[j] + r.lsp[j], base);
+            } else if (!isSpace(it)) {
+                bool step = c.top && bar >= 0 && int(j) >= bar;  // a transformation step: quieter than the equation
+                item(it, step ? Ctx{mc.size, mc.display, mc.top, col(c, L.pal->muted)} : mc, prev, true, x + r.xs[j] + r.lsp[j], base);
+            }
             if (!isSpace(it)) prev = r.boxes[j];
         }
     }

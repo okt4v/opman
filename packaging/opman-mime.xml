@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- .opman notes: installed to share/mime/packages so file managers open them with opman (opman.desktop) -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-opman">
+    <comment>opman math note</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.opman"/>
+    <icon name="opman"/>
+  </mime-type>
+</mime-info>

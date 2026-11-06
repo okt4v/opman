@@ -8,6 +8,7 @@
 #include <set>
 
 namespace om {
+MathOpts mathOpts;
 namespace {
 
 struct Fail {};
@@ -146,7 +147,7 @@ double toPrecision(double x, int p) {
 
 namespace {
 
-std::string fmt(const Value& x) {
+std::string fmt(const Value& x, int digits = 0) {
     if (isMat(x)) {
         std::string s = "(";
         for (size_t r = 0; r < x.m.size(); r++) {
@@ -157,7 +158,7 @@ std::string fmt(const Value& x) {
     }
     if (exact(x)) return x.d == 1 ? intStr(x.n) : intStr(x.n) + "/" + intStr(x.d);
     if (!std::isfinite(x.f)) fail();
-    return jsNum(toPrecision(x.f, 10));
+    return jsNum(toPrecision(x.f, digits ? digits : mathOpts.digits));
 }
 
 const std::map<std::string, double (*)(double)> BUILTIN = {
@@ -170,7 +171,15 @@ const std::map<std::string, double (*)(double)> BUILTIN = {
     {"log", [](double x) { return std::log10(x); }}, {"ln", [](double x) { return std::log(x); }},
     {"exp", [](double x) { return std::exp(x); }},   {"sqrt", [](double x) { return std::sqrt(x); }},
     {"abs", [](double x) { return std::fabs(x); }},  {"floor", [](double x) { return std::floor(x); }},
-    {"ceil", [](double x) { return std::ceil(x); }}, {"max", nullptr}, {"min", nullptr}};  // max/min: variadic, see call
+    {"ceil", [](double x) { return std::ceil(x); }}, {"round", [](double x) { return std::round(x); }},
+    {"sign", [](double x) { return double((x > 0) - (x < 0)); }}};
+
+// functions of any number of arguments; a table column's name as the only argument stands for its numbers: mean(h)
+const std::set<std::string> VARIADIC = {"max", "min", "mean", "median", "stdev", "var", "sum", "count", "gcd", "lcm"};
+bool isTrig(const std::string& f) {
+    return f == "sin" || f == "cos" || f == "tan" || f == "cot" || f == "sec" || f == "csc";
+}
+bool isArc(const std::string& f) { return f == "arcsin" || f == "arccos" || f == "arctan"; }
 
 std::optional<double> isqrt(double n) {
     double r = jsRound(std::sqrt(n));
@@ -187,6 +196,8 @@ std::optional<Value> exactFn(const std::string& f, const Value& x) {
     return std::nullopt;
 }
 bool hasExact(const std::string& f) { return f == "abs" || f == "floor" || f == "ceil" || f == "sqrt"; }
+std::map<std::string, std::vector<Value>> COLUMNS;
+bool DECIMAL = false;  // numItems writes decimals (the "Decimal" suggestion)  // table columns of the section: header name -> numbers
 bool isConst(const std::string& n) { return n == "π" || n == "e"; }
 double constVal(const std::string& n) { return n == "π" ? std::numbers::pi : std::numbers::e; }
 
@@ -426,6 +437,30 @@ struct Parser {
             return var(n.n);
         }
         case Tok::Fn: {
+            if (peek() && peek()->k == Tok::Paren && peek()->node->o == "(") {  // max(2, 4): several arguments
+                std::string inner = plain(peek()->node->s[0]);
+                if (n.n == "fit") {  // fit(t, h[, 2]): column names stay names
+                    p++;
+                    Ast c = mk(Ast::Call, {}, n.n);
+                    for (auto& part : splitArgs(t[p - 1].node->s[0])) {
+                        std::string w = plain(part);
+                        std::erase(w, ' ');
+                        c.a.push_back(COLUMNS.count(w) || w == "exp" ? var(w) : parse(part));
+                    }
+                    return c;
+                }
+                if (VARIADIC.count(n.n) && COLUMNS.count(inner)) {  // mean(mass): a column name of several letters
+                    p++;
+                    return mk(Ast::Call, {var(inner)}, n.n);
+                }
+                auto parts = splitArgs(peek()->node->s[0]);
+                if (parts.size() > 1) {
+                    p++;
+                    Ast c = mk(Ast::Call, {}, n.n);
+                    for (auto& part : parts) c.a.push_back(parse(part));
+                    return c;
+                }
+            }
             Ast arg = peek() && peek()->k == Tok::Paren ? parenAst(t[p++]) : power();
             return mk(Ast::Call, {arg.k == Ast::Group ? arg.a[0] : arg}, n.n);
         }
@@ -496,6 +531,42 @@ Value limit(const std::function<double(double)>& f, double to) {
     return nearQ(toPrecision(b, 9), 1e-8);
 }
 
+Value sub(const Value& a, const Value& b) { return add(a, neg(b)); }
+// max min mean median stdev var sum count gcd lcm over a list of numbers
+Value variadic(const std::string& f, const std::vector<Value>& xs) {
+    if (xs.empty()) fail();
+    if (f == "count") return Q(double(xs.size()));
+    if (f == "sum" || f == "mean") {
+        Value s = Q(0);
+        for (auto& x : xs) s = add(s, x);
+        return f == "sum" ? s : div(s, Q(double(xs.size())));
+    }
+    if (f == "gcd" || f == "lcm") {
+        double r = f == "gcd" ? 0 : 1;
+        for (auto& x : xs) {
+            if (!isInt(x)) fail();
+            double v = std::fabs(x.n);
+            r = f == "gcd" ? gcd(r, v) : (v == 0 ? 0 : r / gcd(r, v) * v);
+        }
+        return Q(r);
+    }
+    if (f == "var" || f == "stdev") {  // sample variance (n − 1), like a calculator's s
+        if (xs.size() < 2) fail();
+        Value m = variadic("mean", xs), s = Q(0);
+        for (auto& x : xs) s = add(s, pow(sub(x, m), Q(2)));
+        Value v = div(s, Q(double(xs.size() - 1)));
+        if (f == "var") return v;
+        if (exact(v)) if (auto r = exactFn("sqrt", v)) return *r;
+        return F0(std::sqrt(val(v)));
+    }
+    std::vector<Value> v = xs;
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return val(a) < val(b); });
+    if (f == "min") return v.front();
+    if (f == "max") return v.back();
+    size_t n = v.size();  // median
+    return n % 2 ? v[n / 2] : div(add(v[n / 2 - 1], v[n / 2]), Q(2));
+}
+
 Value evaluate(const Ast& a, const Scope& scope, int depth) {
     if (depth > 50) fail();
     auto ev = [&](const Ast& x) { return evaluate(x, scope, depth); };
@@ -539,6 +610,8 @@ Value evaluate(const Ast& a, const Scope& scope, int depth) {
         fail();
     }
     case Ast::Call: {
+        if (VARIADIC.count(a.n) && a.a.size() == 1 && a.a[0].k == Ast::Var && !scope.count(a.a[0].n))
+            if (auto c = COLUMNS.find(a.a[0].n); c != COLUMNS.end()) return variadic(a.n, c->second);  // mean(h): a table column
         std::vector<Value> args;
         for (auto& x : a.a) args.push_back(ev(x));
         const Def* d = def(a.n);
@@ -553,19 +626,26 @@ Value evaluate(const Ast& a, const Scope& scope, int depth) {
         }
         if (hasExact(a.n) && args.size() == 1 && exact(args[0]))
             if (auto r = exactFn(a.n, args[0])) return *r;
-        if (auto f = BUILTIN.find(a.n); f != BUILTIN.end()) {
-            for (auto& x : args)
-                if (isMat(x)) fail();
-            if (!f->second) {  // max, min
-                double r = a.n == "max" ? -INFINITY : INFINITY;
-                for (auto& x : args) {
-                    double v = val(x);
-                    if (std::isnan(v)) return F0(NAN);
-                    r = a.n == "max" ? std::max(r, v) : std::min(r, v);
-                }
-                return F0(r);
+        for (auto& x : args)
+            if (isMat(x)) fail();
+        if (VARIADIC.count(a.n)) return variadic(a.n, args);
+        if (args.size() == 2 && (a.n == "mod" || a.n == "nCr" || a.n == "nPr")) {
+            Value x = args[0], y = args[1];
+            if (a.n == "mod") {
+                if (exact(x) && exact(y)) return sub(x, mul(y, Q(std::floor(val(x) / val(y)))));
+                return F0(val(x) - val(y) * std::floor(val(x) / val(y)));
             }
-            return F0(f->second(val(args[0])));
+            if (!isInt(x) || !isInt(y) || y.n < 0 || y.n > x.n) fail();
+            Value r = Q(1);  // n(n−1)…(n−k+1), over k! for nCr
+            for (double j = 0; j < y.n; j++) r = mul(r, Q(x.n - j));
+            return a.n == "nPr" ? r : div(r, fact(y));
+        }
+        if (auto f = BUILTIN.find(a.n); f != BUILTIN.end() && args.size() == 1) {
+            double x = val(args[0]);
+            if (mathOpts.degrees && isTrig(a.n)) x *= std::numbers::pi / 180;
+            double r = f->second(x);
+            if (mathOpts.degrees && isArc(a.n)) r *= 180 / std::numbers::pi;
+            return mathOpts.degrees && (isTrig(a.n) || isArc(a.n)) ? nearQ(r) : F0(r);  // sin(30) = 1/2 exactly
         }
         fail();
     }
@@ -818,6 +898,80 @@ Row digitsOf(const std::string& s) {
     for (char c : s) r.push_back(M(std::string(1, c)));
     return r;
 }
+// a decimal that is really (p/q)·√n, (p/q)·π or (a + b√n)/c: the exact form, as text and items. Small numbers only, so
+// a value that merely happens to be close isn't dressed up (ponytail: a heuristic, like a calculator's "exact" key)
+struct ExactForm {
+    std::string text;
+    Row items;
+};
+std::optional<ExactForm> exactForm(double v) {
+    if (!std::isfinite(v) || std::fabs(v) < 1e-9 || std::fabs(v) > 1e6) return std::nullopt;
+    double tol = 1e-10 * std::max(1.0, std::fabs(v));
+    // v = (n/d)·unit with d <= maxD, |n| <= maxN
+    auto near = [&](double unit, double& n, int maxD, double maxN, int& d) {
+        for (d = 1; d <= maxD; d++) {
+            n = std::round(v / unit * d);
+            if (n != 0 && std::fabs(n) <= maxN && std::fabs(n / d * unit - v) < tol && gcd(std::fabs(n), d) == 1) return true;
+        }
+        return false;
+    };
+    auto squarefree = [](int n) {
+        for (int f = 2; f * f <= n; f++)
+            if (n % (f * f) == 0) return false;
+        return true;
+    };
+    auto frac = [](Row top, double d) {  // top / d
+        if (d == 1) return top;
+        Item f = node(T::Frac);
+        f.s = {std::move(top), digitsOf(intStr(d))};
+        return Row{f};
+    };
+    auto root = [](int n) {
+        Item r = node(T::Sqrt);
+        r.s[0] = digitsOf(std::to_string(n));
+        return r;
+    };
+    auto coefRow = [&](double n, Item tail) {  // n·tail, without "1"
+        Row r;
+        if (std::fabs(n) != 1) r = digitsOf(intStr(std::fabs(n)));
+        r.push_back(std::move(tail));
+        return r;
+    };
+    auto sign = [&](double n, Row r) {
+        if (n < 0) r.insert(r.begin(), M("−"));
+        return r;
+    };
+    auto coefText = [](double n) { return std::fabs(n) == 1 ? std::string(n < 0 ? "−" : "") : intStr(n); };
+    double n;
+    int d;
+    if (near(std::numbers::pi, n, 24, 500, d))  // multiples of π
+        return ExactForm{coefText(n) + "π" + (d > 1 ? "/" + std::to_string(d) : ""),
+                         sign(n, frac(coefRow(n, named(T::Var, "π")), d))};
+    for (int k = 2; k <= 200; k++) {  // (p/q)·√k
+        if (!squarefree(k)) continue;
+        if (near(std::sqrt(double(k)), n, 60, 1000, d))
+            return ExactForm{coefText(n) + "√" + std::to_string(k) + (d > 1 ? "/" + std::to_string(d) : ""), sign(n, frac(coefRow(n, root(k)), d))};
+    }
+    for (int k = 2; k <= 30; k++) {  // (a + b√k)/c: roots of quadratics
+        if (!squarefree(k)) continue;
+        for (int c = 1; c <= 12; c++)
+            for (int b = -12; b <= 12; b++) {
+                if (!b) continue;
+                double a = std::round(v * c - b * std::sqrt(double(k)));
+                if (a == 0 || std::fabs(a) > 1000 || std::fabs((a + b * std::sqrt(double(k))) / c - v) > tol) continue;
+                if (gcd(gcd(std::fabs(a), std::fabs(double(b))), c) != 1) continue;
+                std::string t = intStr(a) + (b < 0 ? " − " : " + ") + (std::abs(b) == 1 ? "" : std::to_string(std::abs(b))) + "√" + std::to_string(k);
+                Row top = digitsOf(intStr(std::fabs(a)));
+                if (a < 0) top.insert(top.begin(), M("−"));
+                top.push_back(M(b < 0 ? "−" : "+"));
+                for (auto& it : coefRow(std::abs(b), root(k))) top.push_back(it);
+                if (c == 1) return ExactForm{t, top};
+                return ExactForm{"(" + t + ")/" + std::to_string(c), frac(top, c)};
+            }
+    }
+    return std::nullopt;
+}
+
 Row numItems(const Value& v) {
     if (isMat(v)) {
         std::vector<std::vector<Row>> rows;
@@ -842,6 +996,8 @@ Row numItems(const Value& v) {
         r.push_back(std::move(f));
         return r;
     }
+    if (!exact(v) && !mathOpts.decimals && !DECIMAL)
+        if (auto e = exactForm(v.f)) return e->items;
     Row r;
     for (char c : fmt(v)) r.push_back(M(c == '-' ? "−" : std::string(1, c)));
     return r;
@@ -914,7 +1070,8 @@ Row toItems(const Ast& a, double ctx = 0) {
         } else if (a.n == "abs") out = {paren("|", "|", args)};
         else if (a.n == "floor") out = {paren("⌊", "⌋", args)};
         else if (a.n == "ceil") out = {paren("⌈", "⌉", args)};
-        else out = {named(BUILTIN.count(a.n) ? T::Fn : T::Var, a.n), paren("(", ")", args)};
+        else out = {named(BUILTIN.count(a.n) || VARIADIC.count(a.n) || a.n == "fit" || a.n == "mod" || a.n == "nCr" || a.n == "nPr" ? T::Fn : T::Var, a.n),
+                    paren("(", ")", args)};
         break;
     }
     case Ast::Bin:
@@ -972,14 +1129,50 @@ void defsIn(const Row& run) {
 
 // definitions from every line of exclude's section (=== lines separate exercises; null: the whole doc); on line
 // `exclude` only the part before index `upto` counts ("v = 90 km/h and v * 2 h =" sees v, but a line never defines itself)
+// a table cell's items as math (cells are typed as text)
+Row cellMath(const Row& r, std::pair<int, int> c) {
+    Row q;
+    for (int j = c.first; j < c.second; j++)
+        if (!isSpace(r[j])) {
+            Item it = r[j];
+            if (it.t == T::Ch) it.m = true;
+            q.push_back(it);
+        }
+    return q;
+}
+
+// every table in lines [a, b): a header cell that is a name ("h", "mass") makes its column's numbers a list
+void collectColumns(int a, int b) {
+    COLUMNS.clear();
+    for (int n = a; n < b; n++) {
+        if (lineStyle(ED->doc[n]).kind != Line::Table || (n > a && lineStyle(ED->doc[n - 1]).kind == Line::Table)) continue;
+        auto head = tableCells(ED->doc[n]);
+        std::vector<std::string> names;
+        for (auto& c : head) {
+            std::string s = plain(cellMath(ED->doc[n], c));
+            bool name = !s.empty() && std::all_of(s.begin(), s.end(), [](char ch) { return std::isalnum((unsigned char)ch) || ch == '_' || (ch & 0x80); });
+            names.push_back(name && !std::isdigit((unsigned char)s[0]) ? s : "");
+        }
+        for (int r = n + 1; r < b && lineStyle(ED->doc[r]).kind == Line::Table; r++) {
+            auto cells = tableCells(ED->doc[r]);
+            for (size_t c = 0; c < cells.size() && c < names.size(); c++) {
+                if (names[c].empty()) continue;
+                try { COLUMNS[names[c]].push_back(evaluate(parse(cellMath(ED->doc[r], cells[c])))); } catch (...) {}
+            }
+        }
+    }
+}
+
 void collectDefs(const Row* exclude, int upto = 0) {
     DEFS.clear();
     int k = exclude ? ED->lineOf(exclude) : -1;
     auto [a, b] = k >= 0 ? sectionOf(ED->doc, k) : std::pair{0, int(ED->doc.size())};
+    collectColumns(a, b);
     for (int n = a; n < b; n++) {
         const Row& whole = ED->doc[n];
         if (lineStyle(whole).kind == Line::Plot) continue;  // "plot y = x^2" doesn't define y
-        Row line = &whole == exclude ? Row(whole.begin(), whole.begin() + std::min(upto, int(whole.size()))) : whole;
+        int cut = stepBar(whole) >= 0 ? stepBar(whole) : int(whole.size());  // a step "| :2" defines nothing
+        Row line = Row(whole.begin(), whole.begin() + std::min(&whole == exclude ? upto : cut, cut));
         auto mask = mathMask(line, true);
         for (size_t j = 0; j < line.size();) {
             size_t k = j;
@@ -1340,6 +1533,12 @@ bool unitStartsWith(const std::string& c) {
 std::vector<Entry> evalSuggestions(Editor& ed) {
     ED = &ed;
     const Row& row = *ed.cur.row;
+    if (int b = stepBar(*ed.topOf(ed.cur.row)); b >= 0) {  // typing the step after "|": no results
+        Cur at = ed.cur;
+        for (auto f = ed.parents.find(at.row); f != ed.parents.end(); f = ed.parents.find(at.row))
+            at = {f->second.row, int(f->second.node - f->second.row->data())};
+        if (at.i > b) return {};
+    }
     int i = ed.cur.i, j = i;
     while (j > 0 && isSpace(row[j - 1])) j--;
     const Item* last = j > 0 ? &row[j - 1] : nullptr;
@@ -1362,8 +1561,15 @@ std::vector<Entry> evalSuggestions(Editor& ed) {
             return expandSuggestions(ast, lead);
         }
         std::vector<Entry> out = {result("= " + fmt(v), "Result", cat(lead, numItems(v)))};
+        if (!exact(v) && !isMat(v))
+            if (auto e = exactForm(v.f)) {
+                out[0].name = "= " + e->text;
+                DECIMAL = true;
+                out.push_back(result("= " + fmt(v), "Decimal", cat(lead, numItems(v))));
+                DECIMAL = false;
+            }
         if (exact(v) && v.d != 1) {
-            double d = toPrecision(v.n / v.d, 10);
+            double d = toPrecision(v.n / v.d, mathOpts.digits);
             out.push_back(result("= " + jsNum(d), "Decimal", cat(lead, numItems(Fl(v.n / v.d)))));
         }
         auto st = steps(ast);
@@ -1378,10 +1584,16 @@ std::vector<Entry> evalSuggestions(Editor& ed) {
     }
 }
 
+namespace {
+std::string fitText(const std::vector<double>& c, bool expo, const std::string& x);
+Ast fitAst(const std::vector<double>& c, bool expo, const std::string& x);
+}  // namespace
+
 std::optional<Ghost> ghost(Editor& ed, const Row& row) {
     ED = &ed;
     auto mask = mathMask(row, true);
-    int end = int(row.size());
+    int end = eqTag(row).first >= 0 ? eqTag(row).first : int(row.size());  // "x + 1 #eq": the answer goes before the tag
+    if (stepBar(row) >= 0) return std::nullopt;  // "2x = 4 | :2": a transformation step, nothing to answer
     while (end > 0 && isSpace(row[end - 1])) end--;
     if (!end || !mask[end - 1] || isRel(&row[end - 1]) || impliesItem(row[end - 1])) return std::nullopt;
     Row seg = segmentBefore(row, end, relItem);
@@ -1390,9 +1602,11 @@ std::optional<Ghost> ghost(Editor& ed, const Row& row) {
     try {
         collectDefs(&row, end - int(seg.size()));
         Ast ast = parse(seg);
-        // "h(2) = 1019/50": a number written after "=" is already the answer
+        // "h(2) = 1019/50", "= 2√2", "= π/4": a number (or exact form) written after "=" is already the answer
         std::function<bool(const Ast&)> named = [&](const Ast& x) {
-            return x.k == Ast::Var || x.k == Ast::Call || x.k == Ast::Deriv || std::any_of(x.a.begin(), x.a.end(), named);
+            if (x.k == Ast::Var) return x.n != "π" && x.n != "e";
+            if (x.k == Ast::Call && x.n != "sqrt") return true;
+            return x.k == Ast::Deriv || std::any_of(x.a.begin(), x.a.end(), named);
         };
         int s0 = end - int(seg.size());
         while (s0 > 0 && isSpace(row[s0 - 1])) s0--;
@@ -1401,7 +1615,29 @@ std::optional<Ghost> ghost(Editor& ed, const Row& row) {
         if (ast.k == Ast::Num || (ast.k == Ast::Neg && ast.a[0].k == Ast::Num) ||
             (ast.k == Ast::Mat && std::all_of(ast.a.begin(), ast.a.end(), [](auto& x) { return x.k == Ast::Num; })))
             return std::nullopt;
+        if (ast.k == Ast::Call && ast.n == "fit") {  // fit(t, h): the least-squares line (or curve) through two columns
+            if (ast.a.size() < 2 || ast.a[0].k != Ast::Var || ast.a[1].k != Ast::Var) fail();
+            auto cx = COLUMNS.find(ast.a[0].n), cy = COLUMNS.find(ast.a[1].n);
+            if (cx == COLUMNS.end() || cy == COLUMNS.end()) fail();
+            int deg = 1;
+            if (ast.a.size() > 2) {
+                if (ast.a[2].k == Ast::Var && ast.a[2].n == "exp") deg = -1;  // ponytail: "exp" parses as a name here
+                else deg = int(val(evaluate(ast.a[2])));
+            }
+            std::vector<double> xs, ys;
+            for (size_t k = 0; k < std::min(cx->second.size(), cy->second.size()); k++)
+                xs.push_back(val(cx->second[k])), ys.push_back(val(cy->second[k]));
+            double r2;
+            auto c = fitCurve(xs, ys, deg, r2);
+            if (c.empty()) fail();
+            std::string x = ast.a[0].n;
+            return Ghost{"= " + fitText(c, deg < 0, x) + "   (R² = " + jsNum(toPrecision(r2, 4)) + ")",
+                         cat({M(" "), M("="), M(" ")}, toItems(fitAst(c, deg < 0, x)))};
+        }
         Value v = evaluate(ast);
+        if (mathOpts.decimals && exact(v) && v.d != 1) v = Fl(v.n / v.d);
+        if (!exact(v) && !isMat(v) && !mathOpts.decimals)
+            if (auto e = exactForm(v.f)) return Ghost{"= " + e->text + " ≈ " + fmt(v), cat({M(" "), M("="), M(" ")}, e->items)};
         return Ghost{"= " + fmt(v), cat({M(" "), M("="), M(" ")}, numItems(v))};
     } catch (...) {
         try {
@@ -1422,16 +1658,7 @@ static void tableSeries(Editor& ed, const Row& row, Plot& out) {
     int start = end;
     while (start > top && lineStyle(ed.doc[start - 1]).kind == Line::Table) start--;
     if (start == end) { out.error = "No table above to plot"; return; }
-    auto cellRow = [](const Row& r, std::pair<int, int> c) {
-        Row q;
-        for (int j = c.first; j < c.second; j++)
-            if (!isSpace(r[j])) {
-                Item it = r[j];
-                if (it.t == T::Ch) it.m = true;
-                q.push_back(it);
-            }
-        return q;
-    };
+    auto cellRow = cellMath;
     auto head = tableCells(ed.doc[start]);
     for (size_t c = 1; c < head.size(); c++) {
         Row h = cellRow(ed.doc[start], head[c]);
@@ -1449,10 +1676,91 @@ static void tableSeries(Editor& ed, const Row& row, Plot& out) {
     }
 }
 
+std::vector<double> fitCurve(const std::vector<double>& xs, const std::vector<double>& ys, int degree, double& r2) {
+    size_t n = xs.size();
+    bool expo = degree < 0;
+    int m = expo ? 2 : degree + 1;
+    if (n < size_t(m)) return {};
+    std::vector<double> ty = ys;
+    if (expo)
+        for (auto& y : ty) {
+            if (y <= 0) return {};  // e^x is positive
+            y = std::log(y);
+        }
+    // normal equations A c = r, A[i][j] = Σ x^(i+j), solved with partial pivoting
+    std::vector<std::vector<double>> A(m, std::vector<double>(m + 1, 0));
+    for (size_t k = 0; k < n; k++)
+        for (int i = 0; i < m; i++) {
+            for (int j = 0; j < m; j++) A[i][j] += std::pow(xs[k], i + j);
+            A[i][m] += std::pow(xs[k], i) * ty[k];
+        }
+    for (int c = 0; c < m; c++) {
+        int piv = c;
+        for (int r = c + 1; r < m; r++)
+            if (std::fabs(A[r][c]) > std::fabs(A[piv][c])) piv = r;
+        std::swap(A[c], A[piv]);
+        if (std::fabs(A[c][c]) < 1e-300) return {};
+        for (int r = 0; r < m; r++)
+            if (r != c) {
+                double f = A[r][c] / A[c][c];
+                for (int j = c; j <= m; j++) A[r][j] -= f * A[c][j];
+            }
+    }
+    std::vector<double> c(m);
+    for (int i = 0; i < m; i++) c[i] = A[i][m] / A[i][i];
+    if (expo) c = {std::exp(c[0]), c[1]};
+    auto f = [&](double x) {
+        if (expo) return c[0] * std::exp(c[1] * x);
+        double y = 0;
+        for (int i = m - 1; i >= 0; i--) y = y * x + c[i];
+        return y;
+    };
+    double mean = 0, res = 0, tot = 0;
+    for (auto y : ys) mean += y / n;
+    for (size_t k = 0; k < n; k++) res += (ys[k] - f(xs[k])) * (ys[k] - f(xs[k])), tot += (ys[k] - mean) * (ys[k] - mean);
+    r2 = tot > 0 ? 1 - res / tot : 1;
+    return c;
+}
+
+namespace {
+// a fitted curve as text: "2.5t + 7.5", "1.2·e^(0.3t)"
+std::string fitText(const std::vector<double>& c, bool expo, const std::string& x) {
+    auto n = [](double v) { return jsNum(toPrecision(v, 4)); };
+    if (expo) return n(c[0]) + "·e^(" + n(c[1]) + x + ")";
+    std::string t;
+    for (int i = int(c.size()) - 1; i >= 0; i--) {
+        double v = toPrecision(c[i], 4);
+        if (v == 0 && c.size() > 1) continue;
+        std::string mag = jsNum(std::fabs(v)), pw = i == 0 ? "" : i == 1 ? x : x + (i == 2 ? "²" : i == 3 ? "³" : "^" + std::to_string(i));
+        if (i > 0 && mag == "1") mag = "";
+        t += (t.empty() ? (v < 0 ? "−" : "") : (v < 0 ? " − " : " + ")) + mag + pw;
+    }
+    return t.empty() ? "0" : t;
+}
+// the same as an expression, to write into the note
+Ast fitAst(const std::vector<double>& c, bool expo, const std::string& x) {
+    auto n = [](double v) { return num(nearQ(toPrecision(v, 4), 1e-12)); };
+    if (expo) return bin("*", n(c[0]), mk(Ast::Bin, {var("e"), bin("*", n(c[1]), var(x))}, "", "^"));
+    Ast out;
+    bool first = true;
+    for (int i = int(c.size()) - 1; i >= 0; i--) {
+        double v = toPrecision(c[i], 4);
+        if (v == 0 && c.size() > 1) continue;
+        Ast term = i == 0 ? n(std::fabs(v)) : i == 1 ? var(x) : bin("^", var(x), num(Q(i)));
+        if (i > 0 && std::fabs(v) != 1) term = bin("*", n(std::fabs(v)), term);
+        if (first) out = v < 0 ? mk(Ast::Neg, {term}) : term, first = false;
+        else out = bin(v < 0 ? "-" : "+", out, term);
+    }
+    return first ? num(Q(0)) : out;
+}
+}  // namespace
+
 Plot plot(Editor& ed, const Row& row, const double* view) {
     ED = &ed;
     Plot out;
-    bool domain = false, yFixed = false;
+    out.x0 = mathOpts.plotX0, out.x1 = mathOpts.plotX1;
+    bool domain = false, yFixed = false, zFixed = false;
+    double t0 = 0, t1 = 2 * std::numbers::pi;
     collectDefs(&row, 0);
     std::vector<Row> parts(1);  // split at top-level commas, without spaces; text letters count as math here
     for (size_t j = 1; j < row.size(); j++) {  // after the plot function
@@ -1463,11 +1771,29 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
             parts.back().push_back(it);
         }
     }
-    std::vector<Ast> fns;
+    enum Kind { Fx, Param, Polar, Implicit, Surface, Space };
+    struct Fn {
+        Kind k;
+        std::vector<Ast> a;  // Fx/Polar/Implicit/Surface: one; Param: x, y; Space: x, y, z
+        size_t at;           // index in series / surfaces / curves
+    };
+    std::vector<Fn> fns;
+    std::vector<std::string> fits;
+    auto unknown = [](const Ast& a) {  // variables nothing in the section defines
+        std::set<std::string> v;
+        for (auto& n : freeVars(a))
+            if (!def(n)) v.insert(n);
+        return v;
+    };
     for (auto& q : parts) {
         if (q.empty()) continue;
-        if (plain(q) == "table") {
+        std::string pq = plain(q);
+        if (pq == "table") {
             tableSeries(ed, row, out);
+            continue;
+        }
+        if (pq.starts_with("fit")) {
+            fits.push_back(pq.substr(3));
             continue;
         }
         std::vector<int> rel, eq;
@@ -1476,51 +1802,181 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
             if (q[j].c == "=") eq.push_back(j);
         }
         try {
-            if (rel.size() == 2) {  // a < x < b, or a < y < b for the visible y range
+            if (rel.size() == 2) {  // a < x < b; y: the y range (a 3D plot's y domain); t, θ: the parameter; z: 3D height
                 double lo = val(evaluate(parse(Row(q.begin(), q.begin() + rel[0]))));
+                std::string v = plain(Row(q.begin() + rel[0] + 1, q.begin() + rel[1]));
                 double hi = val(evaluate(parse(Row(q.begin() + rel[1] + 1, q.end()))));
-                bool y = rel[1] - rel[0] == 2 && q[rel[0] + 1].c == "y";
-                (y ? out.y0 : out.x0) = lo, (y ? out.y1 : out.x1) = hi;
-                (y ? yFixed : domain) = true;
+                if (v == "y") out.y0 = lo, out.y1 = hi, yFixed = true;
+                else if (v == "t" || v == "θ") t0 = lo, t1 = hi;
+                else if (v == "z") out.z0 = lo, out.z1 = hi, zFixed = true;
+                else out.x0 = lo, out.x1 = hi, domain = true;
                 continue;
             }
-            Row e = eq.empty() ? q : Row(q.begin() + eq.back() + 1, q.end());  // y = …: the right side
-            fns.push_back(parse(e));
-            out.series.push_back({tex(e), plain(e), {}});
+            if (q.size() == 1 && q[0].t == T::Paren && q[0].o == "(") {  // (x(t), y(t)) or (x(t), y(t), z(t))
+                auto xs = splitArgs(q[0].s[0]);
+                if (xs.size() == 2 || xs.size() == 3) {
+                    Fn f{xs.size() == 2 ? Param : Space, {}, 0};
+                    for (auto& x : xs) f.a.push_back(parse(x));
+                    if (f.k == Param) f.at = out.series.size(), out.series.push_back({tex(q), plain(q), {}});
+                    else f.at = out.curves.size(), out.curves.push_back({tex(q), plain(q), {}});
+                    fns.push_back(std::move(f));
+                    continue;
+                }
+            }
+            if (!eq.empty()) {
+                Row lhs(q.begin(), q.begin() + eq.back()), rhs(q.begin() + eq.back() + 1, q.end());
+                std::string l = plain(lhs);
+                if (l == "y" || l == "r" || l == "z" || l == "f(x)") {
+                    Kind k = l == "r" ? Polar : l == "z" ? Surface : Fx;
+                    Fn f{k, {parse(rhs)}, 0};
+                    if (k == Fx && unknown(f.a[0]).count("y")) f.k = k = Implicit;  // y = x + y²…
+                    if (k == Surface) f.at = out.surfaces.size(), out.surfaces.push_back({tex(rhs), plain(rhs), 0, {}});
+                    else f.at = out.series.size(), out.series.push_back({k == Fx ? tex(rhs) : tex(q), k == Fx ? plain(rhs) : plain(q), {}});
+                    if (k == Implicit) f.a[0] = bin("-", parse(lhs), f.a[0]);
+                    fns.push_back(std::move(f));
+                    continue;
+                }
+                Fn f{Implicit, {bin("-", parse(lhs), parse(rhs))}, out.series.size()};  // x² + y² = 4
+                out.series.push_back({tex(q), plain(q), {}});
+                fns.push_back(std::move(f));
+                continue;
+            }
+            Ast a = parse(q);
+            if (unknown(a).count("y")) {  // sin(x) cos(y): a surface
+                fns.push_back({Surface, {a}, out.surfaces.size()});
+                out.surfaces.push_back({tex(q), plain(q), 0, {}});
+            } else {
+                fns.push_back({Fx, {a}, out.series.size()});
+                out.series.push_back({tex(q), plain(q), {}});
+            }
         } catch (...) {
-            out.error = "Can't plot " + plain(q);
+            out.error = "Can't plot " + pq;
         }
     }
-    std::vector<double> ys;
-    if (!domain) {  // no domain given: fit the table data, if any
+    auto at = [](const Ast& a, Scope s) {
+        try {
+            Value v = evaluate(a, s);
+            if (!isMat(v) && std::isfinite(val(v))) return val(v);
+        } catch (...) {}
+        return double(NAN);
+    };
+    // curves that don't depend on the x range first, so the range can fit them
+    for (auto& f : fns) {
+        if (f.k != Param && f.k != Polar) continue;
+        auto& pts = out.series[f.at].pts;
+        for (int i = 0; i < 720; i++) {
+            double t = t0 + (t1 - t0) * i / 719, x, y;
+            if (f.k == Param) x = at(f.a[0], {{"t", Fl(t)}}), y = at(f.a[1], {{"t", Fl(t)}});
+            else {
+                double r = at(f.a[0], {{"θ", Fl(t)}, {"t", Fl(t)}});
+                x = r * std::cos(t), y = r * std::sin(t);
+            }
+            pts.push_back({std::isfinite(x) ? x : NAN, std::isfinite(x) ? y : NAN});
+        }
+    }
+    // fits through the first table series
+    std::vector<std::pair<size_t, std::function<double(double)>>> fitFns;
+    for (auto& how : fits) {
+        const Plot::Series* data = nullptr;
+        for (auto& se : out.series)
+            if (se.points) { data = &se; break; }
+        if (!data) { out.error = "fit needs a table: plot table, fit"; continue; }
+        std::vector<double> xs, ys;
+        for (auto& [x, y] : data->pts)
+            if (std::isfinite(x) && std::isfinite(y)) xs.push_back(x), ys.push_back(y);
+        std::string h = how;
+        h.erase(std::remove(h.begin(), h.end(), ' '), h.end());
+        int deg = h.empty() || h == "linear" ? 1 : h == "quadratic" ? 2 : h == "cubic" ? 3 : h == "exp" ? -1 : std::atoi(h.c_str());
+        if (deg == 0 || deg > 6) { out.error = "fit, fit 2, fit 3 or fit exp"; continue; }
+        double r2 = 0;
+        auto c = fitCurve(xs, ys, deg, r2);
+        if (c.empty()) { out.error = "Not enough data to fit"; continue; }
+        std::string label = "fit: y = " + fitText(c, deg < 0, "x") + "   R² = " + jsNum(toPrecision(r2, 4));
+        fitFns.push_back({out.series.size(), [c, deg](double x) {
+                              if (deg < 0) return c[0] * std::exp(c[1] * x);
+                              double y = 0;
+                              for (int i = int(c.size()) - 1; i >= 0; i--) y = y * x + c[i];
+                              return y;
+                          }});
+        out.series.push_back({"\\text{" + label + "}", label, {}});
+    }
+    if (!domain && !out.is3d()) {  // no domain given: fit the table data and parametric curves, if any
         double lo = INFINITY, hi = -INFINITY;
         for (auto& s : out.series)
-            for (auto& [x, y] : s.pts) lo = std::min(lo, x), hi = std::max(hi, x);
+            for (auto& [x, y] : s.pts)
+                if (std::isfinite(x) && std::isfinite(y)) lo = std::min(lo, x), hi = std::max(hi, x);
         if (lo < hi) out.x0 = lo - 0.05 * (hi - lo), out.x1 = hi + 0.05 * (hi - lo);
     }
+    if (view && !out.is3d()) out.x0 = view[0], out.x1 = view[1], out.y0 = view[2], out.y1 = view[3], yFixed = true;
+    if (!(out.x1 > out.x0)) std::swap(out.x0, out.x1);
+    if (out.x0 == out.x1) out.x1 = out.x0 + 1;
+    if (out.is3d()) {  // 3D: y is a domain like x; z is the height
+        if (!yFixed) out.y0 = out.x0, out.y1 = out.x1;
+        std::vector<double> zs;
+        for (auto& f : fns) {
+            if (f.k == Surface) {
+                auto& sf = out.surfaces[f.at];
+                sf.n = 48;
+                for (int j = 0; j < sf.n; j++)
+                    for (int i = 0; i < sf.n; i++) {
+                        double x = out.x0 + (out.x1 - out.x0) * i / (sf.n - 1), y = out.y0 + (out.y1 - out.y0) * j / (sf.n - 1);
+                        double z = at(f.a[0], {{"x", Fl(x)}, {"y", Fl(y)}});
+                        sf.z.push_back(z);
+                        if (std::isfinite(z)) zs.push_back(z);
+                    }
+            } else if (f.k == Space) {
+                auto& cv = out.curves[f.at];
+                for (int i = 0; i < 600; i++) {
+                    double t = t0 + (t1 - t0) * i / 599;
+                    std::array<double, 3> p{at(f.a[0], {{"t", Fl(t)}}), at(f.a[1], {{"t", Fl(t)}}), at(f.a[2], {{"t", Fl(t)}})};
+                    cv.pts.push_back(p);
+                    if (std::isfinite(p[2])) zs.push_back(p[2]);
+                }
+            } else if (out.error.empty()) out.error = "A 3D plot can't also have 2D curves";
+        }
+        if (!out.curves.empty() && !domain && !yFixed) {  // a space curve sets its own box
+            double b[6] = {INFINITY, -INFINITY, INFINITY, -INFINITY};
+            for (auto& cv : out.curves)
+                for (auto& p : cv.pts)
+                    if (std::isfinite(p[0]) && std::isfinite(p[1]))
+                        b[0] = std::min(b[0], p[0]), b[1] = std::max(b[1], p[0]), b[2] = std::min(b[2], p[1]), b[3] = std::max(b[3], p[1]);
+            if (b[0] < b[1]) out.x0 = b[0], out.x1 = b[1];
+            if (b[2] < b[3]) out.y0 = b[2], out.y1 = b[3];
+        }
+        if (!zFixed && !zs.empty()) {
+            std::sort(zs.begin(), zs.end());
+            double lo = zs[size_t(0.01 * (zs.size() - 1))], hi = zs[size_t(0.99 * (zs.size() - 1))];
+            if (hi - lo < 1e-9) lo -= 1, hi += 1;
+            out.z0 = lo, out.z1 = hi;
+        }
+        if (zs.empty() && out.error.empty()) out.error = "Nothing to draw (are x and y the only unknowns?)";
+        return out;
+    }
+    std::vector<double> ys;
     for (auto& s : out.series)
         for (auto& [x, y] : s.pts)
             if (std::isfinite(y)) ys.push_back(y);
-    if (view) out.x0 = view[0], out.x1 = view[1], out.y0 = view[2], out.y1 = view[3], yFixed = true;
-    if (!(out.x1 > out.x0)) std::swap(out.x0, out.x1);
-    if (out.x0 == out.x1) out.x1 = out.x0 + 1;
     const int N = 400;
-    size_t first = out.series.size() - fns.size();  // table series come first
-    for (size_t f = 0; f < fns.size(); f++) {
-        size_t s = first + f;
-        bool any = false;
-        for (int i = 0; i < N; i++) {
-            double x = out.x0 + (out.x1 - out.x0) * i / (N - 1), y = NAN;
-            try {
-                Value v = evaluate(fns[f], {{"x", Fl(x)}});
-                if (!isMat(v)) y = val(v);
-            } catch (...) {}
-            if (!std::isfinite(y)) y = NAN;
-            else ys.push_back(y), any = true;
-            out.series[s].pts.push_back({x, y});
+    bool implicit = false;
+    for (auto& f : fns) {
+        auto& se = out.series[f.at];
+        if (f.k == Fx) {
+            bool any = false;
+            for (int i = 0; i < N; i++) {
+                double x = out.x0 + (out.x1 - out.x0) * i / (N - 1), y = at(f.a[0], {{"x", Fl(x)}});
+                if (std::isfinite(y)) ys.push_back(y), any = true;
+                se.pts.push_back({x, y});
+            }
+            if (!any && out.error.empty()) out.error = "Can't plot " + se.label + " (is x the only unknown?)";
         }
-        if (!any && out.error.empty()) out.error = "Can't plot " + out.series[s].label + " (is x the only unknown?)";
+        implicit = implicit || f.k == Implicit;
     }
+    for (auto& [k, f] : fitFns)
+        for (int i = 0; i < N; i++) {
+            double x = out.x0 + (out.x1 - out.x0) * i / (N - 1), y = f(x);
+            out.series[k].pts.push_back({x, std::isfinite(y) ? y : NAN});
+            if (std::isfinite(y)) ys.push_back(y);
+        }
     // ponytail: y range from the 2nd to 98th percentile plus a margin, so asymptotes don't flatten everything else
     if (!ys.empty() && !yFixed) {
         std::sort(ys.begin(), ys.end());
@@ -1530,6 +1986,56 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
         if (hi - lo < 1e-9) lo -= 1, hi += 1;
         double pad = 0.08 * (hi - lo);
         out.y0 = lo - pad, out.y1 = hi + pad;
+    }
+    // only shapes (parametric, polar, implicit; no y = f(x) or data): equal scales, so a circle is round. The plot area is
+    // about 2.4 times as wide as high (ponytail: the app's shape; a resize doesn't recompute it)
+    bool shapes = !fns.empty() && std::all_of(fns.begin(), fns.end(), [](auto& f) { return f.k == Param || f.k == Polar || f.k == Implicit; }) &&
+                  fitFns.empty() && std::none_of(out.series.begin(), out.series.end(), [](auto& s) { return s.points; });
+    if (shapes && !view) {
+        if (implicit && ys.empty() && !yFixed) out.y0 = out.x0, out.y1 = out.x1;  // only implicit: x's range to start from
+        if (implicit && !domain) {  // implicit curves can reach past the other curves: leave them room
+            double cx = (out.x0 + out.x1) / 2, cyy = (out.y0 + out.y1) / 2, r = std::max({out.x1 - out.x0, out.y1 - out.y0, 4.0}) / 2;
+            if (ys.empty()) r = (out.x1 - out.x0) / 2;
+            out.x0 = cx - r, out.x1 = cx + r, out.y0 = cyy - r, out.y1 = cyy + r;
+        }
+        double xs = out.x1 - out.x0, yspan = out.y1 - out.y0, aspect = 2.4;
+        if (!domain && !yFixed) {
+            if (yspan * aspect > xs) { double m = (out.x0 + out.x1) / 2; out.x0 = m - yspan * aspect / 2, out.x1 = m + yspan * aspect / 2; }
+            else { double m = (out.y0 + out.y1) / 2; out.y0 = m - xs / aspect / 2, out.y1 = m + xs / aspect / 2; }
+        }
+    }
+    // implicit curves: marching squares over the view; each piece is two points and a NaN (a break)
+    for (auto& f : fns) {
+        if (f.k != Implicit) continue;
+        auto& se = out.series[f.at];
+        const int G = 160;
+        std::vector<double> F((G + 1) * (G + 1));
+        auto X = [&](int i) { return out.x0 + (out.x1 - out.x0) * i / G; };
+        auto Y = [&](int j) { return out.y0 + (out.y1 - out.y0) * j / G; };
+        for (int j = 0; j <= G; j++)
+            for (int i = 0; i <= G; i++) F[j * (G + 1) + i] = at(f.a[0], {{"x", Fl(X(i))}, {"y", Fl(Y(j))}});
+        for (int j = 0; j < G; j++)
+            for (int i = 0; i < G; i++) {
+                double c[4] = {F[j * (G + 1) + i], F[j * (G + 1) + i + 1], F[(j + 1) * (G + 1) + i + 1], F[(j + 1) * (G + 1) + i]};
+                double px[4] = {X(i), X(i + 1), X(i + 1), X(i)}, py[4] = {Y(j), Y(j), Y(j + 1), Y(j + 1)};
+                if (std::any_of(c, c + 4, [](double v) { return !std::isfinite(v); })) continue;
+                std::vector<std::pair<double, double>> cross;
+                for (int e = 0; e < 4; e++) {
+                    double a = c[e], b = c[(e + 1) % 4];
+                    if ((a < 0) != (b < 0)) {
+                        double t = a / (a - b);
+                        // a sign change across a pole (tan, 1/x) isn't a crossing: the values are huge, not near 0
+                        if (std::fabs(a) + std::fabs(b) > 1e6) continue;
+                        cross.push_back({px[e] + t * (px[(e + 1) % 4] - px[e]), py[e] + t * (py[(e + 1) % 4] - py[e])});
+                    }
+                }
+                for (size_t m = 0; m + 1 < cross.size(); m += 2) {
+                    se.pts.push_back(cross[m]);
+                    se.pts.push_back(cross[m + 1]);
+                    se.pts.push_back({cross[m].first, NAN});
+                }
+            }
+        if (se.pts.empty() && out.error.empty()) out.error = "No points of " + se.label + " in view";
     }
     return out;
 }

@@ -1,6 +1,8 @@
 // LaTeX export: an article with amsmath; lists, quotes and tables become environments, plots become pgfplots with the
 // same sampled points the app draws, images \includegraphics.
 #include "math.hpp"
+#include <array>
+#include <bit>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -8,6 +10,29 @@
 #include <iterator>
 
 namespace om {
+
+// equation tags and references for export: the tag dropped, each [#ref] as its number "(n)"
+static Row eqPlain(const Row& row, const std::map<std::string, int>& nums) {
+    auto refs = eqRefs(row);
+    auto tag = eqTag(row);
+    if (refs.empty() && tag.first < 0) return row;
+    Row out;
+    int end = tag.first >= 0 ? tag.first - 1 : int(row.size());
+    for (int j = 0; j < end;) {
+        auto r = std::find_if(refs.begin(), refs.end(), [&](auto sp) { return sp.first == j; });
+        if (r == refs.end()) { out.push_back(row[j++]); continue; }
+        auto f = nums.find(eqName(row, *r));
+        for (char c : "(" + (f == nums.end() ? std::string("?") : std::to_string(f->second)) + ")") out.push_back(ch(std::string(1, c), false));
+        j = r->second;
+    }
+    return out;
+}
+static std::string eqNum(const Row& row, const std::map<std::string, int>& nums) {
+    auto t = eqTag(row);
+    if (t.first < 0) return "";
+    auto f = nums.find(eqName(row, t));
+    return f == nums.end() ? "" : "(" + std::to_string(f->second) + ")";
+}
 
 static std::string num(double x) {
     if (!std::isfinite(x)) return "nan";
@@ -53,10 +78,14 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
         env = e;
     };
     const Doc& doc = ed.doc;
+    auto nums = eqNumbers(doc);
     for (size_t k = 0; k < doc.size(); k++) {
-        const Row& row = doc[k];
+        bool eqs = eqTag(doc[k]).first >= 0 || !eqRefs(doc[k]).empty();  // copy only then: plots find their line by address
+        Row plainRow = eqs ? eqPlain(doc[k], nums) : Row{};
+        const Row& row = eqs ? plainRow : doc[k];
         LineStyle ls = lineStyle(row);
         std::string body = latexText(row, ls.len, int(row.size()));
+        if (std::string n = eqNum(doc[k], nums); !n.empty()) body += "\\hfill" + n;  // text with math; display math gets \tag
         switch (ls.kind) {
         case Line::H1: open(""); out += "\\section*{" + body + "}\n"; break;
         case Line::H2: open(""); out += "\\subsection*{" + body + "}\n"; break;
@@ -90,13 +119,39 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
         case Line::Plot: {
             open("");
             Plot pl = plot(ed, row);
-            if (pl.series.empty()) { out += "\\texttt{" + esc(plain(row)) + "}\n\n"; break; }
             static const char* COLS[] = {"blue", "red", "green!60!black", "orange", "violet", "teal"};
+            if (pl.is3d()) {  // pgfplots 3D: a faceted surface (every other grid point) and space curves
+                out += "\\begin{center}\n\\begin{tikzpicture}\n\\begin{axis}[width=0.8\\linewidth, height=7cm, view={-37}{30}, "
+                       "colormap/viridis, unbounded coords=jump, xlabel=$x$, ylabel=$y$, zlabel=$z$, xmin=" + num(pl.x0) + ", xmax=" +
+                       num(pl.x1) + ", ymin=" + num(pl.y0) + ", ymax=" + num(pl.y1) + ", zmin=" + num(pl.z0) + ", zmax=" + num(pl.z1) + "]\n";
+                for (auto& sf : pl.surfaces) {
+                    int rows = 0;
+                    std::string pts;
+                    for (int j = 0; j < sf.n; j += 2, rows++)
+                        for (int i = 0; i < sf.n; i += 2) {
+                            double z = sf.z[j * sf.n + i];
+                            pts += "(" + num(pl.x0 + (pl.x1 - pl.x0) * i / (sf.n - 1)) + "," + num(pl.y0 + (pl.y1 - pl.y0) * j / (sf.n - 1)) + "," +
+                                   num(std::isfinite(z) ? std::clamp(z, pl.z0, pl.z1) : z) + ")";
+                        }
+                    out += "\\addplot3[surf, shader=faceted, mesh/rows=" + std::to_string(rows) + "] coordinates {" + pts + "};\n";
+                }
+                for (size_t c = 0; c < pl.curves.size(); c++) {
+                    out += "\\addplot3[thick, no markers, color=" + std::string(COLS[c % 6]) + "] coordinates {";
+                    for (size_t i = 0; i < pl.curves[c].pts.size(); i += 2) {
+                        auto& q = pl.curves[c].pts[i];
+                        out += "(" + num(q[0]) + "," + num(q[1]) + "," + num(q[2]) + ")";
+                    }
+                    out += "};\n";
+                }
+                out += "\\end{axis}\n\\end{tikzpicture}\n\\end{center}\n\n";
+                break;
+            }
+            if (pl.series.empty()) { out += "\\texttt{" + esc(plain(row)) + "}\n\n"; break; }
             double span = pl.y1 - pl.y0;
             out += "\\begin{center}\n\\begin{tikzpicture}\n\\begin{axis}[width=0.8\\linewidth, height=6.5cm, grid=major, "
                    "grid style={gray!25}, unbounded coords=jump, no markers, xmin=" + num(pl.x0) + ", xmax=" + num(pl.x1) +
                    ", ymin=" + num(pl.y0) + ", ymax=" + num(pl.y1) + ", restrict y to domain=" + num(pl.y0 - 4 * span) + ":" +
-                   num(pl.y1 + 4 * span) + ", legend pos=outer north east, legend style={draw=none}]\n";
+                   num(pl.y1 + 4 * span) + ", legend style={at={(0.5,-0.18)}, anchor=north, draw=none, legend columns=2, column sep=1em}]\n";
             for (size_t s = 0; s < pl.series.size(); s++) {
                 out += "\\addplot[" + std::string(pl.series[s].points ? "only marks, mark=*" : "thick") + ", color=" + COLS[s % 6] +
                        "] coordinates {";
@@ -136,7 +191,8 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
             if (a == int(row.size())) { out += "\n"; break; }
             auto mask = mathMask(row, true);
             bool allMath = std::all_of(mask.begin() + a, mask.end(), [](bool m) { return m; });
-            if (allMath) out += "\\[ " + tex(Row(row.begin() + a, row.end())) + " \\]\n\n";  // a line of only math is displayed
+            std::string n = eqNum(doc[k], nums);
+            if (allMath) out += "\\[ " + tex(Row(row.begin() + a, row.end())) + (n.empty() ? "" : " \\tag{" + n.substr(1, n.size() - 2) + "}") + " \\]\n\n";  // a line of only math is displayed
             else out += body + "\n\n";
         }
         }
@@ -146,23 +202,6 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
 }
 
 // ---------- HTML ----------
-static std::string base64(const std::string& in) {
-    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    size_t i = 0;
-    for (; i + 2 < in.size(); i += 3) {
-        unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8 | (unsigned char)in[i + 2];
-        out += {T[v >> 18], T[v >> 12 & 63], T[v >> 6 & 63], T[v & 63]};
-    }
-    if (i + 1 == in.size()) {
-        unsigned v = (unsigned char)in[i] << 16;
-        out += {T[v >> 18], T[v >> 12 & 63], '=', '='};
-    } else if (i + 2 == in.size()) {
-        unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8;
-        out += {T[v >> 18], T[v >> 12 & 63], T[v >> 6 & 63], '='};
-    }
-    return out;
-}
 
 static std::string htmlEsc(const std::string& s) {
     std::string out;
@@ -208,7 +247,76 @@ static std::string htmlText(const Row& row, int a, int b) {
     return out;
 }
 
+// a 3D plot as SVG: the app's default view (yaw −0.65, pitch 0.45), quads far to near
+static std::string svgPlot3D(const Plot& pl) {
+    const double W = 640, H = 420, cy0 = std::cos(-0.65), sy0 = std::sin(-0.65), cp = std::cos(0.45), sp = std::sin(0.45), sc = 150;
+    auto view = [&](double X, double Y, double Z) {  // box coordinates in [-1, 1] -> screen x, y, depth
+        double nx = (X - pl.x0) / (pl.x1 - pl.x0) * 2 - 1, ny = (Y - pl.y0) / (pl.y1 - pl.y0) * 2 - 1, nz = ((Z - pl.z0) / (pl.z1 - pl.z0) * 2 - 1) * 0.75;
+        double rx = nx * cy0 - ny * sy0, ry = nx * sy0 + ny * cy0;
+        return std::array<double, 3>{W / 2 + rx * sc, H / 2 + 10 - (nz * cp + ry * sp) * sc, -ry * cp + nz * sp};
+    };
+    std::string s = "<svg viewBox=\"0 0 640 420\" class=plot>";
+    for (int a = 0; a < 8; a++)  // the box
+        for (int b = a + 1; b < 8; b++)
+            if (std::popcount(unsigned(a ^ b)) == 1) {
+                auto P = [&](int i) { return view(i & 1 ? pl.x1 : pl.x0, i & 2 ? pl.y1 : pl.y0, i & 4 ? pl.z1 : pl.z0); };
+                auto p = P(a), q = P(b);
+                s += "<line x1=\"" + num(p[0]) + "\" y1=\"" + num(p[1]) + "\" x2=\"" + num(q[0]) + "\" y2=\"" + num(q[1]) + "\" class=grid />";
+            }
+    struct Quad {
+        double depth;
+        std::string svg;
+    };
+    std::vector<Quad> quads;
+    static const double RAMP[5][3] = {{68, 1, 84}, {59, 82, 139}, {33, 145, 140}, {94, 201, 98}, {253, 231, 37}};
+    for (auto& sf : pl.surfaces) {
+        int n = sf.n, st = 2;
+        for (int j = 0; j + st < n; j += st)
+            for (int i = 0; i + st < n; i += st) {
+                int I[4] = {i, i + st, i + st, i}, J[4] = {j, j, j + st, j + st};
+                double zsum = 0, d = 0;
+                std::string pts;
+                bool ok = true;
+                for (int m = 0; m < 4; m++) {
+                    double z = sf.z[J[m] * n + I[m]];
+                    if (!std::isfinite(z)) { ok = false; break; }
+                    z = std::clamp(z, pl.z0, pl.z1);
+                    zsum += z;
+                    auto v = view(pl.x0 + (pl.x1 - pl.x0) * I[m] / (n - 1), pl.y0 + (pl.y1 - pl.y0) * J[m] / (n - 1), z);
+                    pts += num(v[0]) + "," + num(v[1]) + " ";
+                    d += v[2];
+                }
+                if (!ok) continue;
+                double t = std::clamp((zsum / 4 - pl.z0) / (pl.z1 - pl.z0), 0.0, 0.9999) * 4, f = t - int(t);
+                const double *a = RAMP[int(t)], *b = RAMP[int(t) + 1];
+                char col[16];
+                std::snprintf(col, sizeof col, "#%02x%02x%02x", int(a[0] + (b[0] - a[0]) * f), int(a[1] + (b[1] - a[1]) * f), int(a[2] + (b[2] - a[2]) * f));
+                quads.push_back({d, "<polygon points=\"" + pts + "\" fill=\"" + col + "\" stroke=\"rgba(0,0,0,.15)\" stroke-width=\"0.5\" />"});
+            }
+    }
+    std::sort(quads.begin(), quads.end(), [](auto& a, auto& b) { return a.depth < b.depth; });
+    for (auto& q : quads) s += q.svg;
+    static const char* COLS[] = {"#3b82f6", "#e5484d", "#2f9e5b", "#f59e0b", "#8b5cf6", "#14b8a6"};
+    for (size_t c = 0; c < pl.curves.size(); c++) {
+        std::string d;
+        bool pen = false;
+        for (auto& q : pl.curves[c].pts) {
+            if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2])) { pen = false; continue; }
+            auto v = view(q[0], q[1], std::clamp(q[2], pl.z0, pl.z1));
+            d += (pen ? "L" : "M") + num(v[0]) + " " + num(v[1]) + " ";
+            pen = true;
+        }
+        s += "<path d=\"" + d + "\" stroke=\"" + COLS[c % 6] + "\" fill=\"none\" stroke-width=\"2.2\" />";
+    }
+    int k = 0;
+    for (auto& sf : pl.surfaces) s += "<text x=\"14\" y=\"" + num(24 + 18 * k++) + "\">z = " + htmlEsc(sf.label) + "</text>";
+    for (size_t c = 0; c < pl.curves.size(); c++)
+        s += "<text x=\"14\" y=\"" + num(24 + 18 * k++) + "\" style=\"fill:" + COLS[c % 6] + "\">— " + htmlEsc(pl.curves[c].label) + "</text>";
+    return s + "</svg>";
+}
+
 static std::string svgPlot(const Plot& pl) {
+    if (pl.is3d()) return svgPlot3D(pl);
     static const char* COLS[] = {"#3b82f6", "#e5484d", "#2f9e5b", "#f59e0b", "#8b5cf6", "#14b8a6"};
     const double W = 640, H = 340, L = 44, R = 10, T = 10, B = 26;
     auto X = [&](double v) { return L + (v - pl.x0) / (pl.x1 - pl.x0) * (W - L - R); };
@@ -268,7 +376,7 @@ table { border-collapse: collapse; margin: .6em 0; } td, th { border: 1px solid 
 th { background: var(--side); } img { max-width: 100%; border-radius: 6px; } figure { margin: 1em 0; } figcaption { color: var(--muted); font-size: .9em; }
 code { font-family: "JetBrains Mono", monospace; background: var(--side); padding: 0 4px; border-radius: 4px; }
 mark { background: #facc1566; color: inherit; } .r { color: #e5484d; } .g { color: #2f9e5b; } .b { color: #3b82f6; }
-.link { color: #3b82f6; } li.done { text-decoration: line-through; color: var(--muted); }
+.link { color: #3b82f6; } .eqn { float: right; } li.done { text-decoration: line-through; color: var(--muted); }
 .plot { width: 100%; background: var(--side); border-radius: 8px; } .plot text { font-size: 12px; fill: var(--muted); }
 .plot .grid { stroke: var(--line); } ul.todo { list-style: none; padding-left: 1.2em; }
 </style></head><body>
@@ -285,10 +393,14 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
         env = e;
     };
     const Doc& doc = ed.doc;
+    auto nums = eqNumbers(doc);
     for (size_t k = 0; k < doc.size(); k++) {
-        const Row& row = doc[k];
+        bool eqs = eqTag(doc[k]).first >= 0 || !eqRefs(doc[k]).empty();  // copy only then: plots find their line by address
+        Row plainRow = eqs ? eqPlain(doc[k], nums) : Row{};
+        const Row& row = eqs ? plainRow : doc[k];
         LineStyle ls = lineStyle(row);
         std::string body = htmlText(row, ls.len, int(row.size()));
+        if (std::string n = eqNum(doc[k], nums); !n.empty()) body = "<span class=eqn>" + n + "</span>" + body;
         switch (ls.kind) {
         case Line::H1: open(""); out += "<h1>" + body + "</h1>\n"; break;
         case Line::H2: open(""); out += "<h2>" + body + "</h2>\n"; break;
@@ -322,7 +434,7 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
             open("");
             Plot pl = plot(ed, row);
             out += "<p>" + body + "</p>\n";
-            if (!pl.series.empty()) out += svgPlot(pl) + "\n";
+            if (!pl.series.empty() || pl.is3d()) out += svgPlot(pl) + "\n";
             break;
         }
         case Line::Table: {
@@ -350,7 +462,7 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
             if (a == int(row.size())) break;
             auto mask = mathMask(row, true);
             if (std::all_of(mask.begin() + a, mask.end(), [](bool m) { return m; }))
-                out += "<p>\\[" + htmlEsc(tex(Row(row.begin() + a, row.end()))) + "\\]</p>\n";
+                out += "<p>\\[" + htmlEsc(tex(Row(row.begin() + a, row.end())) + (eqNum(doc[k], nums).empty() ? "" : " \\tag{" + eqNum(doc[k], nums).substr(1, eqNum(doc[k], nums).size() - 2) + "}")) + "\\]</p>\n";
             else out += "<p>" + body + "</p>\n";
         }
         }
