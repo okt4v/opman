@@ -30,6 +30,8 @@ struct Entry {
     Item make;
     std::string cat;
     std::optional<Row> insert;
+    int eraseBack = 0;       // items before the cursor it replaces
+    std::vector<Row> below;  // whole lines it adds under this one (showing the working)
 };
 
 // how completion behaves (Settings > Autocomplete)

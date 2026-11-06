@@ -362,8 +362,18 @@ void Editor::applySuggestion(const Entry& e) {
         return insertChar(" ");
     }
     if (!e.insert) return insertNode(e.make);
+    if (e.eraseBack) {
+        cur.row->erase(cur.row->begin() + (cur.i - e.eraseBack), cur.row->begin() + cur.i);
+        cur.i -= e.eraseBack;
+    }
     cur.row->insert(cur.row->begin() + cur.i, e.insert->begin(), e.insert->end());
     cur.i += int(e.insert->size());
+    if (!e.below.empty() && !inSlot()) {
+        int k = lineOf(cur.row);
+        doc.insert(doc.begin() + k + 1, e.below.begin(), e.below.end());
+        Row& last = doc[k + e.below.size()];
+        cur = {&last, int(last.size())};
+    }
     reindex();
 }
 

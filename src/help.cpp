@@ -76,7 +76,7 @@ Write [[Other note]] to link to a note by title. Ctrl-click it, or press Enter o
 `_` a subscript
 `sqrt` a square root (type sqrt, or pick it from the popup)
 `( [ { |` brackets that grow with their contents; |x| is an absolute value
-`|` after an equation: a transformation step, 2x = 4 | :2 (also | −1, | ·3, | √). It is shown set apart and never calculated; write the result on the next line
+`|` after an equation: a transformation step, 2x = 4 | :2 (also | −1, | ·3, | √). It is shown set apart and never calculated. On the empty line below, Tab writes what it gives; a line that doesn't follow from it is flagged in red
 `{` a set, for a solution set (Lösungsmenge): L = {2; 3; 5}. Inside braces | is "such that": L = {x | x > 0}. Type } at the end to leave them
 `Tab` leave the current slot (fraction part, exponent…) and continue after it
 `Shift-Space` `Shift-Enter` add a column / a row to a matrix
@@ -117,6 +117,7 @@ Type = after an expression and the popup offers:
 - "Fill in the steps": every step written out
 - for algebra, "Expand and simplify": (x + 1)^2 = x² + 2x + 1
 Type ⇒ (type =>) after an equation for its solutions: x^2 − 5x + 6 = 0 ⇒ x = 2 or x = 3.
+The popup also offers "Show the working" for linear and quadratic equations: the steps written out line by line, the quadratic ones with the pq formula. f′(x) = offers it for polynomials, term by term.
 
 ## Calculus
 - Derivatives: define f(x) = x^3, then f'(2) = 12, f''(x)…

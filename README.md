@@ -87,6 +87,10 @@ Also:
 - **Tables** move like a spreadsheet: ←/→ go to the next cell, ↑/↓ keep the column, clicks on borders land in a cell.
 - **Transformation steps**: `2x = 4 | :2` in math, a space then `|` after an equation, marks the step
   (`\qquad|\;` in LaTeX); it's shown dimmed and never calculated. `2 = |x|` stays an absolute value.
+  On the empty line under a step, Tab writes what it gives (`x = 2`). A line that doesn't follow from the step above is
+  flagged in red; a line about other variables isn't compared. After `3x + 1 = 7 ⇒` (type `=>`) the popup also offers
+  **Show the working**: the steps written out, for linear and quadratic equations (pq formula). `f′(x) =` offers it too,
+  term by term, for polynomials.
 - **Sets**: `{` in math makes growing braces, for a solution set `L = {2; 3; 5}` or `L = {x | x > 0}` (`\{ … \}`,
   `\mid` in LaTeX).
 - **Decimal comma**: Settings > Math > Numbers (`:set comma`): `2,5` is a number and `;` separates arguments, as in

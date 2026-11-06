@@ -274,7 +274,7 @@ void Vi::insertKey(Editor& ed, const Key& k) {
     case Key::Tab:
         if (n && (items[0].insert || navigated || items[ed.pick].cat == "Program" || (completeOpts.accept != 0 && enterPicks(ed))))
             pickItem(ed, ed.pick);
-        else if (auto g = ghostHere(); g && !k.shift) {
+        else if (auto g = ghostHere(); g && !g->warn && !k.shift) {
             if (auto t = eqTag(*ed.cur.row); t.first >= 0 && !ed.inSlot()) ed.cur.i = t.first - 1;  // before the "#tag"
             ed.insertItems(g->insert);
         }

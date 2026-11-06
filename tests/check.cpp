@@ -154,7 +154,7 @@ static void checkCorca() {
     newLine(); type("f"); pick("Variable f"); type("'(3) =");
     CHECK_EQ(names()[0], "= 6");
     newLine(); type("f"); pick("Variable f"); type("'(t) =");
-    CHECK_EQ(names(), (std::vector<std::string>{"Expand and simplify"}));
+    CHECK_EQ(names(), (std::vector<std::string>{"Expand and simplify", "Show the working"}));
     pick("Expand and simplify");
     CHECK(noSpaces(line()).ends_with("=2t$"));
 
@@ -167,7 +167,7 @@ static void checkCorca() {
     newLine(); type("x"); pick("Variable x"); type("^2-4 = 0 =>");
     CHECK_EQ(names()[0], "x = -2, x = 2");
     newLine(); type("x"); pick("Variable x"); type("^2 = 2 =>");
-    CHECK_EQ(names(), (std::vector<std::string>{"x = ± √2", "x = -1.414213562, x = 1.414213562"}));
+    CHECK_EQ(names(), (std::vector<std::string>{"x = ± √2", "x = -1.414213562, x = 1.414213562", "Show the working"}));
     newLine(); type("3x + 1 = 7 =>");
     CHECK_EQ(names()[0], "x = 2");
     newLine(); type("cos"); pick("cos"); type("(x) = x =>");
@@ -943,6 +943,77 @@ static void checkVi() {
         size_t table = std::stoul(pdf.substr(x));
         CHECK(pdf.compare(table, 4, "xref") == 0);
         CHECK(pdf.compare(std::stoul(pdf.substr(table + pdf.substr(table).find("\n", 8) + 21, 10)), 7, "1 0 obj") == 0);
+    }
+
+    // equation steps: Tab under a step writes what it gives; a line that doesn't follow is flagged
+    {
+        Editor e;
+        Vi v;
+        auto next = [&](const std::string& line) {  // type a step line; returns the ghost on the empty line under it
+            keys(e, v, "cc<C-m>" + line + "<C-m><Esc>o<Esc>");
+            auto g = ghost(e, e.doc.back());
+            return g ? g->text : std::string("-");
+        };
+        CHECK_EQ(next("2x = 4 |:2"), "x = 2");
+        CHECK_EQ(next("3x + 1 = 7 |−1"), "3x = 6");
+        CHECK_EQ(next("x/2 = 3 |*2"), "x = 6");
+        CHECK_EQ(next("x + 2 = 2x |−x"), "2 = x");
+        CHECK_EQ(next("x^2<Right> = 9 |sqrt<Tab>"), "-");
+        auto rows = [&](const std::string& a, const std::string& b) {
+            Editor f;
+            Vi w;
+            keys(f, w, "i<C-m>" + a + "<CR>" + b + "<Esc>");
+            auto g = ghost(f, f.doc[1]);
+            return g && g->warn;
+        };
+        CHECK(rows("2x = 4 |:2", "x = 3"));
+        CHECK(!rows("2x = 4 |:2", "x = 2"));
+        CHECK(rows("3x + 1 = 7 |−1", "3x = 8"));
+        CHECK(!rows("3x + 1 = 7 |−1", "3x = 6"));
+        CHECK(!rows("3x + 1 = 7 |−1", "6x = 12"));  // two steps at once is still right
+        CHECK(!rows("x = 2", "x = 3"));             // no step, no claim that they're related
+        CHECK(!rows("2x = 4 |:2", "y = 3"));        // a different unknown: a new exercise, not a mistake
+        // ⇒ offers the working: steps on the lines, the bar in place of the ⇒
+        Editor f;
+        Vi w;
+        keys(f, w, "i<C-m>3x + 1 = 7 =>");
+        CHECK(w.items.size() == 2 && w.items[1].name == "Show the working");
+        keys(f, w, "<C-2>");
+        CHECK_EQ(int(f.doc.size()), 3);
+        CHECK_EQ(noSpaces(plain(f.doc[0])), "3x+1=7|−1");
+        CHECK_EQ(noSpaces(plain(f.doc[1])), "3x=6|:3");
+        CHECK_EQ(noSpaces(plain(f.doc[2])), "x=2");
+        CHECK(stepBar(f.doc[0]) > 0 && stepBar(f.doc[1]) > 0);
+        Editor g;
+        Vi y;
+        keys(g, y, "i<C-m>x^2<Right> − 5x + 6 = 0 =><C-2>");
+        CHECK_EQ(noSpaces(plain(g.doc.back())), "x_1=2;x_2=3");
+        Editor h;
+        Vi z;
+        keys(h, z, "i<C-m>x^2<Right> = 9 =><C-2>");
+        CHECK_EQ(noSpaces(plain(h.doc.back())), "x=±3");
+        Editor m;
+        Vi n;
+        keys(m, n, "i<C-m>x = 3<CR>x^2<Right> = 2 =>");
+        CHECK_EQ(int(n.items.size()), 3);
+        keys(m, n, "<C-3>");
+        CHECK_EQ(noSpaces(plain(m.doc.back())), "x=±√2");
+        Editor o;  // a line above that isn't a value (x = 1 ± 2) doesn't stop solving
+        Vi r;
+        keys(o, r, "i<C-m>x = 1 ±2<CR>x + 1 = 5 =>");
+        CHECK(!r.items.empty() && r.items[0].name == "x = 4");
+        Editor k;  // x already has a value above: solving treats it as the unknown again
+        Vi q;
+        keys(k, q, "i<C-m>x = 2<CR>x + 1 = 5 =>");
+        CHECK_EQ(q.items[0].name, "x = 4");
+        keys(k, q, "<C-2>");
+        CHECK_EQ(noSpaces(plain(k.doc.back())), "x=4");
+        Editor d;
+        Vi u;
+        keys(d, u, "i<C-m>f(x) = x^3<Right> + 2x <CR>f′(x) =");
+        bool has = false;
+        for (auto& it : u.items) has = has || it.name == "Show the working";
+        CHECK(has);
     }
 
     // matrices in insert mode: Shift+Space grows a column, Shift+Enter a row

@@ -1727,10 +1727,10 @@ struct App {
             }
             float w = b.w;
             if (!printMode && k < ghosts.size() && ghosts[k]) {
-                L.drawText(ghosts[k]->text, x0 + b.w + 0.5f * L.textSize, base, L.textSize * 0.9f, alpha(p.muted, 0.85f));
+                L.drawText(ghosts[k]->text, x0 + b.w + 0.5f * L.textSize, base, L.textSize * 0.9f, ghosts[k]->warn ? IM_COL32(0xe5, 0x48, 0x4d, 255) : alpha(p.muted, 0.85f));
                 w += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
             }
-            if (kind == Line::Text && sliders && !printMode) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
+            if (kind == Line::Text && sliders && !printMode && !(k > 0 && stepBar(ed.doc[k - 1]) >= 0)) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
             maxW = std::max(maxW, w);
             y += h;
         }

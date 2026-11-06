@@ -24,6 +24,7 @@ std::vector<Entry> evalSuggestions(Editor& ed);
 struct Ghost {
     std::string text;
     Row insert;
+    bool warn = false;  // not a result: this line doesn't follow from the transformation step above it
 };
 std::optional<Ghost> ghost(Editor& ed, const Row& row);
 

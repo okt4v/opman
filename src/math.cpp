@@ -1459,8 +1459,11 @@ std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
     for (size_t k = 0; k < seg.size(); k++)
         if (isRel(&seg[k])) { eq = int(k); break; }
     if (eq < 0) return {};
-    Ast diff = subst(bin("-", parse(Row(seg.begin(), seg.begin() + eq)), parse(Row(seg.begin() + eq + 1, seg.end()))));
+    Ast written = bin("-", parse(Row(seg.begin(), seg.begin() + eq)), parse(Row(seg.begin() + eq + 1, seg.end())));
+    Ast diff = written;
+    try { diff = subst(written); } catch (...) {}  // a name above that has no value (x = 1 ± 2)
     auto vars = freeVars(diff);
+    if (vars.empty()) diff = written, vars = freeVars(diff);  // "x = 2" above: ⇒ still means x is the unknown here
     if (vars.size() != 1) return {};
     std::string v = vars[0];
     auto answer = [&](const std::vector<Value>& roots) {
@@ -1532,6 +1535,338 @@ bool unitStartsWith(const std::string& c) {
     return false;
 }
 
+// ---------- equation steps: "2x = 4 |:2", what it gives, and writing out how an equation is solved ----------
+namespace {
+using EqPolys = std::pair<Poly, Poly>;
+
+// a line's equation (before any step or #tag) as two polynomials; nothing if it isn't one. Names stay names, whatever
+// they're defined as: a step works on what's written
+std::optional<EqPolys> eqPolys(const Row& row) {
+    int end = stepBar(row) >= 0 ? stepBar(row) : eqTag(row).first >= 0 ? eqTag(row).first : int(row.size()), eq = -1;
+    for (int j = 0; j < end; j++)
+        if (isRel(&row[j])) {
+            if (eq >= 0 || row[j].c != "=") return std::nullopt;
+            eq = j;
+        }
+    if (eq < 0) return std::nullopt;
+    try {
+        return EqPolys{poly(parse(Row(row.begin(), row.begin() + eq))), poly(parse(Row(row.begin() + eq + 1, row.begin() + end)))};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+Row eqItems(const Poly& l, const Poly& r) {
+    return cat(cat(toItems(polyToAst(l)), {M(" "), M("="), M(" ")}), toItems(polyToAst(r)));
+}
+
+// p / d, when d is one term that divides every term of p
+std::optional<Poly> pdivTerm(const Poly& p, const Poly& d) {
+    if (d.size() != 1 || isZero(d.begin()->second)) return std::nullopt;
+    auto& [dk, dc] = *d.begin();
+    Poly out;
+    for (auto& [k, c] : p) {
+        std::map<std::string, int> m(k.begin(), k.end());
+        for (auto& [n, e] : dk) {
+            auto f = m.find(n);
+            if (f == m.end() || f->second < e) return std::nullopt;
+            if ((f->second -= e) == 0) m.erase(f);
+        }
+        pput(out, Mono(m.begin(), m.end()), div(c, dc));
+    }
+    return out;
+}
+
+// x² = 9 under |√: x = ±3
+std::optional<Row> rootLine(const EqPolys& e) {
+    auto& [l, r] = e;
+    if (l.size() != 1 || l.begin()->first.size() != 1 || l.begin()->first[0].second % 2 || !(exact(l.begin()->second) && l.begin()->second.n == 1 && l.begin()->second.d == 1)) return std::nullopt;
+    Value c = Q(0);
+    try { c = constOf(r); } catch (...) { return std::nullopt; }
+    if (val(c) < 0) return std::nullopt;
+    auto& [name, power] = l.begin()->first[0];
+    Row out = cat(toItems(polyToAst({{Mono{{name, power / 2}}, Q(1)}})), {M(" "), M("="), M(" ")});
+    if (isZero(c)) return cat(out, {M("0")});
+    out.push_back(sym("±", "\\pm"));
+    if (auto root = exact(c) ? exactFn("sqrt", c) : std::nullopt) return cat(out, numItems(*root));
+    Item sq = node(T::Sqrt);
+    sq.s[0] = numItems(c);
+    out.push_back(sq);
+    return out;
+}
+
+// what a step does to an equation; a |√ gives a line rather than polynomials
+struct StepResult {
+    std::optional<EqPolys> eq;
+    std::optional<Row> line;
+};
+std::optional<StepResult> applyStep(const EqPolys& e, const Row& line) {
+    Row step;
+    int end = eqTag(line).first >= 0 ? eqTag(line).first : int(line.size());
+    for (int j = stepBar(line) + 1; j < end; j++)
+        if (!isSpace(line[j])) step.push_back(line[j]);
+    if (step.empty()) return std::nullopt;
+    const Item& first = step[0];
+    if (first.t == T::Sqrt && first.s[0].empty() && step.size() == 1) {
+        if (auto r = rootLine(e)) return StepResult{std::nullopt, r};
+        return std::nullopt;
+    }
+    auto& [l, r] = e;
+    if (first.t == T::Sup && step.size() == 1 && plain(first.s[0]) == "2") return StepResult{EqPolys{pmul(l, l), pmul(r, r)}, std::nullopt};
+    try {
+        Row rest(step.begin() + 1, step.end());
+        auto over = [&](const Poly& d) -> std::optional<StepResult> {
+            auto a = pdivTerm(l, d), b = pdivTerm(r, d);
+            if (!a || !b) return std::nullopt;
+            return StepResult{EqPolys{*a, *b}, std::nullopt};
+        };
+        if (first.t == T::Frac && first.s[0].empty() && rest.empty()) return over(poly(parse(first.s[1])));  // "/" typed alone is an empty fraction
+        const std::string& c = first.c;
+        if (first.t != T::Ch && first.t != T::Sym) return std::nullopt;
+        if (rest.empty()) return std::nullopt;
+        Poly by = poly(parse(rest));
+        if (c == ":" || c == "/" || c == "÷") return over(by);
+        if (c == "*" || c == "·" || c == "⋅" || c == "×") return StepResult{EqPolys{pmul(l, by), pmul(r, by)}, std::nullopt};
+        if (c == "+") return StepResult{EqPolys{padd(l, by), padd(r, by)}, std::nullopt};
+        if (c == "-" || c == "−") return StepResult{EqPolys{padd(l, by, -1), padd(r, by, -1)}, std::nullopt};
+    } catch (...) {}
+    return std::nullopt;
+}
+
+// the same equation up to a factor?
+bool proportional(const EqPolys& a, const EqPolys& b) {
+    Poly x = padd(a.first, a.second, -1), y = padd(b.first, b.second, -1);
+    if (x.size() != y.size()) return false;
+    if (x.empty()) return true;
+    double ratio = 0;
+    for (auto& [k, c] : x) {
+        auto f = y.find(k);
+        if (f == y.end() || val(c) == 0) return false;
+        double t = val(f->second) / val(c);
+        if (ratio != 0 && std::fabs(t - ratio) > 1e-9 * std::fabs(ratio)) return false;
+        ratio = t;
+    }
+    return true;
+}
+
+// "x = 3" under an equation: does that value solve it? (squaring or a |√ can lose or gain solutions, so a line needn't
+// be equivalent to be right)
+bool solvesIt(const EqPolys& line, const EqPolys& eq) {
+    Poly d = padd(line.first, line.second, -1), e = padd(eq.first, eq.second, -1);
+    std::string name;
+    Value a = Q(0), b = Q(0);
+    for (auto& [k, c] : d) {
+        if (k.empty()) b = c;
+        else if (k.size() == 1 && k[0].second == 1 && name.empty()) name = k[0].first, a = c;
+        else return false;
+    }
+    if (name.empty()) return false;
+    double x = -val(b) / val(a), sum = 0, size = 1;
+    for (auto& [k, c] : e) {
+        double t = val(c);
+        for (auto& [n, p] : k) {
+            if (n != name) return false;
+            t *= std::pow(x, p);
+        }
+        sum += t;
+        size = std::max(size, std::fabs(t));
+    }
+    return std::fabs(sum) < 1e-9 * size;
+}
+
+// Tab on the empty line under a step writes what it gives
+std::optional<Ghost> stepGhost(const Editor& ed, const Row& row) {
+    int k = ed.lineOf(&row);
+    if (k < 1 || stepBar(ed.doc[k - 1]) < 0) return std::nullopt;
+    const Row& above = ed.doc[k - 1];
+    auto eq = eqPolys(above);
+    if (!eq) return std::nullopt;
+    auto done = applyStep(*eq, above);
+    if (row.empty()) {
+        if (!done) return std::nullopt;
+        Row ins = done->line ? *done->line : eqItems(done->eq->first, done->eq->second);
+        return Ghost{plain(ins), ins};
+    }
+    auto now = eqPolys(row);
+    if (!now || proportional(*now, *eq) || solvesIt(*now, *eq) || (done && done->eq && proportional(*now, *done->eq))) return std::nullopt;
+    if (done && done->line) return std::nullopt;  // ±: "x = 3" was solvesIt's job, anything else can't be judged here
+    auto names = [](const EqPolys& p) {
+        std::set<std::string> out;
+        for (auto* side : {&p.first, &p.second})
+            for (auto& [k, c] : *side)
+                for (auto& [n, e] : k) out.insert(n);
+        return out;
+    };
+    auto was = names(*eq), is = names(*now);
+    if (std::none_of(is.begin(), is.end(), [&](auto& n) { return was.count(n) > 0; })) return std::nullopt;  // about something else
+    return Ghost{"≠ doesn't follow from the line above", {}, true};
+}
+
+Row barThen(Row op) { return cat({M(" "), sym("|", "\\qquad|\\;")}, op); }
+
+// "− 2x" or "+ 3": the step that takes this off both sides
+Row minusOp(const Poly& t) {
+    if (t.size() != 1) return {M("−"), paren("(", ")", toItems(polyToAst(t)))};
+    auto [k, c] = *t.begin();
+    bool negative = val(c) < 0;
+    return cat({M(negative ? "+" : "−")}, toItems(polyToAst({{k, negative ? neg(c) : c}})));
+}
+Row divOp(const Value& a) {
+    if (val(a) < 0) return {M(":"), paren("(", ")", numItems(a))};
+    return cat({M(":")}, numItems(a));
+}
+
+// how "3x + 1 = 7 ⇒" comes out, line by line; eraseBack takes the ⇒ away
+std::optional<Entry> workingEntry(const Row& seg, int eraseBack) {
+    int eq = -1;
+    for (size_t j = 0; j < seg.size(); j++)
+        if (isRel(&seg[j])) {
+            if (eq >= 0 || seg[j].c != "=") return std::nullopt;
+            eq = int(j);
+        }
+    if (eq < 0) return std::nullopt;
+    Ast ls = parse(Row(seg.begin(), seg.begin() + eq)), rs = parse(Row(seg.begin() + eq + 1, seg.end()));
+    Poly l, r;
+    try {
+        l = poly(subst(ls)), r = poly(subst(rs));
+    } catch (...) {  // a name above that has no value (x = 1 ± 2): as written
+        l = poly(ls), r = poly(rs);
+    }
+    Poly both = padd(l, r, -1);
+    std::set<std::string> names;
+    int deg = 0;
+    auto scan = [&] {
+        names.clear();
+        deg = 0;
+        for (auto& [k, c] : both) {
+            deg = std::max(deg, degree(k));
+            for (auto& [n, e] : k) names.insert(n);
+        }
+    };
+    scan();
+    if (names.empty()) {  // "x = 2" above: x is still the unknown here
+        l = poly(ls), r = poly(rs);
+        both = padd(l, r, -1);
+        scan();
+    }
+    if (names.size() != 1 || deg < 1 || deg > 2) return std::nullopt;
+    std::string v = *names.begin();
+    auto term = [&](const Poly& p, int e) {
+        auto f = p.find(e ? Mono{{v, e}} : Mono{});
+        return f == p.end() ? Q(0) : f->second;
+    };
+    auto only = [&](int e, const Value& c) { return Poly{{e ? Mono{{v, e}} : Mono{}, c}}; };
+    std::vector<Row> lines;  // the first is what follows the original equation: its step
+    Row pendingStep;
+    auto step = [&](Row op, Poly nl, Poly nr) {
+        if (lines.empty()) pendingStep = barThen(op);
+        else lines.back() = cat(lines.back(), barThen(op));
+        l = std::move(nl), r = std::move(nr);
+        lines.push_back(eqItems(l, r));
+    };
+    auto off = [&](const Poly& t) {
+        if (!t.empty()) step(minusOp(t), padd(l, t, -1), padd(r, t, -1));
+    };
+    auto divide = [&](const Value& a) {
+        if (exact(a) && a.n == 1 && a.d == 1) return;
+        Poly by = pconst(a);
+        step(divOp(a), *pdivTerm(l, by), *pdivTerm(r, by));
+    };
+    Value a2 = term(both, 2), b1 = term(both, 1);
+    if (deg == 1) {
+        if (Value x = term(r, 1); !isZero(x)) off(only(1, x));  // the unknown to the left
+        if (Value c = term(l, 0); !isZero(c)) off(only(0, c));  // the rest to the right
+        divide(term(l, 1));
+    } else if (isZero(b1)) {  // x² = 9
+        if (Value x = term(r, 2); !isZero(x)) off(only(2, x));
+        if (Value c = term(l, 0); !isZero(c)) off(only(0, c));
+        divide(term(l, 2));
+        Value s = term(r, 0);
+        if (val(s) < 0) lines.push_back({M("∅")});
+        else if (auto root = rootLine({l, r})) {
+            Item sq = node(T::Sqrt);
+            if (lines.empty()) pendingStep = barThen({sq});
+            else lines.back() = cat(lines.back(), barThen({sq}));
+            lines.push_back(*root);
+        }
+    } else {  // pq: x² + px + q = 0
+        off(r);
+        divide(term(l, 2));
+        Value p2 = div(term(l, 1), Q(2)), q = term(l, 0), center = neg(p2);
+        Value s = add(mul(p2, p2), neg(q));
+        Row x = {named(T::Var, v)}, pre = cat(x, {M(" "), M("="), M(" ")});
+        // x = −p/2 ± √((p/2)² − q)
+        Item sup = node(T::Sup);
+        sup.s[0] = {M("2")};
+        Row inside = val(p2) < 0 ? Row{paren("(", ")", numItems(p2)), sup} : cat(numItems(p2), {sup});
+        inside = cat(inside, val(q) < 0 ? Row{M("+")} : Row{M("−")});
+        inside = cat(inside, numItems(val(q) < 0 ? neg(q) : q));
+        Item sq = node(T::Sqrt);
+        sq.s[0] = inside;
+        Row formula = pre;
+        if (!isZero(center)) formula = cat(formula, numItems(center));
+        formula.push_back(sym("±", "\\pm"));
+        formula.push_back(sq);
+        lines.push_back(formula);
+        if (val(s) < 0) lines.push_back({M("∅")});
+        else {
+            std::optional<Value> root = exact(s) ? exactFn("sqrt", s) : std::nullopt;
+            Row line = pre;
+            if (!isZero(center)) line = cat(line, numItems(center));
+            line.push_back(sym("±", "\\pm"));
+            if (root) line = cat(line, numItems(*root));
+            else {
+                Item q2 = node(T::Sqrt);
+                q2.s[0] = numItems(s);
+                line.push_back(q2);
+            }
+            lines.push_back(line);
+            if (root) {
+                auto named12 = [&](const char* n, const Value& w) {
+                    Item sb = node(T::Sub);
+                    sb.s[0] = {M(n)};
+                    return cat(cat(x, {sb, M(" "), M("="), M(" ")}), numItems(w));
+                };
+                Row last = named12("1", add(center, neg(*root)));
+                if (!isZero(*root)) last = cat(cat(last, {M(";"), M(" ")}), named12("2", add(center, *root)));
+                lines.push_back(last);
+            }
+        }
+    }
+    if (lines.empty()) return std::nullopt;
+    Entry out = result("Show the working", "Steps", pendingStep);
+    out.eraseBack = eraseBack;
+    out.below = std::move(lines);
+    return out;
+}
+
+// f′(x) of a polynomial, term by term with the power rule
+std::optional<Entry> derivWorking(const Ast& ast, const Row& seg, const Row& lead) {
+    if (ast.k != Ast::Deriv || ast.order != 1 || ast.a[0].k != Ast::Var) return std::nullopt;
+    const std::string& x = ast.a[0].n;
+    Ast call = mk(Ast::Call, {var(x)}, ast.n);
+    Poly p = poly(subst(call));
+    std::vector<std::pair<Mono, Value>> terms(p.begin(), p.end());
+    std::stable_sort(terms.begin(), terms.end(), [](auto& a, auto& b) { return degree(a.first) > degree(b.first); });
+    std::optional<Ast> sum;
+    for (auto& [k, c] : terms) {
+        if (k.empty()) continue;
+        if (k.size() != 1 || k[0].first != x) return std::nullopt;
+        int e = k[0].second;
+        bool negative = val(c) < 0;
+        Value ac = negative ? neg(c) : c;
+        Ast t = num(Q(e));
+        if (!(exact(ac) && ac.n == 1 && ac.d == 1)) t = bin("*", num(ac), std::move(t));
+        if (e > 1) t = bin("*", std::move(t), e == 2 ? var(x) : bin("^", var(x), num(Q(e - 1))));
+        sum = !sum ? (negative ? mk(Ast::Neg, {std::move(t)}) : std::move(t)) : bin(negative ? "-" : "+", std::move(*sum), std::move(t));
+    }
+    if (!sum) return std::nullopt;
+    Entry out = result("Show the working", "Steps", cat(lead, toItems(*sum)));
+    out.below = {cat(cat(seg, {M(" "), M("="), M(" ")}), toItems(polyToAst(pderiv(p, x))))};
+    return out;
+}
+}  // namespace
+
 static std::vector<Entry> evalSuggestions0(Editor& ed) {
     ED = &ed;
     const Row& row = *ed.cur.row;
@@ -1549,7 +1884,11 @@ static std::vector<Entry> evalSuggestions0(Editor& ed) {
         if (last && impliesItem(*last)) {
             Row eqn = segmentBefore(row, j - 1, impliesItem);
             collectDefs(ed.topOf(ed.cur.row), defsUpto(&row, j - 1 - int(eqn.size())));
-            return solveSuggestions(eqn, lead);
+            auto out = solveSuggestions(eqn, lead);
+            try {
+                if (auto w = workingEntry(eqn, i - (j - 1)); w && !ed.inSlot()) out.push_back(std::move(*w));
+            } catch (...) {}
+            return out;
         }
         if (!(last && last->t == T::Ch && last->m && last->c == "=")) return {};
         Row seg = segmentBefore(row, j - 1, relItem);
@@ -1560,7 +1899,11 @@ static std::vector<Entry> evalSuggestions0(Editor& ed) {
             v = evaluate(ast);
         } catch (...) {
             try { return unitSuggestions(seg, lead); } catch (...) {}
-            return expandSuggestions(ast, lead);
+            auto out = expandSuggestions(ast, lead);
+            try {
+                if (auto w = derivWorking(ast, seg, lead); w && !ed.inSlot()) out.push_back(std::move(*w));
+            } catch (...) {}
+            return out;
         }
         std::vector<Entry> out = {result("= " + fmt(v), "Result", cat(lead, numItems(v)))};
         if (!exact(v) && !isMat(v))
@@ -1610,6 +1953,7 @@ std::vector<Entry> evalSuggestions(Editor& ed) {
 
 static std::optional<Ghost> ghost0(Editor& ed, const Row& row) {
     ED = &ed;
+    if (auto g = stepGhost(ed, row)) return g;
     auto mask = mathMask(row, true);
     int end = eqTag(row).first >= 0 ? eqTag(row).first : int(row.size());  // "x + 1 #eq": the answer goes before the tag
     if (stepBar(row) >= 0) return std::nullopt;  // "2x = 4 | :2": a transformation step, nothing to answer
