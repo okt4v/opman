@@ -529,6 +529,84 @@ std::string docTitle(const Doc& doc) {
     return "Untitled";
 }
 
+// ---------- tables as text ----------
+static std::string fixNumber(std::string c) {
+    size_t i = !c.empty() && (c[0] == '-' || c[0] == '+');
+    if (i >= c.size()) return c;
+    int seps = 0;
+    for (size_t j = i; j < c.size(); j++) {
+        if (c[j] == '.' || c[j] == ',') seps++;
+        else if (!std::isdigit((unsigned char)c[j])) return c;
+    }
+    if (seps != 1 || c[i] == '.' || c[i] == ',' || c.back() == '.' || c.back() == ',') return c;
+    for (auto& x : c)
+        if (x == '.' || x == ',') x = decimalComma ? ',' : '.';
+    return c;
+}
+
+std::vector<Row> tableFromText(std::string s) {
+    if (s.starts_with("\xEF\xBB\xBF")) s.erase(0, 3);  // Excel's byte order mark
+    size_t lineEnd = s.find('\n');
+    std::string head = s.substr(0, lineEnd);
+    char sep = ',';
+    size_t most = 0;
+    for (char c : {',', ';', '\t'})  // ties go to the later: "1,5;2,5" is split at ;
+        if (size_t n = std::count(head.begin(), head.end(), c); n && n >= most) most = n, sep = c;
+    std::vector<std::vector<std::string>> cells(1, std::vector<std::string>(1));
+    bool quoted = false;
+    for (size_t j = 0; j < s.size(); j++) {
+        char c = s[j];
+        if (quoted) {
+            if (c == '"' && j + 1 < s.size() && s[j + 1] == '"') cells.back().back() += '"', j++;
+            else if (c == '"') quoted = false;
+            else cells.back().back() += c == '\n' || c == '\r' ? ' ' : c;  // a table cell is one line
+        } else if (c == '"' && cells.back().back().empty()) quoted = true;
+        else if (c == sep) cells.back().emplace_back();
+        else if (c == '\n') cells.emplace_back(1);
+        else if (c != '\r') cells.back().back() += c;
+    }
+    while (!cells.empty() && cells.back().size() == 1 && cells.back()[0].empty()) cells.pop_back();
+    size_t cols = 0;
+    for (auto& r : cells) cols = std::max(cols, r.size());
+    std::vector<Row> out;
+    for (auto& r : cells) {
+        std::string line = "|";
+        for (size_t c = 0; c < cols; c++) {
+            std::string v = c < r.size() ? fixNumber(trimSpaces(r[c])) : "";
+            std::replace(v.begin(), v.end(), '|', '/');  // a | would end the cell
+            line += " " + v + " |";
+        }
+        Row row;
+        for (auto& c : codepoints(line)) row.push_back(ch(c, false));
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+std::string tableText(const Doc& doc, int k, char sep) {
+    auto isTable = [&](int j) { return j >= 0 && j < int(doc.size()) && lineStyle(doc[j]).kind == Line::Table; };
+    if (!isTable(k))
+        for (k = 0; k < int(doc.size()) && !isTable(k); k++) {}
+    if (!isTable(k)) return "";
+    while (isTable(k - 1)) k--;
+    std::string out;
+    for (; isTable(k); k++) {
+        bool first = true;
+        for (auto [a, b] : tableCells(doc[k])) {
+            std::string c = trimSpaces(plain(Row(doc[k].begin() + a, doc[k].begin() + b)));
+            if (c.find_first_of(std::string("\"\n") + sep) != std::string::npos) {  // quoted, as CSV wants
+                std::string q = "\"";
+                for (char x : c) q += x == '"' ? "\"\"" : std::string(1, x);
+                c = q + "\"";
+            }
+            out += (first ? "" : std::string(1, sep)) + c;
+            first = false;
+        }
+        out += "\n";
+    }
+    return out;
+}
+
 // ---------- JSON ----------
 using nlohmann::json;
 static const char* TNAME[] = {"ch", "var", "const", "unit", "sym", "fn", "frac", "sup", "sub", "sqrt", "paren", "mat", "big", "lim"};

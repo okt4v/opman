@@ -749,7 +749,7 @@ void Vi::commandKey(Editor& ed, const Key& k) {
         }
         std::string name = c.substr(0, c.find(' '));
         static const std::vector<std::string> known = {"w", "q", "q!", "wq", "x", "e", "new", "rename", "trash", "set", "export",
-                                                       "image", "table", "rule", "section", "row", "col", "print", "tour", "saveas", "open", "help", "settings",
+                                                       "image", "table", "rule", "section", "row", "col", "print", "tour", "import", "copytable", "saveas", "open", "help", "settings",
                                                        "palette", "outline", "zoom", "folder"};
         bool subst = name.starts_with("s/") || name.starts_with("%s/");
         if (!subst && std::find(known.begin(), known.end(), name) == known.end()) { message = "Not an editor command: " + c; return; }
@@ -769,6 +769,16 @@ void Vi::yanked() {
 
 // ponytail: pasted text is typed in, so it gets the same text/math reading as typing it ("a/b" becomes a fraction)
 void Vi::pasteText(Editor& ed, const std::string& s) {
+    if (s.find('\t') != std::string::npos && !ed.inSlot()) {  // cells copied from a spreadsheet: a table
+        auto rows = tableFromText(s);
+        int at = lineIdx(ed) + !ed.cur.row->empty();
+        if (ed.cur.row->empty()) ed.doc.erase(ed.doc.begin() + at);
+        ed.doc.insert(ed.doc.begin() + at, rows.begin(), rows.end());
+        ed.cur = {&ed.doc[at + rows.size() - 1], 0};
+        ed.cur.i = len(ed.cur.row);
+        ed.reindex();
+        return;
+    }
     for (size_t i = 0; i < s.size();) {
         unsigned char b = s[i];
         size_t n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;

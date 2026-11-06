@@ -75,6 +75,12 @@ extern bool decimalComma;
 bool isDecimalComma(const Row& row, size_t j);  // the comma at j sits between two digits and the setting is on
 std::string localNum(std::string s);            // "2.5" -> "2,5" when the setting is on (only between digits)
 
+// tables as text, for spreadsheets. tableFromText reads CSV or tab-separated text into table lines (the separator
+// is whichever of tab ; , the first line has most of; numbers follow the decimal setting). tableText writes the table
+// at line k, else the note's first, separated by sep ("" if there is none)
+std::vector<Row> tableFromText(std::string text);
+std::string tableText(const Doc& doc, int k, char sep);
+
 // constructors
 Item ch(std::string c, bool m);
 inline Item M(std::string c) { return ch(std::move(c), true); }

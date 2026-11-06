@@ -300,6 +300,7 @@ struct App {
         mathOpts.degrees = cfg.value("angles", std::string("radians")) == "degrees";
         mathOpts.decimals = cfg.value("decimals", false);
         decimalComma = cfg.value("decimalComma", false);
+        plotMarks = cfg.value("plotMarks", true);
         mathOpts.plotX0 = cfg.value("plotX0", -10.0);
         mathOpts.plotX1 = cfg.value("plotX1", 10.0);
         if (!(mathOpts.plotX0 < mathOpts.plotX1)) mathOpts.plotX0 = -10, mathOpts.plotX1 = 10;
@@ -342,6 +343,7 @@ struct App {
         cfg["angles"] = mathOpts.degrees ? "degrees" : "radians";
         cfg["decimals"] = mathOpts.decimals;
         cfg["decimalComma"] = decimalComma;
+        cfg["plotMarks"] = plotMarks;
         cfg["plotX0"] = mathOpts.plotX0;
         cfg["plotX1"] = mathOpts.plotX1;
         cfg["recent"] = recent;
@@ -758,11 +760,48 @@ struct App {
         fs::path start = current.empty() ? freeName(dir, titleOf(meta)) : fs::path(current).parent_path() / fs::path(current).filename();
         askPath(true, "Save note as", start, {{"opman notes", "*.opman"}}, [this](std::string p) { saveAs(p); });
     }
+    // :import [file]: a CSV or tab-separated file as a table at the cursor
+    void importTable(const std::string& arg) {
+        if (arg.empty()) {
+            askPath(false, "Import a table", home(), {{"Tables", "*.csv *.tsv *.txt"}}, [this](std::string p) { importTable(p); });
+            return;
+        }
+        std::ifstream f(arg.starts_with("~/") ? home() / arg.substr(2) : fs::path(arg), std::ios::binary);
+        if (!f) { message = "Could not read " + arg; return; }
+        std::string text((std::istreambuf_iterator<char>(f)), {}), fixed;
+        // Excel saves CSV in the old Windows encoding: anything that isn't UTF-8 is read as Latin-1, so ä stays ä
+        bool utf8 = true;
+        for (size_t j = 0; j < text.size() && utf8;) {
+            unsigned char b = text[j];
+            size_t n = b < 0x80 ? 0 : (b >> 5) == 6 ? 1 : (b >> 4) == 14 ? 2 : (b >> 3) == 30 ? 3 : 9;
+            if (n == 9 || j + n >= text.size() + (n == 0)) { utf8 = false; break; }
+            for (size_t m = 1; m <= n; m++) utf8 = utf8 && (text[j + m] & 0xC0) == 0x80;
+            j += n + 1;
+        }
+        if (!utf8) {
+            for (unsigned char b : text)
+                if (b < 0x80) fixed += char(b);
+                else fixed += char(0xC0 | (b >> 6)), fixed += char(0x80 | (b & 0x3F));
+            text = std::move(fixed);
+        }
+        auto rows = tableFromText(text);
+        if (rows.empty()) { message = "Nothing to import in " + arg; return; }
+        ed.snap();
+        int k = ed.lineOf(ed.topOf(ed.cur.row)), at = k + !ed.doc[k].empty();
+        if (ed.doc[k].empty()) ed.doc.erase(ed.doc.begin() + k);
+        ed.doc.insert(ed.doc.begin() + at, rows.begin(), rows.end());
+        Row& last = ed.doc[at + rows.size() - 1];
+        ed.cur = {&last, int(last.size())};
+        ed.reindex();
+        changed();
+        message = "Imported " + std::to_string(rows.size()) + " rows";
+    }
+
     void exportDialog(const std::string& ext) {
         std::string t = titleOf(meta);
         for (auto& c : t) if (std::strchr("/\\:*?\"<>|", c)) c = '-';
         fs::path start = (exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + ext);
-        static const std::map<std::string, std::string> names = {{"md", "Markdown"}, {"html", "Web page"}, {"tex", "LaTeX"}, {"pdf", "PDF"}};
+        static const std::map<std::string, std::string> names = {{"md", "Markdown"}, {"html", "Web page"}, {"tex", "LaTeX"}, {"pdf", "PDF"}, {"csv", "Table (CSV)"}};
         askPath(true, "Export as " + names.at(ext), start, {{names.at(ext), "*." + ext}}, [this, ext](std::string p) {
             if (fs::path(p).extension() != "." + ext) p += "." + ext;
             exportTo(p);
@@ -807,6 +846,7 @@ struct App {
             else if (arg == "degrees" || arg == "radians") mathOpts.degrees = arg == "degrees";
             else if (arg == "decimals" || arg == "fractions") mathOpts.decimals = arg == "decimals";
             else if (arg == "comma" || arg == "point") decimalComma = arg == "comma";
+            else if (arg == "marks" || arg == "nomarks") plotMarks = arg == "marks";
             else if (arg == "pdf=auto" || arg == "pdf=latex" || arg == "pdf=builtin") pdfEngine = arg == "pdf=auto" ? 0 : arg == "pdf=latex" ? 1 : 2;
             else if (arg == "vim" || arg == "standard") { vim = arg == "vim"; vi.mode = vim ? Mode::Normal : Mode::Insert; }
             else if (std::sscanf(arg.c_str(), "digits=%d", &n) == 1) mathOpts.digits = std::clamp(n, 2, 15);
@@ -816,6 +856,12 @@ struct App {
         } else if (name == "export") exportTo(arg);
         else if (name == "print") print();
         else if (name == "tour") tour();
+        else if (name == "import") importTable(arg);
+        else if (name == "copytable") {
+            std::string t = tableText(ed.doc, ed.lineOf(ed.topOf(ed.cur.row)), '\t');
+            if (!t.empty()) ImGui::SetClipboardText(t.c_str());
+            message = t.empty() ? "No table in this note" : "Copied the table: paste it into a spreadsheet";
+        }
         else if (name == "image") addImage(arg);
         else if (name == "rule") insertLines({"---"}, 0);
         else if (name == "section") {  // :section [title]; the default numbers the exercises
@@ -955,9 +1001,15 @@ struct App {
         std::string t = titleOf(meta);
         for (auto& c : t) if (std::strchr("/\\:*?\"<>| ", c)) c = '-';
         if (arg.empty()) arg = "md";
-        if (arg == "md" || arg == "tex" || arg == "pdf" || arg == "html") arg = ((exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + arg)).string();
+        if (arg == "md" || arg == "tex" || arg == "pdf" || arg == "html" || arg == "csv") arg = ((exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + arg)).string();
         fs::path out = arg.starts_with("~/") ? home() / arg.substr(2) : fs::path(arg);
         std::string ext = lower(out.extension().string());
+        if (ext == ".csv") {  // the table at the cursor; ; goes with a decimal comma, as spreadsheets expect
+            std::string t = tableText(ed.doc, ed.lineOf(ed.topOf(ed.cur.row)), decimalComma ? ';' : ',');
+            if (t.empty()) { message = "No table in this note"; return; }
+            message = std::ofstream(out, std::ios::binary) << t ? "Exported to " + out.string() : "Could not write " + out.string();
+            return;
+        }
         if (ext != ".tex" && ext != ".pdf") {
             std::ofstream f(out, std::ios::binary);
             bool ok = ext == ".html" || ext == ".htm" ? bool(f << html(ed, media, titleOf(meta))) : bool(f << markdown(ed.doc, media));
@@ -1567,6 +1619,7 @@ struct App {
         return h;
     }
 
+    bool plotMarks = true;  // zeros, extrema and intersections on curves
     float plotAspect = 0;  // the plot area's shape when it differs from what the plots were fitted to
     float drawPlot(const Plot& pl, float x, float y, float w, int k) {
         const Palette& p = pal();
@@ -1580,7 +1633,7 @@ struct App {
         ImGui::PopID();
         // pl may be viewPlots[k]: a new view is applied after drawing (erasing it now would leave pl dangling)
         std::optional<std::array<double, 4>> newView;
-        bool reset = false;
+        bool reset = false, hovered = false;
         if (ImGui::IsItemHovered()) {
             ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);  // the wheel zooms the plot, not the page
             std::array<double, 4> v{pl.x0, pl.x1, pl.y0, pl.y1};
@@ -1600,7 +1653,7 @@ struct App {
             }
             if (ImGui::IsMouseDoubleClicked(0)) reset = true;
             else if (moved) newView = v;
-            if (!ImGui::IsItemActive()) ImGui::SetTooltip("Drag to pan · wheel to zoom · double-click to reset");
+            hovered = !ImGui::IsItemActive();
         }
         dl->AddRectFilled({x, y}, {x + w, y + h}, p.side, 8);
         auto X = [&](double v) { return float(a.x + (v - pl.x0) / (pl.x1 - pl.x0) * (b.x - a.x)); };
@@ -1655,6 +1708,47 @@ struct App {
             L.drawText(pl.series[s].label, a.x + 28, ly + 11, 13, p.fg, ui);
         }
         if (!pl.error.empty()) L.drawText(pl.error, a.x + 8, b.y - 8, 13, IM_COL32(0xe5, 0x48, 0x4d, 255), ui);
+        // marks, and reading a value off a curve under the mouse
+        ImVec2 mouse = ImGui::GetIO().MousePos;
+        auto val = [](double v) {
+            char s[32];
+            std::snprintf(s, sizeof s, "%.4g", std::fabs(v) < 1e-12 ? 0.0 : v);
+            return localNum(s);
+        };
+        std::string tip = "Drag to pan · wheel to zoom · double-click to reset";
+        dl->PushClipRect(a, b, true);
+        if (plotMarks) {
+            float best = 9;
+            for (auto& m : pl.marks) {
+                ImVec2 at{X(m.x), Y(m.y)};
+                dl->AddCircleFilled(at, 3.5f, p.side);
+                dl->AddCircle(at, 3.5f, COLS[m.series % 6], 0, 1.6f);
+                float d = std::hypot(mouse.x - at.x, mouse.y - at.y);
+                if (hovered && d < best) {
+                    static const char* NAMES[] = {"Zero", "Minimum", "Maximum", "Intersection"};
+                    best = d;
+                    tip = std::string(NAMES[m.kind]) + ": x = " + val(m.x) + ", y = " + val(m.y);
+                }
+            }
+            if (hovered && best == 9) {  // no mark near: a curve near?
+                double mx = pl.x0 + (mouse.x - a.x) / (b.x - a.x) * (pl.x1 - pl.x0);
+                float nearest = 10;
+                for (size_t s = 0; s < pl.series.size(); s++) {
+                    auto& pts = pl.series[s].pts;
+                    if (!pl.series[s].fn) continue;
+                    auto hi = std::lower_bound(pts.begin(), pts.end(), mx, [](auto& q, double v) { return q.first < v; });
+                    if (hi == pts.begin() || hi == pts.end()) continue;
+                    auto lo = hi - 1;
+                    double f = (mx - lo->first) / (hi->first - lo->first), my = lo->second + f * (hi->second - lo->second);
+                    if (!std::isfinite(my) || std::fabs(mouse.y - Y(my)) >= nearest) continue;
+                    nearest = std::fabs(mouse.y - Y(my));
+                    tip = "x = " + val(mx) + ", y = " + val(my);
+                    dl->AddCircleFilled({mouse.x, Y(my)}, 3, COLS[s % 6]);
+                }
+            }
+        }
+        dl->PopClipRect();
+        if (hovered) ImGui::SetTooltip("%s", tip.c_str());
         if (reset) views.erase(k), viewPlots.erase(k);
         else if (newView) views[k] = *newView, viewPlots[k] = plot(ed, ed.doc[k], newView->data());
         return h;
@@ -1962,6 +2056,7 @@ struct App {
                 ImGui::SetNextItemWidth(260);
                 if (ImGui::InputFloat2("Default x range", r, "%g") && r[0] < r[1]) mathOpts.plotX0 = r[0], mathOpts.plotX1 = r[1], cfgDirty = math = true;
                 hint("Used when a plot line gives no range such as −3 < x < 3");
+                check("Mark zeros, extrema and intersections", plotMarks, "On y = f(x) curves; hover over a curve or mark to read its values");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Files")) {
@@ -2130,6 +2225,9 @@ struct App {
             {"Open the tour (an example note)", ":tour", [this] { run("tour"); }},
             {"Print…", ":print · Ctrl-p (standard keys)", [this] { run("print"); }},
             {"Insert table", "Space |", [this] { run("table 3 2"); }},
+            {"Import a table from CSV", ":import", [this] { run("import"); }},
+            {"Export the table as CSV", ":export csv", [this] { exportDialog("csv"); }},
+            {"Copy the table for a spreadsheet", ":copytable", [this] { run("copytable"); }},
             {"Table/matrix: add row below", ":row below · Shift-Enter", [this] { run("row below"); }},
             {"Table/matrix: add row above", ":row above", [this] { run("row above"); }},
             {"Table/matrix: add column right", ":col right", [this] { run("col right"); }},
@@ -2318,8 +2416,10 @@ struct App {
             if (ImGui::MenuItem("Web page (.html)…")) exportDialog("html");
             if (ImGui::MenuItem("LaTeX (.tex)…")) exportDialog("tex");
             if (ImGui::MenuItem("PDF (.pdf)…")) exportDialog("pdf");
+            if (ImGui::MenuItem("Table (.csv)…")) exportDialog("csv");
             ImGui::EndMenu();
         }
+        if (ImGui::MenuItem("Import table (.csv)…")) run("import");
         if (ImGui::MenuItem("Print…", vim ? ":print" : "Ctrl-p")) run("print");
         ImGui::Separator();
         if (ImGui::MenuItem("Rename…")) exCmd("rename ");

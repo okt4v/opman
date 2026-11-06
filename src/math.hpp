@@ -43,8 +43,16 @@ struct Plot {
         std::string tex, label;
         std::vector<std::pair<double, double>> pts;
         bool points = false;  // table data: markers, not a curve
+        bool fn = false;      // y = f(x), sampled left to right
     };
     std::vector<Series> series;
+    // what's worth reading off a graph: found from the samples, on screen
+    struct Mark {
+        double x, y;
+        enum Kind { Zero, Min, Max, Cross } kind;
+        size_t series;
+    };
+    std::vector<Mark> marks;
     // 3D: z = f(x, y) on an n×n grid over [x0, x1]×[y0, y1] (z[j·n + i] at x_i, y_j), and space curves
     struct Surface {
         std::string tex, label;

@@ -196,7 +196,7 @@ Plots of only these shapes keep x and y at the same scale, so circles stay round
 Drag a 3D plot to turn it, wheel to zoom, double-click to reset. Exports draw the surface too.
 
 ## Moving around
-Drag a plot to pan, use the mouse wheel to zoom, double-click to reset. Hover to read coordinates.
+Drag a plot to pan, use the mouse wheel to zoom, double-click to reset. Hover over a curve to read its values. Zeros, minima, maxima and intersections are marked; turn them off in Settings > Math.
 
 The word plot inside a sentence stays text: only a line that starts with the plot function (from the popup) is a plot.)"},
 
@@ -229,6 +229,7 @@ Pictures are stored inside the .opman file, so they travel with the note. Export
 `:export md` Markdown, math as $…$
 `:export html` one web page that works offline: math, pictures and plots inside
 `:export tex` a LaTeX article (tables, lists, plots as pgfplots)
+`:export csv` the table at the cursor, for a spreadsheet
 `:export pdf` a PDF: through pdflatex in the background when it's installed, else drawn by opman itself
 `:export ~/Desktop/notes.pdf` a path picks the format by its extension
 Without a path the file goes to the export folder (Settings > Files, your home folder by default) named after the note.

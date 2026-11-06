@@ -2124,7 +2124,7 @@ Ast fitAst(const std::vector<double>& c, bool expo, const std::string& x) {
 }
 }  // namespace
 
-Plot plot(Editor& ed, const Row& row, const double* view) {
+static Plot plot0(Editor& ed, const Row& row, const double* view) {
     ED = &ed;
     Plot out;
     out.x0 = mathOpts.plotX0, out.x1 = mathOpts.plotX1;
@@ -2330,6 +2330,7 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
     for (auto& f : fns) {
         auto& se = out.series[f.at];
         if (f.k == Fx) {
+            se.fn = true;
             bool any = false;
             for (int i = 0; i < N; i++) {
                 double x = out.x0 + (out.x1 - out.x0) * i / (N - 1), y = at(f.a[0], {{"x", Fl(x)}});
@@ -2344,6 +2345,7 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
         for (int i = 0; i < N; i++) {
             double x = out.x0 + (out.x1 - out.x0) * i / (N - 1), y = f(x);
             out.series[k].pts.push_back({x, std::isfinite(y) ? y : NAN});
+            out.series[k].fn = true;
             if (std::isfinite(y)) ys.push_back(y);
         }
     // ponytail: y range from the 2nd to 98th percentile plus a margin, so asymptotes don't flatten everything else
@@ -2407,6 +2409,77 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
         if (se.pts.empty() && out.error.empty()) out.error = "No points of " + se.label + " in view";
     }
     return out;
+}
+
+// zeros, extrema and intersections from the samples, refined between them. ponytail: as exact as the sampling, a few
+// digits; more than 12 of a kind on a curve (sin(50x)) or a curve lying on the axis is noise, so that kind is dropped
+static void findMarks(Plot& pl) {
+    using Pts = std::vector<std::pair<double, double>>;
+    double span = pl.y1 - pl.y0;
+    auto joined = [&](double a, double b) { return std::isfinite(a) && std::isfinite(b) && std::fabs(a - b) <= 3 * span; };  // not an asymptote
+    auto clean = [&](double v, double size) { return std::fabs(v) < 1e-9 * size ? 0.0 : v; };
+    // a sign change between samples i and i+1 where the curve grows towards it from both sides: tan at π/2, not a crossing
+    auto pole = [](size_t i, size_t n, const std::function<double(size_t)>& y) {
+        return i > 0 && i + 2 < n && std::fabs(y(i)) > std::fabs(y(i - 1)) && std::fabs(y(i + 1)) > std::fabs(y(i + 2));
+    };
+    auto add = [&](std::vector<Plot::Mark>& to, double x, double y, Plot::Mark::Kind k, size_t s) {
+        x = clean(x, pl.x1 - pl.x0), y = clean(y, span);
+        if (x < pl.x0 || x > pl.x1 || y < pl.y0 || y > pl.y1) return;
+        bool dup = std::any_of(to.begin(), to.end(), [&](auto& m) { return m.kind == k && std::fabs(m.x - x) < 1e-6 * (pl.x1 - pl.x0); });
+        if (!dup) to.push_back({x, y, k, s});
+    };
+    auto keep = [&](std::vector<Plot::Mark>& got) {
+        if (got.size() <= 12) pl.marks.insert(pl.marks.end(), got.begin(), got.end());
+        got.clear();
+    };
+    std::vector<Plot::Mark> got;
+    for (size_t s = 0; s < pl.series.size(); s++) {
+        if (!pl.series[s].fn) continue;
+        const Pts& p = pl.series[s].pts;
+        for (size_t i = 0; i + 1 < p.size(); i++) {
+            auto [ax, ay] = p[i];
+            auto [bx, by] = p[i + 1];
+            if (!joined(ay, by)) continue;
+            if (ay == 0) add(got, ax, 0, Plot::Mark::Zero, s);
+            else if (ay * by < 0 && !pole(i, p.size(), [&](size_t j) { return p[j].second; })) add(got, ax - ay * (bx - ax) / (by - ay), 0, Plot::Mark::Zero, s);
+        }
+        keep(got);
+        for (auto kind : {Plot::Mark::Min, Plot::Mark::Max}) {
+            for (size_t i = 0; i + 2 < p.size(); i++) {
+                double a = p[i].second, b = p[i + 1].second, c = p[i + 2].second, h = p[i + 1].first - p[i].first;
+                if (i + 3 < p.size() && b == c && joined(a, b) && joined(c, p[i + 3].second) && (b - a) * (p[i + 3].second - c) < 0) {
+                    // two equal samples either side of the turn (x² on a symmetric range): it's halfway between them
+                    if ((b < a) == (kind == Plot::Mark::Min)) add(got, (p[i + 1].first + p[i + 2].first) / 2, b - (a - b) / 8, kind, s);
+                    continue;
+                }
+                if (!joined(a, b) || !joined(b, c) || !((b - a) * (c - b) < 0)) continue;
+                double bend = a - 2 * b + c;
+                if (bend == 0 || (bend > 0) != (kind == Plot::Mark::Min)) continue;
+                add(got, p[i + 1].first + h * (a - c) / (2 * bend), b - (a - c) * (a - c) / (8 * bend), kind, s);
+            }
+            keep(got);
+        }
+        for (size_t t = s + 1; t < pl.series.size(); t++) {
+            const Pts& q = pl.series[t].pts;
+            if (!pl.series[t].fn || q.size() != p.size()) continue;
+            for (size_t i = 0; i + 1 < p.size(); i++) {
+                if (!joined(p[i].second, p[i + 1].second) || !joined(q[i].second, q[i + 1].second)) continue;
+                double d0 = p[i].second - q[i].second, d1 = p[i + 1].second - q[i + 1].second;
+                if (d0 == 0) add(got, p[i].first, p[i].second, Plot::Mark::Cross, s);
+                else if (d0 * d1 < 0 && !pole(i, p.size(), [&](size_t j) { return p[j].second - q[j].second; })) {
+                    double f = d0 / (d0 - d1);
+                    add(got, p[i].first + f * (p[i + 1].first - p[i].first), p[i].second + f * (p[i + 1].second - p[i].second), Plot::Mark::Cross, s);
+                }
+            }
+            keep(got);
+        }
+    }
+}
+
+Plot plot(Editor& ed, const Row& row, const double* view) {
+    Plot pl = plot0(ed, row, view);
+    if (!pl.is3d() && pl.y1 > pl.y0 && pl.x1 > pl.x0) findMarks(pl);
+    return pl;
 }
 
 std::vector<std::string> definedNames(Editor& ed) {

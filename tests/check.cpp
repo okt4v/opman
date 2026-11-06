@@ -1016,6 +1016,55 @@ static void checkVi() {
         CHECK(has);
     }
 
+    // plot marks: zeros, extrema, intersections
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "iplot<Tab>x^2<Right> − 1<Esc>");
+        Plot p = plot(e, e.doc[0]);
+        auto count = [&](Plot::Mark::Kind k) { return std::count_if(p.marks.begin(), p.marks.end(), [&](auto& m) { return m.kind == k; }); };
+        CHECK_EQ(int(count(Plot::Mark::Zero)), 2);
+        CHECK_EQ(int(count(Plot::Mark::Min)), 1);
+        for (auto& m : p.marks) {
+            if (m.kind == Plot::Mark::Zero) CHECK(std::fabs(std::fabs(m.x) - 1) < 1e-3 && m.y == 0);
+            else CHECK(std::fabs(m.x) < 1e-3 && std::fabs(m.y + 1) < 1e-3);
+        }
+        keys(e, v, "ccplot<Tab>x, 2 − x<Esc>");  // a crossing at (1, 1)
+        p = plot(e, e.doc[0]);
+        CHECK_EQ(int(count(Plot::Mark::Cross)), 1);
+        keys(e, v, "ccplot<Tab>tan(x)<Esc>");  // asymptotes aren't zeros
+        p = plot(e, e.doc[0]);
+        for (auto& m : p.marks) CHECK(m.kind != Plot::Mark::Zero || std::fabs(std::sin(m.x)) < 1e-2);
+        keys(e, v, "ccplot<Tab>(cos(t), sin(t))<Esc>");  // only y = f(x) curves
+        CHECK(plot(e, e.doc[0]).marks.empty());
+    }
+
+    // tables and spreadsheets: separators, quotes, decimals; a tab paste makes a table
+    {
+        auto rows = tableFromText("name;value\r\n\"a;b\";2,5\r\n");
+        CHECK_EQ(int(rows.size()), 2);
+        CHECK_EQ(plain(rows[0]), "| name | value |");
+        CHECK_EQ(plain(rows[1]), "| a;b | 2.5 |");
+        CHECK_EQ(plain(tableFromText("a,b\n1,2\n")[1]), "| 1 | 2 |");
+        CHECK_EQ(plain(tableFromText("a\tb\n1.5\t\"x\"\"y\"\n")[1]), "| 1.5 | x\"y |");
+        CHECK_EQ(plain(tableFromText("a,b,c\n1\n")[1]), "| 1 |  |  |");
+        decimalComma = true;
+        CHECK_EQ(plain(tableFromText("a\tb\n1.5\t2\n")[1]), "| 1,5 | 2 |");
+        decimalComma = false;
+        Doc d = {Row{}};
+        for (auto& r : tableFromText("h,\"q,r\"\n1,2\n")) d.push_back(r);
+        CHECK_EQ(tableText(d, 0, ','), "h,\"q,r\"\n1,2\n");
+        CHECK_EQ(tableText(d, 2, '\t'), "h\tq,r\n1\t2\n");
+        CHECK_EQ(tableText({Row{}}, 0, ','), "");
+        Editor e;
+        Vi v;
+        v.getClip = [] { return std::string("t\th\n1\t2\n"); };
+        keys(e, v, "i<C-v><Esc>");
+        CHECK_EQ(int(e.doc.size()), 2);
+        CHECK(lineStyle(e.doc[0]).kind == Line::Table);
+        CHECK_EQ(plain(e.doc[1]), "| 1 | 2 |");
+    }
+
     // matrices in insert mode: Shift+Space grows a column, Shift+Enter a row
     keys(ed, vi, "oA = (1<S-Space>2<S-CR>3<Tab>4<Esc>");
     CHECK(lineTex(ed.doc.back()).find("\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}") != std::string::npos);

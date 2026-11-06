@@ -69,6 +69,7 @@ line and take it from the popup with Tab (they're the *Program* functions there)
 | Line | Renders as |
 |---|---|
 | **plot** `sin(x), f(x), x^2/4, −3 < x < 3, −1 < y < 1` | a graph of each expression; x and y ranges optional. `plot table` draws the nearest table above (column 1 is x), `fit` / `fit 2` / `fit exp` a least-squares curve through it. Parametric `(cos(t), sin(t))`, polar `r = 1 + cos(θ)` and implicit `x^2 + y^2 = 4` curves too. Drag pans, the wheel zooms, a double-click resets |
+| | Zeros, minima, maxima and intersections are marked on `y = f(x)` curves; hover over a mark or a curve to read its values (Settings > Math > Plots, `:set marks`, `:set nomarks`) |
 | **plot** `sin(x) cos(y)`, `z = x y`, `(cos(t), sin(t), t)` | 3D: a surface over x and y, or a space curve; drag to turn it |
 | `=== Exercise 2` (Space =, `:section`) | a section banner. **Definitions don't cross it**: two exercises can both use `x` |
 | `\| a \| x^2 \| b \|` (Space \|, `:table`) | a table row; consecutive rows form a table, the first is the header. Tab / Shift-Tab move between cells, Enter adds a row, Enter on an empty row ends it. Right-click (or `:row above\|below\|delete`, `:col left\|right\|delete`) adds and removes rows and columns, in matrices too |
@@ -98,13 +99,16 @@ Also:
 - **Exact answers**: `√8 = 2√2`, `arctan(1) = π/4`; Tab writes the exact form.
 - **Equation numbers**: end a line with `#name` to number it `(1)`; `[#name]` refers to it (Ctrl-click jumps).
 - **Tour**: `:tour` (or Help > Open the tour) types an example note.
+- **Spreadsheets**: paste cells copied from Excel to get a table; `:import file.csv` reads CSV or tab-separated files
+  (Excel's `;` and old encoding too), `:export csv` writes the table at the cursor, `:copytable` copies it for pasting
+  into a spreadsheet.
 - **Functions**: `sin … arctan`, `ln log exp sqrt abs floor ceil round sign`, `mod(a, b)`, `nCr(n, k)`, `nPr(n, k)`, and over
   lists `max min sum count mean median stdev var gcd lcm`. A table column's header name is its list: `mean(h)`;
   `fit(t, h)`, `fit(t, h, 2)`, `fit(t, h, exp)` give a regression formula with R².
 
 ## Export
 
-`:export` takes a file name or just a format: `md` (default), `html`, `tex` or `pdf`. Without a path it writes
+`:export` takes a file name or just a format: `md` (default), `html`, `tex`, `pdf` or `csv` (the table at the cursor). Without a path it writes
 `~/<title>.<ext>`.
 - **HTML**: one shareable file that works offline; math as MathML (browsers draw it themselves), images inlined, plots as SVG.
 - **PDF**: runs `pdflatex` in the background when it's installed (a TeX distribution with amsmath, pgfplots, soul and
