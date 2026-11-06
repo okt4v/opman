@@ -12,6 +12,7 @@ struct MathOpts {
     bool degrees = false;   // sin/cos/tan take degrees, arcsin/arccos/arctan return them
     bool decimals = false;  // live results show 0.75 rather than 3/4
     double plotX0 = -10, plotX1 = 10;  // a plot's x range when the line gives none
+    double plotAspect = 2.4;           // width / height of the plot area, so a circle comes out round (the app sets it)
 };
 extern MathOpts mathOpts;
 
@@ -56,6 +57,7 @@ struct Plot {
     std::vector<Surface> surfaces;
     std::vector<Curve3> curves;
     bool is3d() const { return !surfaces.empty() || !curves.empty(); }
+    bool equal = false;  // only shapes: x and y on one scale, fitted to mathOpts.plotAspect
     std::string error;
 };
 

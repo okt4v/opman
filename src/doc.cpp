@@ -96,6 +96,24 @@ std::vector<bool> mathMask(const Row& row, bool top) {
     return out;
 }
 
+std::map<int, int> followLines(const std::vector<std::pair<int, std::string>>& before, const std::vector<std::pair<int, std::string>>& after) {
+    std::map<int, int> out;
+    std::vector<bool> used(after.size());
+    std::vector<int> oldLeft, newLeft;
+    for (auto& [k, text] : before) {
+        size_t j = 0;
+        while (j < after.size() && (used[j] || after[j].second != text)) j++;
+        if (j == after.size()) { oldLeft.push_back(k); continue; }
+        used[j] = true;
+        out[k] = after[j].first;
+    }
+    for (size_t j = 0; j < after.size(); j++)
+        if (!used[j]) newLeft.push_back(after[j].first);
+    if (oldLeft.size() == newLeft.size())
+        for (size_t j = 0; j < oldLeft.size(); j++) out[oldLeft[j]] = newLeft[j];
+    return out;
+}
+
 // ---------- text forms ----------
 const std::vector<std::pair<std::string, std::string>> GREEK = {
     {"alpha", "α"}, {"beta", "β"}, {"gamma", "γ"}, {"delta", "δ"}, {"epsilon", "ε"}, {"zeta", "ζ"}, {"eta", "η"},

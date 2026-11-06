@@ -14,7 +14,8 @@ struct Cur {
 };
 struct Range {
     Row* row = nullptr;
-    int a = 0, b = 0;  // b is the cursor end
+    int a = 0, b = 0;      // b is the cursor end
+    Row* row2 = nullptr;   // set: the selection runs over top-level lines, from (row, a) to (row2, b)
 };
 struct Parent {
     Item* node;
@@ -111,8 +112,12 @@ struct Editor {
     void snapToCell();  // a cursor on a border, in padding or past the last | goes into its cell
     bool inGrid() const;
 
-    // selection: always a range of one row
+    // selection: a range of one row (selRange), or of several top-level lines (range->row2 set, selRange empty)
     std::optional<std::pair<int, int>> selRange() const;
+    std::optional<std::pair<int, int>> selOn(const Row& row) const;  // the items of this row that are selected
+    Doc selectedLines() const;  // what's selected, a row per line
+    void insertLines(const Doc& parts);  // at the cursor: the first joins this line, the last joins what follows it
+    void collapseSelection(bool toEnd);
     void selectBetween(Cur a, Cur b);
     void extendSelection(int d);
     void selectAll();

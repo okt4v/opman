@@ -838,7 +838,7 @@ void Editor::matrixBackspace(const Parent& p) {
 
 // ---------- selection: always a range of one row (the deepest row containing both ends) ----------
 std::optional<std::pair<int, int>> Editor::selRange() const {
-    if (!range) return std::nullopt;
+    if (!range || range->row2) return std::nullopt;
     return std::pair{std::min(range->a, range->b), std::max(range->a, range->b)};
 }
 
@@ -866,11 +866,13 @@ void Editor::selectBetween(Cur A, Cur B) {
         auto y = std::find_if(cb.begin(), cb.end(), [&](auto& z) { return z.row == x.row; });
         if (y != cb.end()) { ea = x; eb = *y; break; }
     }
-    if (!ea) {
-        // ponytail: selections stay within one line; dragging onto another line selects to this line's start/end
-        ea = ca.back();
-        bool forward = lineOf(topOf(B.row)) > lineOf(ea->row);
-        eb = Link{ea->row, forward ? int(ea->row->size()) : 0, false};
+    if (!ea) {  // different lines: whole top-level items, the node either end is inside included
+        Link ta = ca.back(), tb = cb.back();
+        bool fwd = lineOf(tb.row) > lineOf(ta.row);
+        int a = ta.i + (!fwd && ta.inside), b = tb.i + (fwd && tb.inside);
+        range = Range{ta.row, a, b, tb.row};
+        cur = {tb.row, b};
+        return;
     }
     bool forward = ea->i < eb->i || (ea->i == eb->i && !ea->inside && eb->inside);
     int a = ea->i, b = eb->i;
@@ -881,15 +883,71 @@ void Editor::selectBetween(Cur A, Cur B) {
     cur = {ea->row, b};
 }
 
+std::optional<std::pair<int, int>> Editor::selOn(const Row& row) const {
+    if (!range) return std::nullopt;
+    if (!range->row2) return range->row == &row ? selRange() : std::nullopt;
+    int k = lineOf(&row), ka = lineOf(range->row), kb = lineOf(range->row2);
+    if (k < std::min(ka, kb) || k > std::max(ka, kb)) return std::nullopt;
+    int n = int(row.size());
+    int from = k == std::min(ka, kb) ? (ka < kb ? range->a : range->b) : 0;
+    int to = k == std::max(ka, kb) ? (ka < kb ? range->b : range->a) : n;
+    return std::pair{std::min(from, n), std::min(to, n)};
+}
+
+Doc Editor::selectedLines() const {
+    if (!range) return {};
+    if (!range->row2) return {selectedItems()};
+    Doc out;
+    int ka = lineOf(range->row), kb = lineOf(range->row2);
+    for (int k = std::min(ka, kb); k <= std::max(ka, kb); k++) {
+        auto s = selOn(doc[k]);
+        out.emplace_back(doc[k].begin() + s->first, doc[k].begin() + s->second);
+    }
+    return out;
+}
+
+void Editor::collapseSelection(bool toEnd) {
+    if (!range || !range->row2) return;
+    bool fwd = lineOf(range->row2) > lineOf(range->row);
+    cur = fwd == toEnd ? Cur{range->row2, range->b} : Cur{range->row, range->a};
+    range.reset();
+}
+
+void Editor::insertLines(const Doc& parts) {
+    if (parts.size() < 2 || inSlot()) {  // a slot holds one line: the parts run together
+        for (auto& p : parts) insertItems(p);
+        return;
+    }
+    int k = lineOf(cur.row);
+    Row tail(cur.row->begin() + cur.i, cur.row->end());
+    cur.row->erase(cur.row->begin() + cur.i, cur.row->end());
+    cur.row->insert(cur.row->end(), parts[0].begin(), parts[0].end());
+    doc.insert(doc.begin() + k + 1, parts.begin() + 1, parts.end());
+    Row& last = doc[k + parts.size() - 1];
+    cur = {&last, int(last.size())};
+    last.insert(last.end(), tail.begin(), tail.end());
+    reindex();
+}
+
 void Editor::extendSelection(int d) {
+    if (range && range->row2) {
+        range->b = std::clamp(range->b + d, 0, int(range->row2->size()));
+        cur.i = range->b;
+        return;
+    }
     if (!range || range->row != cur.row) range = Range{cur.row, cur.i, cur.i};
     range->b = std::clamp(range->b + d, 0, int(cur.row->size()));
     cur.i = range->b;
     if (range->a == range->b) range.reset();
 }
 
+// the line, or a second time (or on an empty line) the whole note
 void Editor::selectAll() {
-    if (cur.row->empty()) range.reset();
+    auto whole = selRange();
+    if (!inSlot() && doc.size() > 1 && (cur.row->empty() || (whole && whole->first == 0 && whole->second == int(cur.row->size())))) {
+        range = Range{&doc[0], 0, int(doc.back().size()), &doc.back()};
+        cur = {&doc.back(), range->b};
+    } else if (cur.row->empty()) range.reset();
     else range = Range{cur.row, 0, int(cur.row->size())};
     cur.i = int(cur.row->size());
 }
@@ -900,6 +958,18 @@ Row Editor::selectedItems() const {
 }
 
 bool Editor::deleteSelection() {
+    if (range && range->row2) {
+        int ka = lineOf(range->row), kb = lineOf(range->row2), k0 = std::min(ka, kb), k1 = std::max(ka, kb);
+        int i0 = selOn(doc[k0])->first, i1 = selOn(doc[k1])->second;
+        Row tail(doc[k1].begin() + i1, doc[k1].end());
+        doc[k0].erase(doc[k0].begin() + i0, doc[k0].end());
+        doc[k0].insert(doc[k0].end(), tail.begin(), tail.end());
+        doc.erase(doc.begin() + k0 + 1, doc.begin() + k1 + 1);
+        cur = {&doc[k0], i0};
+        range.reset();
+        reindex();
+        return true;
+    }
     auto r = selRange();
     if (!r) return false;
     range->row->erase(range->row->begin() + r->first, range->row->begin() + r->second);

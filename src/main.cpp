@@ -237,6 +237,7 @@ struct App {
     std::unordered_map<size_t, LineCache> lineCache;  // by (section content, line): an edit recomputes only its section
     std::map<int, std::array<double, 4>> views;       // panned/zoomed plots by line: x0 x1 y0 y1 (ponytail: by index)
     std::map<int, Plot> viewPlots;
+    std::vector<std::pair<int, std::string>> plotLines;  // plot lines at the last edit, so views and turns can follow them
     std::future<int> pdfJob;                          // pdflatex in the background
     fs::path pdfOut, pdfTmp;
     bool printing = false;  // the running PDF export is for :print
@@ -570,6 +571,7 @@ struct App {
         saveCfg();
         vi.mode = vim ? Mode::Normal : Mode::Insert;
         views.clear();
+        turns.clear();
         changed(true);
         findBacklinks();
     }
@@ -1066,6 +1068,19 @@ struct App {
         if (force || j != lastJson) {
             lastJson = j;
             int n = int(ed.doc.size());
+            std::vector<std::pair<int, std::string>> nowPlots;
+            for (int k = 0; k < n; k++)
+                if (lineStyle(ed.doc[k]).kind == Line::Plot) nowPlots.push_back({k, toJson(ed.doc[k]).dump()});
+            auto moved = followLines(plotLines, nowPlots);
+            auto follow = [&](auto& state) {
+                std::decay_t<decltype(state)> next;
+                for (auto& [k, v] : state)
+                    if (auto f = moved.find(k); f != moved.end()) next[f->second] = v;
+                state = std::move(next);
+            };
+            follow(views);
+            follow(turns);
+            plotLines = std::move(nowPlots);
             ghosts.assign(n, std::nullopt);
             plots.assign(n, std::nullopt);
             viewPlots.clear();
@@ -1417,11 +1432,13 @@ struct App {
         return h;
     }
 
+    float plotAspect = 0;  // the plot area's shape when it differs from what the plots were fitted to
     float drawPlot(const Plot& pl, float x, float y, float w, int k) {
         const Palette& p = pal();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float h = std::min(320.f, w * 0.55f), padL = 44, padB = 22, padT = 8, padR = 10;
         ImVec2 a{x + padL, y + padT}, b{x + w - padR, y + h - padB};
+        if (float asp = (b.x - a.x) / (b.y - a.y); std::fabs(asp - mathOpts.plotAspect) > 0.02f) plotAspect = asp;
         ImGui::SetCursorScreenPos(a);
         ImGui::PushID(k);
         ImGui::InvisibleButton("plot", {b.x - a.x, b.y - a.y});
@@ -2657,6 +2674,14 @@ struct App {
         ImGui::EndChild();
         ImGui::BeginChild("doc", {0, -statusH}, 0, ImGuiWindowFlags_HorizontalScrollbar);
         drawDoc();
+        if (plotAspect > 0) {  // the window changed shape: shapes re-fit so a circle stays round
+            mathOpts.plotAspect = plotAspect;
+            plotAspect = 0;
+            std::erase_if(lineCache, [](auto& e) { return e.second.plot && e.second.plot->equal; });
+            bool scroll = scrollToCaret;
+            changed(true);
+            scrollToCaret = scroll;
+        }
         ImGui::EndChild();
         ImGui::EndGroup();
         drawStatus(statusH);

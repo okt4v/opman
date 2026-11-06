@@ -827,6 +827,89 @@ static void checkVi() {
         CHECK(lineStyle(e.doc.back()).kind == Line::Text);
     }
 
+    // selections over several lines
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "ione<CR>two<CR>three<Esc>ggwl");  // w stops on nothing here: to line 2
+        e.cur = {&e.doc[0], 1};
+        e.selectBetween({&e.doc[0], 1}, {&e.doc[2], 2});
+        CHECK(e.range && e.range->row2 && !e.selRange());
+        CHECK(e.selOn(e.doc[1]) == std::pair(0, 3));
+        CHECK(e.selOn(e.doc[0]) == std::pair(1, 3));
+        CHECK(e.selOn(e.doc[2]) == std::pair(0, 2));
+        CHECK_EQ(int(e.selectedLines().size()), 3);
+        CHECK_EQ(plain(e.selectedLines()[0]), "ne");
+        e.deleteSelection();
+        CHECK_EQ(int(e.doc.size()), 1);
+        CHECK_EQ(plain(e.doc[0]), "oree");
+        CHECK_EQ(e.cur.i, 1);
+        // backwards, and paste puts the pieces back
+        e.load({Row{ch("a", false), ch("b", false)}, Row{ch("c", false), ch("d", false)}}, Path{});
+        e.reindex();
+        e.selectBetween({&e.doc[1], 1}, {&e.doc[0], 1});
+        Doc parts = e.selectedLines();
+        CHECK_EQ(plain(parts[0]), "b");
+        CHECK_EQ(plain(parts[1]), "c");
+        e.deleteSelection();
+        CHECK_EQ(plain(e.doc[0]), "ad");
+        e.insertLines(parts);
+        CHECK_EQ(int(e.doc.size()), 2);
+        CHECK_EQ(plain(e.doc[0]), "ab");
+        CHECK_EQ(plain(e.doc[1]), "cd");
+        CHECK_EQ(e.cur.i, 1);
+        // vim: charwise Visual over lines, d and p, one undo; dw stops at the line end; db joins
+        Editor f;
+        Vi w;
+        keys(f, w, "ione<CR>two<CR>three<Esc>ggvjd");
+        CHECK_EQ(plain(f.doc[0]), "wo");
+        CHECK_EQ(plain(f.doc[1]), "three");
+        keys(f, w, "$p");
+        CHECK_EQ(plain(f.doc[0]), "woone");
+        CHECK_EQ(plain(f.doc[1]), "t");
+        keys(f, w, "uu");
+        CHECK_EQ(plain(f.doc[0]), "one");
+        CHECK_EQ(int(f.doc.size()), 3);
+        keys(f, w, "ggdw");
+        CHECK_EQ(plain(f.doc[0]), "");
+        CHECK_EQ(int(f.doc.size()), 3);
+        keys(f, w, "u");
+        keys(f, w, "jdb");
+        CHECK_EQ(plain(f.doc[0]), "two");
+        CHECK_EQ(int(f.doc.size()), 2);
+        // standard keys: Shift-Down selects, typing replaces, Ctrl-z brings it back; Ctrl-a twice is the whole note
+        Editor g;
+        Vi x;
+        x.standard = true;
+        x.mode = Mode::Insert;
+        keys(g, x, "ab<CR>cd<Esc><Up><S-Down>");
+        CHECK(g.range && g.range->row2);
+        keys(g, x, "Z");
+        CHECK_EQ(int(g.doc.size()), 1);
+        keys(g, x, "<C-z>");
+        CHECK_EQ(int(g.doc.size()), 2);
+        g.range.reset();
+        keys(g, x, "<C-a><C-a>");
+        CHECK(g.range && g.range->row2);
+        CHECK_EQ(int(g.selectedLines().size()), 2);
+        // typing in standard mode can be undone at all
+        Editor h;
+        Vi y;
+        y.standard = true;
+        y.mode = Mode::Insert;
+        keys(h, y, "hello");
+        keys(h, y, "<C-z>");
+        CHECK_EQ(plain(h.doc[0]), "");
+        // plot state follows its line
+        using PL = std::vector<std::pair<int, std::string>>;
+        auto m = followLines(PL{{2, "a"}, {5, "b"}}, PL{{3, "a"}, {6, "b"}});  // a line went in above
+        CHECK(m[2] == 3 && m[5] == 6);
+        m = followLines(PL{{2, "a"}, {5, "b"}}, PL{{2, "a"}, {5, "c"}});  // one was edited
+        CHECK(m[5] == 5);
+        m = followLines(PL{{2, "a"}, {5, "b"}}, PL{{4, "b"}});  // one was deleted
+        CHECK(m.size() == 1 && m[5] == 4);
+    }
+
     // matrices in insert mode: Shift+Space grows a column, Shift+Enter a row
     keys(ed, vi, "oA = (1<S-Space>2<S-CR>3<Tab>4<Esc>");
     CHECK(lineTex(ed.doc.back()).find("\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}") != std::string::npos);

@@ -263,10 +263,8 @@ struct Impl {
         float y0 = base - r.total.asc, y1 = base + r.total.desc;
         if (ed && L.dl) {
             if (ed->cur.row == &row && !c.top) L.dl->AddRectFilled({x - 1, y0}, {x + r.total.w + 1, y1}, L.pal->active, 3);
-            if (ed->range && ed->range->row == &row) {
-                auto [a, b] = *ed->selRange();
-                L.dl->AddRectFilled({x + r.xs[a], y0}, {x + r.xs[b], y1}, L.pal->sel);
-            }
+            if (auto s = ed->selOn(row))  // an empty line in a selection still shows
+                L.dl->AddRectFilled({x + r.xs[s->first], y0}, {x + r.xs[s->second] + (row.empty() ? 6 : 0), y1}, L.pal->sel);
         }
         for (size_t j = 0; j <= row.size(); j++) L.stops.push_back({&row, int(j), x + r.xs[j], y0, y1});
         if (row.empty() && !c.top) {

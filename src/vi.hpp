@@ -60,6 +60,7 @@ private:
         bool lines = false;
         Doc doc;
         Row items;
+        Doc parts;  // a charwise selection over several lines
     } reg;
     std::string copied;               // what we last put on the clipboard, so p knows whether it came from elsewhere
     std::vector<Key> rec, last;       // keys of the command being typed, and of the last one that changed the doc (.)

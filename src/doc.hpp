@@ -65,6 +65,9 @@ int stepBar(const Row& row);
 std::vector<std::pair<int, int>> eqRefs(const Row& row);
 std::string eqName(const Row& row, std::pair<int, int> span);
 std::map<std::string, int> eqNumbers(const std::vector<Row>& doc);
+// which line each of the old lines is now, given (line, content) lists from before and after an edit: same content
+// first, then what's left over pairs up in order when as many remain (an edited line). Lines that went are absent
+std::map<int, int> followLines(const std::vector<std::pair<int, std::string>>& before, const std::vector<std::pair<int, std::string>>& after);
 
 // constructors
 Item ch(std::string c, bool m);

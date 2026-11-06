@@ -34,6 +34,15 @@ static std::string eqNum(const Row& row, const std::map<std::string, int>& nums)
     return f == nums.end() ? "" : "(" + std::to_string(f->second) + ")";
 }
 
+// plots in exports have their own shape, whatever the app's window is (so a circle is round there too)
+namespace {
+struct PlotShape {
+    double keep = mathOpts.plotAspect;
+    explicit PlotShape(double aspect) { mathOpts.plotAspect = aspect; }
+    ~PlotShape() { mathOpts.plotAspect = keep; }
+};
+}  // namespace
+
 static std::string num(double x) {
     if (!std::isfinite(x)) return "nan";
     char b[32];
@@ -70,6 +79,7 @@ static const char* PREAMBLE = R"(\documentclass[11pt]{article}
 )";
 
 std::string latex(Editor& ed, const std::filesystem::path& base) {
+    PlotShape shape(1.6);  // about the shape of the pgfplots axis
     std::string out = PREAMBLE, env;
     auto open = [&](const std::string& e) {  // the list/quote environment the next line needs ("" = none)
         if (env == e) return;
@@ -383,6 +393,7 @@ mark { background: #facc1566; color: inherit; } .r { color: #e5484d; } .g { colo
 )HTML";
 
 std::string html(Editor& ed, const std::filesystem::path& base, const std::string& title) {
+    PlotShape shape(586.0 / 304);  // svgPlot's area
     std::string head = HTML_HEAD;
     head.replace(head.find("%TITLE%"), 7, htmlEsc(title));
     std::string out = head, env;

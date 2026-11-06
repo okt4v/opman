@@ -57,6 +57,8 @@ std::vector<Key> Vi::parse(const std::string& s) {
             else if (t == "Tab") k.sp = Key::Tab;
             else if (t == "BS") k.sp = Key::Backspace;
             else if (t == "F1") k.sp = Key::F1;
+            else if (t == "S-Down") k.sp = Key::Down, k.shift = true;
+            else if (t == "S-Up") k.sp = Key::Up, k.shift = true;
             else if (t == "Down") k.sp = Key::Down;
             else if (t == "Up") k.sp = Key::Up;
             else if (t == "Left") k.sp = Key::Left;
@@ -88,6 +90,7 @@ void Vi::toInsert(Editor& ed, bool snapped) {
 // ---------- formatting ----------
 std::pair<int, int> Vi::lines(const Editor& ed) const {
     if (auto v = visualLines(ed)) return *v;
+    if (ed.range && ed.range->row2) return std::minmax(ed.lineOf(ed.range->row), ed.lineOf(ed.range->row2));
     int k = ed.range ? ed.lineOf(ed.topOf(ed.range->row)) : lineIdx(ed);
     return {k, k};
 }
@@ -100,6 +103,15 @@ void Vi::format(Editor& ed, uint16_t flag) {
         auto [a, b] = lines(ed);
         ed.snap();
         for (int k = a; k <= b; k++) ed.toggleFmt(ed.doc[k], lineStyle(ed.doc[k]).len, int(ed.doc[k].size()), flag);
+        return done();
+    }
+    if (ed.range && ed.range->row2) {
+        auto [a, b] = lines(ed);
+        ed.snap();
+        for (int k = a; k <= b; k++) {
+            auto s = ed.selOn(ed.doc[k]);
+            ed.toggleFmt(ed.doc[k], std::max(s->first, lineStyle(ed.doc[k]).len), s->second, flag);
+        }
         return done();
     }
     if (auto s = ed.selRange()) {
@@ -158,7 +170,10 @@ void Vi::leaderKey(Editor& ed, const std::string& c) {
 void Vi::visualSelect(Editor& ed) {
     ed.selectBetween(anchor, ed.cur);
     int n = len(ed.cur.row);
-    if (!ed.range) {
+    if (ed.range && ed.range->row2) {
+        if (ed.lineOf(ed.range->row2) > ed.lineOf(ed.range->row)) ed.range->b = std::min(ed.range->b + 1, n);
+        else ed.range->a = std::min(ed.range->a + 1, len(ed.range->row));
+    } else if (!ed.range) {
         if (ed.cur.i < n) ed.range = Range{ed.cur.row, ed.cur.i, ed.cur.i + 1};
     } else if (ed.range->a < ed.range->b) ed.range->b = std::min(ed.range->b + 1, n);
     else ed.range->a = std::min(ed.range->a + 1, n);
@@ -219,6 +234,9 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         if (ed.inSlot() || ed.cur.i != len(ed.cur.row)) return std::nullopt;
         return ghost(ed, *ed.cur.row);
     };
+    // standard keys have no insert sessions to undo as one step: typing merges (Editor::snap), anything else is its own step
+    if (standard && (k.ctrl ? k.ch == "v" : k.sp == Key::Enter || k.sp == Key::Tab || k.sp == Key::Backspace || k.sp == Key::Delete || (k.sp == Key::None && !k.ch.empty())))
+        ed.snap(!ed.range && !k.ctrl && k.sp != Key::Enter && k.sp != Key::Tab ? "char" : "");
     auto sel = ed.selRange();
     int n = int(items.size());
     // a Ctrl-Space popup lasts while you type letters of its word
@@ -233,9 +251,10 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         else if (k.ch == "v" && getClip) { ed.deleteSelection(); pasteText(ed, getClip()); }
         else if (k.ch == "z") k.shift ? ed.redo() : ed.undo();
         else if (k.ch == "y") ed.redo();
-        else if ((k.ch == "c" || k.ch == "x") && sel) {
-            const Row& r = *ed.cur.row;
-            copied = markdown(Row(r.begin() + sel->first, r.begin() + sel->second));
+        else if ((k.ch == "c" || k.ch == "x") && ed.range) {
+            Doc parts = ed.selectedLines();
+            copied = parts.size() > 1 ? markdown(parts) : markdown(parts[0]);
+            if (parts.size() > 1 && copied.ends_with("\n")) copied.pop_back();
             if (setClip) setClip(copied);
             if (k.ch == "x") ed.snap(), ed.deleteSelection();
         } else if (k.ch == "f") mode = Mode::Command, prompt = '/', cmdline.clear();
@@ -276,11 +295,18 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         } else ed.exitSlot();
         return;
     case Key::Up: case Key::Down:
-        if (n) ed.pick = (ed.pick + (k.sp == Key::Down ? 1 : n - 1)) % n, navigated = true;
-        else { ed.range.reset(); ed.vertical(k.sp == Key::Up ? -1 : 1); }
+        if (k.shift) {  // select over lines
+            Cur from = ed.range ? Cur{ed.range->row, ed.range->a} : ed.cur;
+            ed.range.reset();
+            ed.vertical(k.sp == Key::Up ? -1 : 1);
+            ed.reindex();
+            ed.selectBetween(from, ed.cur);
+        } else if (n) ed.pick = (ed.pick + (k.sp == Key::Down ? 1 : n - 1)) % n, navigated = true;
+        else { ed.collapseSelection(k.sp == Key::Down); ed.range.reset(); ed.vertical(k.sp == Key::Up ? -1 : 1); }
         return;
     case Key::Left: case Key::Right:
         if (k.shift) ed.extendSelection(k.sp == Key::Left ? -1 : 1);
+        else if (ed.range && ed.range->row2) ed.collapseSelection(k.sp == Key::Right);
         else if (sel) { ed.cur.i = k.sp == Key::Left ? sel->first : sel->second; ed.range.reset(); }
         else if (ed.cellMove(k.sp == Key::Left ? -1 : 1, 0)) {}  // tables: cell to cell
         else if (k.sp == Key::Left) ed.left();
@@ -323,28 +349,39 @@ bool Vi::motion(Editor& ed, const std::string& m, int n, bool hasCount, bool str
     } else if (m == "j" || m == "k") {
         for (int k = 0; k < n; k++) ed.vertical(m == "j" ? 1 : -1);
         linewise = true;
-    } else if (m == "w") {
+    } else if (m == "w" || m == "e" || m == "b") {  // words run on over line ends, not out of a slot
+        int line = ed.inSlot() ? -1 : ed.lineOf(row), last = int(ed.doc.size()) - 1, i = ed.cur.i;
+        auto step = [&](int d) {
+            if (line < 0 || line + d < 0 || line + d > last) return false;
+            line += d;
+            row = &ed.doc[line];
+            i = d > 0 ? 0 : len(row);
+            return true;
+        };
         for (int k = 0; k < n; k++) {
-            int i = ed.cur.i;
-            while (i < len(row) && !sp(i)) i++;
-            while (i < len(row) && sp(i)) i++;
-            ed.cur.i = i;
+            if (m == "w") {
+                while (i < len(row) && !sp(i)) i++;
+                while (i < len(row) && sp(i)) i++;
+                if (i >= len(row) && step(1))
+                    while (i < len(row) && sp(i)) i++;
+            } else if (m == "e") {
+                i++;
+                for (;;) {
+                    while (i < len(row) && sp(i)) i++;
+                    if (i < len(row) || !step(1)) break;
+                }
+                while (i + 1 < len(row) && !sp(i + 1)) i++;
+                i = std::min(i, std::max(len(row) - 1, 0));
+            } else {
+                for (;;) {
+                    while (i > 0 && sp(i - 1)) i--;
+                    if (i > 0 || !step(-1)) break;
+                }
+                while (i > 0 && !sp(i - 1)) i--;
+            }
         }
-    } else if (m == "e") {
-        for (int k = 0; k < n; k++) {
-            int i = ed.cur.i + 1;
-            while (i < len(row) && sp(i)) i++;
-            while (i + 1 < len(row) && !sp(i + 1)) i++;
-            ed.cur.i = std::min(i, std::max(len(row) - 1, 0));
-        }
-        inclusive = true;
-    } else if (m == "b") {
-        for (int k = 0; k < n; k++) {
-            int i = ed.cur.i;
-            while (i > 0 && sp(i - 1)) i--;
-            while (i > 0 && !sp(i - 1)) i--;
-            ed.cur.i = i;
-        }
+        ed.cur = {row, i};
+        inclusive = m == "e";
     } else if (m == "0") ed.cur.i = 0;
     else if (m == "^") {
         int i = 0;
@@ -470,7 +507,8 @@ void Vi::normalKey(Editor& ed, const std::string& c0, const Key& k) {
         }
         Cur from = ed.cur;
         bool linewise, inclusive;
-        if (op == "c" && m == "w" && ed.cur.i < len(ed.cur.row) && !isSpace((*ed.cur.row)[ed.cur.i])) m = "e";  // cw is ce
+        bool cw = op == "c" && m == "w" && ed.cur.i < len(ed.cur.row) && !isSpace((*ed.cur.row)[ed.cur.i]);
+        if (cw) m = "e";  // cw is ce
         Editor::Snap before{ed.doc, ed.curPath()};
         if (!motion(ed, m, count, hasCount, false, linewise, inclusive)) return;
         if (linewise) {
@@ -487,10 +525,29 @@ void Vi::normalKey(Editor& ed, const std::string& c0, const Key& k) {
             }
             return;
         }
-        if (ed.cur.row != from.row) { ed.cur = from; return; }  // ponytail: operators work inside one row
+        if (ed.cur.row != from.row && m == "w" && !hasCount) ed.cur = {from.row, len(from.row)}, inclusive = false;  // dw on a line's last word stops there, as in vim
+        if (ed.cur.row != from.row && cw) ed.cur = from;  // so does cw
+        if (ed.cur.row != from.row) {  // db at a line start, de past its end, d3w: charwise over the lines
+            Cur to = ed.cur;
+            ed.selectBetween(from, to);
+            if (!ed.range || !ed.range->row2) { ed.range.reset(); ed.cur = from; return; }
+            if (inclusive) ed.range->b = std::min(ed.range->b + (ed.lineOf(ed.range->row2) > ed.lineOf(ed.range->row)), len(ed.range->row2));
+            reg.lines = false;
+            reg.items.clear();
+            reg.parts = ed.selectedLines();
+            yanked();
+            if (op == "y") { ed.collapseSelection(false); return; }
+            ed.changes++;
+            ed.undoStack.push_back(std::move(before));
+            ed.redoStack.clear();
+            ed.deleteSelection();
+            if (op == "c") toInsert(ed, true);
+            return;
+        }
         int a = std::min(from.i, ed.cur.i), b = std::max(from.i, ed.cur.i) + (inclusive ? 1 : 0);
         b = std::min(b, len(from.row));
         reg.lines = false;
+        reg.parts.clear();
         reg.items.assign(from.row->begin() + a, from.row->begin() + b);
         yanked();
         ed.cur = {from.row, a};
@@ -570,6 +627,9 @@ void Vi::normalKey(Editor& ed, const std::string& c0, const Key& k) {
                 ed.doc.insert(ed.doc.begin() + at, reg.doc.begin(), reg.doc.end());
                 ed.cur = {&ed.doc[at], 0};
                 ed.reindex();
+            } else if (!reg.parts.empty()) {
+                if (m == "p" && ed.cur.i < len(ed.cur.row)) ed.cur.i++;
+                ed.insertLines(reg.parts);
             } else if (!reg.items.empty()) {
                 if (m == "p" && ed.cur.i < len(ed.cur.row)) ed.cur.i++;
                 ed.insertItems(reg.items);
@@ -649,9 +709,12 @@ void Vi::visualKey(Editor& ed, const std::string& c, const Key& k) {
     } else {
         reg.lines = false;
         reg.items = ed.selectedItems();
+        reg.parts.clear();
+        if (ed.range && ed.range->row2) reg.parts = ed.selectedLines();
         yanked();
         if (del) { ed.snap(); ed.deleteSelection(); }
         else if (auto r = ed.selRange()) ed.cur = {ed.range->row, r->first};
+        else ed.collapseSelection(false);
         leave();
     }
     if (c == "c" || c == "s") toInsert(ed, del);
@@ -698,8 +761,9 @@ void Vi::commandKey(Editor& ed, const Key& k) {
 
 // ---------- clipboard and search ----------
 void Vi::yanked() {
-    copied = reg.lines ? markdown(reg.doc) : markdown(reg.items);
-    if (reg.lines && copied.ends_with("\n")) copied.pop_back();
+    bool many = reg.lines || !reg.parts.empty();
+    copied = reg.lines ? markdown(reg.doc) : many ? markdown(reg.parts) : markdown(reg.items);
+    if (many && copied.ends_with("\n")) copied.pop_back();
     if (setClip) setClip(copied);
 }
 

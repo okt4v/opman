@@ -1987,18 +1987,18 @@ Plot plot(Editor& ed, const Row& row, const double* view) {
         double pad = 0.08 * (hi - lo);
         out.y0 = lo - pad, out.y1 = hi + pad;
     }
-    // only shapes (parametric, polar, implicit; no y = f(x) or data): equal scales, so a circle is round. The plot area is
-    // about 2.4 times as wide as high (ponytail: the app's shape; a resize doesn't recompute it)
+    // only shapes (parametric, polar, implicit; no y = f(x) or data): equal scales, so a circle is round
     bool shapes = !fns.empty() && std::all_of(fns.begin(), fns.end(), [](auto& f) { return f.k == Param || f.k == Polar || f.k == Implicit; }) &&
                   fitFns.empty() && std::none_of(out.series.begin(), out.series.end(), [](auto& s) { return s.points; });
     if (shapes && !view) {
+        out.equal = true;
         if (implicit && ys.empty() && !yFixed) out.y0 = out.x0, out.y1 = out.x1;  // only implicit: x's range to start from
         if (implicit && !domain) {  // implicit curves can reach past the other curves: leave them room
             double cx = (out.x0 + out.x1) / 2, cyy = (out.y0 + out.y1) / 2, r = std::max({out.x1 - out.x0, out.y1 - out.y0, 4.0}) / 2;
             if (ys.empty()) r = (out.x1 - out.x0) / 2;
             out.x0 = cx - r, out.x1 = cx + r, out.y0 = cyy - r, out.y1 = cyy + r;
         }
-        double xs = out.x1 - out.x0, yspan = out.y1 - out.y0, aspect = 2.4;
+        double xs = out.x1 - out.x0, yspan = out.y1 - out.y0, aspect = mathOpts.plotAspect;
         if (!domain && !yFixed) {
             if (yspan * aspect > xs) { double m = (out.x0 + out.x1) / 2; out.x0 = m - yspan * aspect / 2, out.x1 = m + yspan * aspect / 2; }
             else { double m = (out.y0 + out.y1) / 2; out.y0 = m - xs / aspect / 2, out.y1 = m + xs / aspect / 2; }
