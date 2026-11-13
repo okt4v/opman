@@ -7,9 +7,11 @@ can keep anywhere; F1 in the app explains everything.
 ## Files
 
 Each note is one `.opman` file (JSON: text, math, tables, and pictures packed in as base64), so it can be copied,
-mailed or synced on its own. New notes go to the library folder (`~/Documents/opman`, changeable in Settings) and are
-named after their title; **Save as** (Ctrl-Shift-s, `:saveas`, `:w path`) puts a note anywhere, **Open** (Ctrl-Shift-o,
-`:open`) opens one from anywhere, and the sidebar lists the library plus recently opened notes. The installers
+mailed or synced on its own. A new note is *Untitled* until the first **Save** (Ctrl-s, `:w`) asks for a name and a
+folder; from then on it autosaves to that file (Settings can turn that off) and its file name is its name. **Save as**
+(Ctrl-Shift-s, `:saveas`, `:w path`) puts a note anywhere, **Open** (Ctrl-Shift-o, `:open`) opens one from anywhere,
+and the sidebar lists the notes folder (`~/Documents/opman`, File > Open folder changes it) plus recently opened notes.
+Closing with unsaved changes asks first, and unsaved changes are recovered after a crash. The installers
 register `.opman`, so a double-click opens it. Older corca `.json` notes are converted on first sight (the original
 goes to `.old/`). Open/save dialogs are the system's (Linux: zenity or kdialog), else a built-in browser.
 
@@ -42,9 +44,12 @@ Windows installer: `packaging/build-windows.sh` (NSIS, cross-built with mingw).
 | `/ ? n N` | search (smartcase) |
 | `d c y` + motion, `dd cc yy x D C S J r p P u Ctrl-r .` | editing, as in vim |
 | `v V` | Visual, Visual line |
-| `Space` | formatting leader: `b i u s c h` style, `^ _` super/subscript, `R G B` colour, `r` clear, `1 2 3` headings, `- n > t` lists, `x` tick, `\|` table, `/` divider, `=` section, `m` math |
+| `Space` | formatting leader: `b i u s c h` style, `^ _` super/subscript, `R O G T B P A` colour, `S +` small/large, `[ \\ ]` align, `r` clear, `1 2 3` headings, `- n > t` lists, `x` tick, `\|` table, `/` divider, `=` section, `m` math |
 | `Enter`, `gf`, `Ctrl-o` | follow a `[[link]]`, go back |
-| `Ctrl-m` | math mode: everything typed is math |
+| `Ctrl-m` | math mode: everything typed is math. Outside it everything is plain text (`:set automath` brings back math recognised in text) |
+| `Shift-Enter` | continue a long calculation (or sentence) in the next line; it stays one line with one result. Lines too long for the page wrap by themselves, math before an operator |
+| `Tab` `Shift-Tab`, `>>` `<<` | indent a list item or line |
+| `Ctrl-Shift-l` `e` `r` | align left, centre, right |
 | `Ctrl-v` (Insert), `p` | paste from the system clipboard; yanks are copied to it as Markdown |
 | `Ctrl-w`, `Ctrl-\` | focus / toggle the file list |
 | `Ctrl-Shift-p`, `F1`, `Ctrl-,` | command palette, help, settings |
@@ -73,8 +78,8 @@ line and take it from the popup with Tab (they're the *Program* functions there)
 | **plot** `sin(x) cos(y)`, `z = x y`, `(cos(t), sin(t), t)` | 3D: a surface over x and y, or a space curve; drag to turn it |
 | `=== Exercise 2` (Space =, `:section`) | a section banner. **Definitions don't cross it**: two exercises can both use `x` |
 | `\| a \| x^2 \| b \|` (Space \|, `:table`) | a table row; consecutive rows form a table, the first is the header. Tab / Shift-Tab move between cells, Enter adds a row, Enter on an empty row ends it. Right-click (or `:row above\|below\|delete`, `:col left\|right\|delete`) adds and removes rows and columns, in matrices too |
-| `---` (Space /) | a divider |
-| `![caption](path)` | an image: drag a picture onto the window or `:image path` (copied into `media/` next to the notes) |
+| `---` (Space /) | a divider. Definitions don't cross it either |
+| `![caption](path)` | a picture: drag one onto the window, Insert > Picture, paste a screenshot with Ctrl-v, or `:image path`. Drag its corner to resize, align it like text |
 
 Also:
 - **Sliders**: a line `a = 2` gets a drag handle; every result and plot using `a` follows as you drag.

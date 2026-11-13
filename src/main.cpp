@@ -1,5 +1,5 @@
 // opman: window, document column, popup, sidebar, files. The editing model lives in edit/math/vi, the typesetting
-// in layout. Dev hooks: OPMAN_DOCS=<dir> documents folder, OPMAN_KEYS="<vi keys>" typed at start,
+// in layout. Dev hooks: OPMAN_DOCS=<dir> documents folder, OPMAN_KEYS="<vi keys>" typed at start (<Wait> draws a frame),
 // OPMAN_SHOT=<file.ppm> saves a screenshot after OPMAN_SHOT_AFTER seconds (default 1.5) and quits.
 #include "doc.hpp"
 #include "layout.hpp"
@@ -279,6 +279,8 @@ struct App {
         textSize = std::clamp(cfg.value("textSize", 18.f), 12.f, 32.f);
         pageWidth = std::clamp(cfg.value("pageWidth", 820.f), 500.f, 2000.f);
         autosave = std::clamp(cfg.value("autosave", 0.5f), 0.f, 60.f);
+        autosaveOn = cfg.value("autosaveOn", true);
+        ed.autoMath = cfg.value("autoMath", false);
         toolbar = cfg.value("toolbar", true);
         vim = cfg.value("keys", std::string("vim")) == "vim";
         g_capsEscape = cfg.value("capsEscape", true);
@@ -322,6 +324,8 @@ struct App {
         cfg["textSize"] = textSize;
         cfg["pageWidth"] = pageWidth;
         cfg["autosave"] = autosave;
+        cfg["autosaveOn"] = autosaveOn;
+        cfg["autoMath"] = ed.autoMath;
         cfg["toolbar"] = toolbar;
         cfg["keys"] = vim ? "vim" : "standard";
         cfg["capsEscape"] = g_capsEscape;
@@ -363,7 +367,11 @@ struct App {
 
     // ---------- files ----------
     static std::string str(const json& m, const char* k) { return m.contains(k) && m[k].is_string() ? m[k].get<std::string>() : ""; }
-    static std::string titleOf(const json& m) {
+    // a note is called what its file is called
+    static std::string nameOf(const std::string& path) { return path.empty() ? "Untitled" : fs::path(path).stem().string(); }
+    std::string title() const { return nameOf(current); }
+    bool dirty() const { return lastJson != savedJson; }
+    static std::string metaTitle(const json& m) {  // corca notes carried their title inside
         std::string t = str(m, "title");
         if (t.empty()) t = str(m, "autoTitle");
         return t.empty() ? "Untitled" : t;
@@ -393,10 +401,10 @@ struct App {
         std::vector<FileInfo> out;
         std::string q = lower(filter);
         for (auto& f : files)
-            if (lower(titleOf(f.meta)).find(q) != std::string::npos || (!q.empty() && noteText(f.name).find(q) != std::string::npos))
+            if (lower(nameOf(f.name)).find(q) != std::string::npos || (!q.empty() && noteText(f.name).find(q) != std::string::npos))
                 out.push_back(f);
         std::stable_sort(out.begin(), out.end(), [&](auto& a, auto& b) {
-            if (sort == 2) return lower(titleOf(a.meta)) < lower(titleOf(b.meta));
+            if (sort == 2) return lower(nameOf(a.name)) < lower(nameOf(b.name));
             const char* k = sort == 1 ? "created" : "edited";
             return str(a.meta, k) > str(b.meta, k);
         });
@@ -436,7 +444,7 @@ struct App {
 
     void findBacklinks() {
         backlinks.clear();
-        std::string want = "[[" + lower(titleOf(meta)) + "]]";
+        std::string want = "[[" + lower(title()) + "]]";
         for (auto& f : files)
             if (f.name != current && noteText(f.name).find(want) != std::string::npos) backlinks.push_back(f);
     }
@@ -513,33 +521,105 @@ struct App {
                 {"media", packMedia()}};
     }
 
-    // writes only when the document changed, so moving the cursor doesn't bump "last edited"
-    void saveNow(bool force = false) {
+    // ---------- saving ----------
+    // A note is Untitled until Save (Ctrl-s) asks where it goes; after that Save writes that file, and autosave (a
+    // setting) keeps it current. Changes that aren't in a file yet are also kept in a recovery file, so a crash or a
+    // power cut loses nothing: it's read back at the next start.
+    bool autosaveOn = true;
+    std::function<void()> pending, afterSave;  // what waits for "save changes?", and for the Save As dialog
+    bool askSave = false;
+    static fs::path recoveryFile() { return configDir() / "recovery.opman"; }
+    void writeRecovery() {
+        json j = fileJson();
+        j["recoverFor"] = current;
+        writeFile(recoveryFile(), j);
+    }
+    static void dropRecovery() {
+        std::error_code ec;
+        fs::remove(recoveryFile(), ec);
+    }
+    // writes the note to its file; false when it has none yet or the write failed
+    bool saveNow() {
         changedAt = -1;
-        if (current.empty() || noSave) return;
+        if (current.empty() || noSave) return false;
         std::string j = docJson(ed.doc).dump();
-        if (j == savedJson && !force) return;
-        savedJson = j;
         json st = stats();
         for (auto& [k, v] : st.items()) meta[k] = v;
         meta["edited"] = nowIso();
         if (!writeFile(current, fileJson())) {
             message = "Could not write " + current;
-            savedJson.clear();
-            return;
+            return false;
         }
-        // a library note's file name follows its title ("Untitled.opman" becomes "Vectors.opman")
-        if (inLibrary(current) && meta.value("autoName", false)) {
-            fs::path want = freeName(dir, titleOf(meta), current);
-            std::error_code ec;
-            if (want != fs::path(current) && !fs::exists(want, ec)) {
-                fs::rename(current, want, ec);
-                if (!ec) moved(current, want.string());
-            }
-        }
+        savedJson = lastJson = j;
+        dropRecovery();
         auto f = std::find_if(files.begin(), files.end(), [&](auto& x) { return x.name == current; });
         if (f != files.end()) f->meta = meta;
         else files.push_back({current, meta});
+        return true;
+    }
+    void save() {
+        if (current.empty()) saveAsDialog();
+        else if (saveNow()) message = "Saved " + current;
+    }
+    // before the open note is replaced or the app quits: unsaved changes are saved (autosave) or asked about
+    void guard(std::function<void()> next) {
+        lastJson = docJson(ed.doc).dump();  // keys typed this frame haven't been through changed() yet
+        if (!dirty() || noSave) return next();
+        if (!current.empty() && autosaveOn) {
+            if (saveNow()) next();
+            return;
+        }
+        pending = std::move(next);
+        askSave = true;
+    }
+    void requestQuit() { guard([this] { quit = true; }); }
+    void drawAskSave() {
+        if (!askSave) return;
+        ImGui::OpenPopup("Save changes?");
+        ImVec2 d = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos({d.x / 2, d.y / 2}, ImGuiCond_Always, {0.5f, 0.5f});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {20, 16});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {10, 10});
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {14, 7});
+        if (ImGui::BeginPopupModal("Save changes?", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar)) {
+            panelFocused = true;
+            ImGui::PushFont(bold, 16);
+            ImGui::Text("Save the changes to \"%s\"?", title().c_str());
+            ImGui::PopFont();
+            ImGui::TextDisabled(current.empty() ? "This note hasn't been saved to a file yet." : "%s", current.c_str());
+            ImGui::Spacing();
+            int choice = 0;  // 1 save, 2 don't, 3 cancel
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(alpha(pal().fn, 0.35f)));
+            if (ImGui::Button(current.empty() ? "Save as…" : "Save") || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) choice = 1;
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(pal().line));
+            if (ImGui::Button("Don't save") || ImGui::IsKeyPressed(ImGuiKey_D)) choice = 2;
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) choice = 3;
+            ImGui::PopStyleColor();
+            ImGui::TextDisabled("Enter saves · D discards · Esc goes back");
+            if (choice) {
+                ImGui::CloseCurrentPopup();
+                askSave = false;
+                auto next = std::move(pending);
+                pending = nullptr;
+                if (choice == 1 && current.empty()) {
+                    afterSave = next;
+                    saveAsDialog(true);
+                    if (!browser.open) afterSave = nullptr;  // the system dialog has already answered
+                } else if (choice == 1) {
+                    if (saveNow()) next();
+                } else if (choice == 2) {
+                    savedJson = lastJson;
+                    changedAt = -1;
+                    dropRecovery();
+                    next();
+                }
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar(3);
     }
     // the open note's file has a new path
     void moved(const std::string& from, const std::string& to) {
@@ -555,7 +635,29 @@ struct App {
     }
 
     void openDoc(const std::string& name) {
-        saveNow();
+        if (name == current) return;
+        guard([this, name] { openNow(name); });
+    }
+    // the note in d becomes the open one, as the file `name` ("" for a note without a file)
+    void show(const json& d, const std::string& name) {
+        current = name;
+        meta = d.contains("meta") && d["meta"].is_object() ? d["meta"] : json::object();
+        if (str(meta, "id").empty()) meta["id"] = newId();
+        ed.undoStack.clear();
+        ed.redoStack.clear();
+        ed.mathMode = false;
+        ed.load(docFromJson(d.value("doc", json::array())), pathFromJson(d.value("path", json::object())));
+        if (!d.contains("format")) upgradePlots();
+        unpackMedia(d, name.empty() ? dir : fs::path(name).parent_path());
+        texs.clear();
+        savedJson = lastJson = docJson(ed.doc).dump();
+        changedAt = -1;
+        vi.mode = vim ? Mode::Normal : Mode::Insert;
+        views.clear();
+        turns.clear();
+        changed(true);
+    }
+    void openNow(const std::string& name) {
         json d;
         if (!readFile(name, d) || !d.is_object() || !d.contains("doc")) {
             message = "Could not read " + name;
@@ -565,26 +667,26 @@ struct App {
             history.push_back(current);
             if (history.size() > 50) history.erase(history.begin());
         }
-        current = name;
-        meta = d.contains("meta") && d["meta"].is_object() ? d["meta"] : json::object();
-        if (str(meta, "id").empty()) meta["id"] = newId();
-        ed.undoStack.clear();
-        ed.redoStack.clear();
-        ed.load(docFromJson(d.value("doc", json::array())), pathFromJson(d.value("path", json::object())));
-        if (!d.contains("format")) upgradePlots();
-        unpackMedia(d, fs::path(name).parent_path());
-        texs.clear();
-        savedJson = lastJson = docJson(ed.doc).dump();
+        show(d, name);
         if (fs::path(name).extension() == ".json") convert();  // corca's format: becomes name.opman
         if (std::none_of(files.begin(), files.end(), [&](auto& f) { return f.name == current; })) files.push_back({current, meta});
         remember(current);
         cfg["lastDoc"] = current;
         saveCfg();
-        vi.mode = vim ? Mode::Normal : Mode::Insert;
-        views.clear();
-        turns.clear();
-        changed(true);
         findBacklinks();
+    }
+    // unsaved changes from a run that ended without saving them
+    bool recover() {
+        json d;
+        if (!readFile(recoveryFile(), d) || !d.is_object() || !d.contains("doc")) return false;
+        std::string was = str(d, "recoverFor");
+        show(d, was);
+        savedJson = "\x01";  // differs from the document: it counts as changed until saved
+        changedAt = -1;
+        message = "Recovered changes that weren't saved" + (was.empty() ? std::string() : " to " + was);
+        if (!was.empty() && std::none_of(files.begin(), files.end(), [&](auto& f) { return f.name == was; })) files.push_back({was, meta});
+        findBacklinks();
+        return true;
     }
     // notes from before plot was a program function: a line starting with the text "plot " becomes a plot
     void upgradePlots() {
@@ -597,7 +699,7 @@ struct App {
     }
     // an open .json note becomes a .opman beside it; the .json moves into ".old" in that folder
     void convert() {
-        fs::path from = current, to = freeName(from.parent_path(), titleOf(meta));
+        fs::path from = current, to = freeName(from.parent_path(), metaTitle(meta));
         if (!writeFile(to, fileJson())) return;
         std::error_code ec;
         fs::create_directories(from.parent_path() / ".old", ec);
@@ -615,7 +717,6 @@ struct App {
                 current = f.name;
                 meta = d.contains("meta") && d["meta"].is_object() ? d["meta"] : json::object();
                 if (str(meta, "id").empty()) meta["id"] = newId();
-                meta["autoName"] = !meta.contains("title");
                 ed.load(docFromJson(d.value("doc", json::array())), pathFromJson(d.value("path", json::object())));
                 upgradePlots();
                 unpackMedia(d, dir);
@@ -633,19 +734,31 @@ struct App {
         return buf;
     }
 
-    void newDoc(const std::string& title = "") {
-        saveNow();
-        std::string t = nowIso();
-        fs::path file = freeName(dir, title.empty() ? "Untitled" : title);
-        json m = {{"created", t}, {"edited", t}, {"autoTitle", "Untitled"}, {"words", 0}, {"lines", 1}, {"defines", json::array()},
-                  {"id", newId()}, {"autoName", title.empty()}};
-        if (!title.empty()) m["title"] = title;
-        if (!writeFile(file, {{"format", "opman"}, {"version", 1}, {"meta", m}, {"doc", docJson(Doc{Row{}})}, {"path", pathJson({})}})) {
-            message = "Could not write " + file.string();
-            return;
-        }
-        files.push_back({file.string(), m});
-        openDoc(file.string());
+    // a new, empty note without a file
+    void newDoc() {
+        guard([this] { newNow(); });
+    }
+    void newNow() {
+        json d = {{"format", "opman"}, {"meta", {{"created", nowIso()}, {"id", newId()}}}, {"doc", docJson(Doc{Row{}})}};
+        show(d, "");
+        backlinks.clear();
+        cfg["lastDoc"] = "";
+        saveCfg();
+    }
+    // a new note that has its name already (a [[link]] to a note that doesn't exist, :new name): a file beside this one
+    void newNamed(const std::string& name) {
+        fs::path folder = current.empty() ? dir : fs::path(current).parent_path();
+        guard([this, folder, name] {
+            fs::path file = freeName(folder, name);
+            std::string t = nowIso();
+            json m = {{"created", t}, {"edited", t}, {"id", newId()}};
+            if (!writeFile(file, {{"format", "opman"}, {"version", 1}, {"meta", m}, {"doc", docJson(Doc{Row{}})}, {"path", pathJson({})}})) {
+                message = "Could not write " + file.string();
+                return;
+            }
+            files.push_back({file.string(), m});
+            openNow(file.string());
+        });
     }
 
     // Save As: the note continues in the new file (the old one stays as it was)
@@ -654,31 +767,31 @@ struct App {
         if (to.starts_with("~/")) to = (home() / to.substr(2)).string();
         fs::path p = fs::absolute(to);
         if (p.extension() != ".opman") p += ".opman";
-        json keepMeta = meta;
-        // a note that was only ever in the library under an automatic name moves; one you placed before is copied
-        bool move = inLibrary(current) && meta.value("autoName", false);
-        json st = stats();
-        for (auto& [k, v] : st.items()) meta[k] = v;
-        meta["autoName"] = false;
-        meta["edited"] = nowIso();
-        if (!writeFile(p, fileJson())) {
-            meta = keepMeta;
-            message = "Could not write " + p.string();
+        std::string old = current;
+        current = p.string();
+        if (!saveNow()) {
+            current = old;
             return;
         }
-        std::error_code ec;
-        if (move && !fs::equivalent(current, p, ec)) {
-            fs::remove(current, ec);
-            std::erase_if(files, [&](auto& f) { return f.name == current; });
-            std::erase(history, current);
-        }
-        current = p.string();
-        savedJson = docJson(ed.doc).dump();
-        if (std::none_of(files.begin(), files.end(), [&](auto& f) { return f.name == current; })) files.push_back({current, meta});
         remember(current);
         cfg["lastDoc"] = current;
         saveCfg();
-        message = "Saved as " + current;
+        findBacklinks();
+        message = "Saved " + current;
+        if (auto next = std::exchange(afterSave, nullptr)) next();
+    }
+    // the open note's file gets another name, in its folder
+    void rename(const std::string& name) {
+        if (current.empty()) return saveAsDialog();
+        if (name.empty()) { message = "Use :rename <new name>"; return; }
+        fs::path to = freeName(fs::path(current).parent_path(), name, current);
+        std::error_code ec;
+        if (to == fs::path(current)) return;
+        fs::rename(current, to, ec);
+        if (ec) { message = "Could not rename: " + ec.message(); return; }
+        moved(current, to.string());
+        findBacklinks();
+        message = "Renamed to " + to.filename().string();
     }
     void openPath(std::string path) {
         if (path.starts_with("~/")) path = (home() / path.substr(2)).string();
@@ -690,17 +803,13 @@ struct App {
         openDoc(p.string());
     }
 
-    void openMostRecent() {
+    // at start: unsaved changes from last time, else the note that was open, else a new one
+    void start() {
+        if (recover()) return;
         std::string last = str(cfg, "lastDoc");
-        if (openLast && std::any_of(files.begin(), files.end(), [&](auto& f) { return f.name == last; })) return openDoc(last);
-        if (openLast) {
-            int keep = sort;
-            sort = 0;
-            auto s = sortedFiles();
-            sort = keep;
-            if (!s.empty()) return openDoc(s[0].name);
-        }
-        newDoc();
+        std::error_code ec;
+        if (openLast && !last.empty() && fs::is_regular_file(last, ec)) openNow(last);
+        if (current.empty()) newNow();
     }
 
     // ponytail: "trash" is a .trash folder in the library; system trash APIs differ per OS
@@ -717,10 +826,7 @@ struct App {
         if (ec) { message = "Could not move " + name + " to the trash"; return; }
         std::erase_if(files, [&](auto& f) { return f.name == name; });
         std::erase(recent, name);
-        if (name == current) {
-            current.clear();
-            openMostRecent();
-        }
+        if (name == current) newNow();
         message = "Moved to " + (dir / ".trash").string();
     }
 
@@ -756,8 +862,10 @@ struct App {
     void openDialog() {
         askPath(false, "Open note", dir, noteFilter(), [this](std::string p) { openPath(p); });
     }
-    void saveAsDialog() {
-        fs::path start = current.empty() ? freeName(dir, titleOf(meta)) : fs::path(current).parent_path() / fs::path(current).filename();
+    // keepNext: the dialog was opened by "save changes?", and what waited on that runs after the save
+    void saveAsDialog(bool keepNext = false) {
+        if (!keepNext) afterSave = nullptr;
+        fs::path start = current.empty() ? freeName(dir, docTitle(ed.doc)) : fs::path(current);  // suggested: the first line
         askPath(true, "Save note as", start, {{"opman notes", "*.opman"}}, [this](std::string p) { saveAs(p); });
     }
     // :import [file]: a CSV or tab-separated file as a table at the cursor
@@ -798,7 +906,7 @@ struct App {
     }
 
     void exportDialog(const std::string& ext) {
-        std::string t = titleOf(meta);
+        std::string t = title();
         for (auto& c : t) if (std::strchr("/\\:*?\"<>|", c)) c = '-';
         fs::path start = (exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + ext);
         static const std::map<std::string, std::string> names = {{"md", "Markdown"}, {"html", "Web page"}, {"tex", "LaTeX"}, {"pdf", "PDF"}, {"csv", "Table (CSV)"}};
@@ -812,7 +920,14 @@ struct App {
         std::string name = cmd.substr(0, cmd.find(' ')), arg = cmd.size() > name.size() ? cmd.substr(name.size() + 1) : "";
         if (name == "sidebar") { sidebar = !sidebar; sideFocus = false; saveCfg(); }
         else if (name == "w" && !arg.empty()) saveAs(arg);
-        else if (name == "w") { saveNow(true); message = "\"" + titleOf(meta) + "\" saved to " + current; }
+        else if (name == "w") save();
+        else if (name == "close") newDoc();
+        else if (name == "align") {
+            vi.align(ed, arg == "center" || arg == "centre" ? 1 : arg == "right" ? 2 : 0);
+            changed();
+        }
+        else if (name == "indent" || name == "outdent") { vi.indent(ed, name == "indent" ? 1 : -1); changed(); }
+        else if (name == "pasteimage") pasteImage();
         else if (name == "saveas") { if (arg.empty()) saveAsDialog(); else saveAs(arg); }
         else if (name == "open") { if (arg.empty()) openDialog(); else openPath(arg); }
         else if (name == "help") { showHelp = true; helpTopic = arg; }
@@ -828,17 +943,18 @@ struct App {
         }
         else if (name.starts_with("s/") || name.starts_with("%s/")) substitute(cmd);
         else if (name == "folder") revealFolder();
-        else if (name == "q") quit = true;
-        else if (name == "q!") quit = noSave = true;
-        else if (name == "wq" || name == "x") { saveNow(); quit = true; }
-        else if (name == "new") newDoc(arg);
-        else if (name == "rename") {
-            if (arg.empty()) meta.erase("title");
-            else meta["title"] = arg;
-            if (inLibrary(current)) meta["autoName"] = true;  // the file name follows
-            savedJson.clear();
-            saveNow();
-            findBacklinks();
+        else if (name == "q") requestQuit();
+        else if (name == "q!") { quit = noSave = true; dropRecovery(); }
+        else if (name == "wq" || name == "x") {  // a note without a file asks where it goes first
+            if (current.empty()) {
+                afterSave = [this] { quit = true; };
+                saveAsDialog(true);
+                if (!browser.open) afterSave = nullptr;
+            }
+            else if (saveNow()) quit = true;
+        }
+        else if (name == "new") { if (arg.empty()) newDoc(); else newNamed(arg); }
+        else if (name == "rename") { rename(arg);
         } else if (name == "trash") { if (!current.empty()) trash(current); }
         else if (name == "set") {
             int n = 0;
@@ -849,6 +965,8 @@ struct App {
             else if (arg == "marks" || arg == "nomarks") plotMarks = arg == "marks";
             else if (arg == "pdf=auto" || arg == "pdf=latex" || arg == "pdf=builtin") pdfEngine = arg == "pdf=auto" ? 0 : arg == "pdf=latex" ? 1 : 2;
             else if (arg == "vim" || arg == "standard") { vim = arg == "vim"; vi.mode = vim ? Mode::Normal : Mode::Insert; }
+            else if (arg == "automath" || arg == "noautomath") ed.autoMath = arg == "automath";
+            else if (arg == "autosave" || arg == "noautosave") autosaveOn = arg == "autosave";
             else if (std::sscanf(arg.c_str(), "digits=%d", &n) == 1) mathOpts.digits = std::clamp(n, 2, 15);
             else { message = "Unknown option: " + arg + " (dark light · degrees radians · decimals fractions · digits=N · vim standard)"; return; }
             mathChanged();
@@ -871,9 +989,8 @@ struct App {
             ed.cur = {&ed.doc[ed.lineOf(ed.cur.row) + 1], 0};  // ready to write the exercise; k edits the title
         } else if (name == "link") {  // [[title]]: open the note with that title, or start it
             for (auto& f : files)
-                if (lower(titleOf(f.meta)) == lower(arg)) return openDoc(f.name);
-            newDoc(arg);
-            message = "New note \"" + arg + "\" (Ctrl-o goes back)";
+                if (lower(nameOf(f.name)) == lower(arg)) return openDoc(f.name);
+            newNamed(arg);
         } else if (name == "back") {
             if (history.empty()) { message = "No earlier note"; return; }
             std::string to = history.back();
@@ -899,7 +1016,7 @@ struct App {
             if (arg.empty()) return openDialog();
             std::string q = lower(arg);
             for (auto& f : sortedFiles())
-                if (f.name == arg || lower(titleOf(f.meta)).find(q) != std::string::npos) return openDoc(f.name);
+                if (f.name == arg || lower(nameOf(f.name)).find(q) != std::string::npos) return openDoc(f.name);
             message = "No document matches \"" + arg + "\"";
         }
     }
@@ -977,6 +1094,33 @@ struct App {
         changed();
     }
 
+    // the picture on the system clipboard (a screenshot, a copied image), through the platform's own tool.
+    // ponytail: shells out (wl-paste / xclip / osascript / powershell); GLFW's clipboard is text only
+    bool pasteImage(bool quiet = false) {
+        std::error_code ec;
+        fs::path f = fs::temp_directory_path(ec) / "opman-paste" / "pasted.png";
+        fs::create_directories(f.parent_path(), ec);
+        fs::remove(f, ec);
+        std::string q = "\"" + f.string() + "\"";
+#ifdef _WIN32
+        std::string cmd = "powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms; $i = [Windows.Forms.Clipboard]::GetImage(); "
+                          "if ($i) { $i.Save('" + f.string() + "') }\"";
+#elif defined(__APPLE__)
+        std::string cmd = "osascript -e 'set f to open for access POSIX file " + q + " with write permission' -e 'write (the clipboard as «class PNGf») to f' "
+                          "-e 'close access f' >/dev/null 2>&1";
+#else
+        std::string cmd = std::getenv("WAYLAND_DISPLAY") ? "wl-paste -t image/png > " + q + " 2>/dev/null"
+                                                         : "xclip -selection clipboard -t image/png -o > " + q + " 2>/dev/null";
+#endif
+        (void)std::system(cmd.c_str());
+        if (fs::file_size(f, ec) < 16 || ec) {
+            if (!quiet) message = "No picture on the clipboard";
+            return false;
+        }
+        addImage(f.string());
+        return true;
+    }
+
     // an image file: copied into the note (saved inside the .opman file)
     void addImage(std::string src) {
         if (src.starts_with("~/")) src = (home() / src.substr(2)).string();
@@ -994,11 +1138,13 @@ struct App {
         if (!fs::exists(to)) fs::copy_file(src, to, ec);
         if (ec) { message = "Could not copy " + src + ": " + ec.message(); return; }
         insertLines({"![](media/" + to.filename().string() + ")"}, 2);
+        ed.cur.row->align = 1;  // pictures start centred
+        changed();
     }
 
     // :export [file.md|file.tex|file.pdf|md|tex|pdf]; PDF goes through pdflatex
     void exportTo(std::string arg) {
-        std::string t = titleOf(meta);
+        std::string t = title();
         for (auto& c : t) if (std::strchr("/\\:*?\"<>| ", c)) c = '-';
         if (arg.empty()) arg = "md";
         if (arg == "md" || arg == "tex" || arg == "pdf" || arg == "html" || arg == "csv") arg = ((exportDir.empty() ? home() : fs::path(exportDir)) / (t + "." + arg)).string();
@@ -1012,7 +1158,7 @@ struct App {
         }
         if (ext != ".tex" && ext != ".pdf") {
             std::ofstream f(out, std::ios::binary);
-            bool ok = ext == ".html" || ext == ".htm" ? bool(f << html(ed, media, titleOf(meta))) : bool(f << markdown(ed.doc, media));
+            bool ok = ext == ".html" || ext == ".htm" ? bool(f << html(ed, media, title())) : bool(f << markdown(ed.doc, media));
             message = ok ? "Exported to " + out.string() : "Could not write " + out.string();
             return;
         }
@@ -1042,16 +1188,21 @@ struct App {
 
     // :tour: a new note typed by the tour's key script (in vim mode, whatever the setting)
     void tour() {
-        newDoc("Tour");
-        bool std0 = vi.standard;
-        vi.standard = false;
-        vi.mode = Mode::Normal;
-        for (auto& k : Vi::parse(tourKeys())) vi.key(ed, k);
-        vi.standard = std0;
-        vi.mode = std0 ? Mode::Insert : Mode::Normal;
-        vi.cmds.clear();
-        showHelp = false;
-        changed(true);
+        guard([this] {
+            newNow();
+            bool std0 = vi.standard;
+            vi.standard = false;
+            vi.mode = Mode::Normal;
+            auto hook = std::exchange(ed.visualLine, nullptr);  // the keys are typed in one go, before anything is drawn
+            for (auto& k : Vi::parse(tourKeys())) vi.key(ed, k);
+            ed.visualLine = hook;
+            ed.mathMode = false;
+            vi.standard = std0;
+            vi.mode = std0 ? Mode::Insert : Mode::Normal;
+            vi.cmds.clear();
+            showHelp = false;
+            changed(true);
+        });
     }
 
     // :print: a PDF to the default printer (lp; on Windows the PDF viewer's Print verb). Without pdflatex, or if lp
@@ -1069,7 +1220,7 @@ struct App {
         std::error_code ec;
         fs::path f = fs::temp_directory_path(ec) / "opman-print" / "note.html";
         fs::create_directories(f.parent_path(), ec);
-        std::string h = html(ed, media, titleOf(meta));
+        std::string h = html(ed, media, title());
         h.insert(h.rfind("</body>"), "<script>addEventListener('load', () => setTimeout(print, 200))</script>\n");
         if (!(std::ofstream(f, std::ios::binary) << h)) { message = "Could not write " + f.string(); return; }
         openExternal(f.string());
@@ -1313,7 +1464,12 @@ struct App {
     }
 
     void input() {
-        for (auto& d : std::exchange(g_drops, {})) run("image " + d);
+        for (auto& d : std::exchange(g_drops, {})) {  // a note dropped on the window opens; a picture goes into the note
+            std::string ext = lower(fs::path(d).extension().string());
+            if (ext == ".opman" || ext == ".json") openPath(d);
+            else if (ext == ".csv" || ext == ".tsv") importTable(d);
+            else addImage(d);
+        }
         if (g_keys.empty()) return;
         auto keys = std::move(g_keys);
         g_keys.clear();
@@ -1326,6 +1482,11 @@ struct App {
             if (k.ctrl && k.shift && k.ch == "s") { saveAsDialog(); continue; }
             if (k.ctrl && k.shift && k.ch == "o") { openDialog(); continue; }
             if (k.ctrl && k.shift && k.ch == "n") { newDoc(); continue; }
+            if (k.ctrl && k.ch == "q") { requestQuit(); continue; }
+            if (k.ctrl && k.shift && (k.ch == "l" || k.ch == "e" || k.ch == "r")) { run(k.ch == "l" ? "align left" : k.ch == "e" ? "align center" : "align right"); continue; }
+            if (!vim && k.ctrl && !k.shift && k.ch == "n" && vi.items.empty()) { newDoc(); continue; }
+            // Ctrl-v with a picture on the clipboard (no text) pastes the picture
+            if (k.ctrl && !k.shift && k.ch == "v" && vi.mode == Mode::Insert && !*ImGui::GetClipboardText() && pasteImage(true)) continue;
             if (k.ctrl && k.ch == ",") { showSettings = !showSettings; continue; }
             if (k.ctrl && (k.ch == "=" || k.ch == "+")) { run("zoom in"); continue; }
             if (k.ctrl && k.ch == "-") { run("zoom out"); continue; }
@@ -1360,6 +1521,7 @@ struct App {
         s[ImGuiCol_WindowBg] = c(p.bg);
         s[ImGuiCol_ChildBg] = c(p.bg, 0);
         s[ImGuiCol_PopupBg] = c(p.pop);
+        s[ImGuiCol_MenuBarBg] = c(p.side);
         s[ImGuiCol_Text] = c(p.fg);
         s[ImGuiCol_TextDisabled] = c(p.muted);
         s[ImGuiCol_Border] = c(p.line);
@@ -1414,24 +1576,42 @@ struct App {
         for (float w : width) L.tabs.push_back(L.tabs.back() + std::max(w, 2.5f * L.textSize));
     }
 
-    // returns the height; draw=false only measures
-    float drawImage(const Row& row, float x, float y, float maxW, bool draw) {
+    // the picture of an image line, placed in maxW by the line's alignment. Selected: an outline and a corner to drag
+    // for its size. Returns its height; sets resized when the drag changed the width
+    float drawImage(Row& row, float x, float y, float maxW, bool selected, int k, bool& resized) {
         std::string alt, path;
         imageRef(row, alt, path);
         Tex& t = texture(path);
         const Palette& p = pal();
         if (!t.id) {
-            if (draw) L.drawText("Image not found: " + path, x, y + L.textSize, L.textSize * 0.85f, p.muted, ui);
+            L.drawText("Picture not found: " + path, x, y + L.textSize, L.textSize * 0.85f, p.muted, ui);
             return L.textSize * 1.4f;
         }
-        float s = std::min({1.f, maxW / t.w, 420.f / t.h});
-        float h = t.h * s, capH = alt.empty() ? 0 : L.textSize * 1.4f;
-        if (draw) {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddImageRounded(t.id, {x, y}, {x + t.w * s, y + h}, {0, 0}, {1, 1}, IM_COL32_WHITE, 6);
-            if (!alt.empty()) L.drawText(alt, x, y + h + L.textSize * 1.1f, L.textSize * 0.82f, p.muted, ui);
+        float w = row.w ? std::min(float(row.w), maxW) : std::min({float(t.w), maxW, 420.f * t.w / t.h});
+        float h = w * t.h / t.w, ix = x + (maxW - w) * (row.align == 1 ? 0.5f : row.align == 2 ? 1.f : 0.f);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddImageRounded(t.id, {ix, y}, {ix + w, y + h}, {0, 0}, {1, 1}, IM_COL32_WHITE, 4);
+        if (!selected || printMode) return h;
+        dl->AddRect({ix - 2, y - 2}, {ix + w + 2, y + h + 2}, p.fn, 5.f, 0, 2.f);
+        bool left = row.align == 2;  // a right-aligned picture grows to the left
+        ImVec2 hc{left ? ix : ix + w, y + h};
+        ImGui::SetCursorScreenPos({hc.x - 10, hc.y - 10});
+        ImGui::PushID(k);
+        ImGui::InvisibleButton("imgsize", {20, 20});
+        ImGui::PopID();
+        bool active = ImGui::IsItemActive();
+        if (active || ImGui::IsItemHovered()) ImGui::SetMouseCursor(left ? ImGuiMouseCursor_ResizeNESW : ImGuiMouseCursor_ResizeNWSE);
+        if (ImGui::IsItemHovered() && !active) ImGui::SetTooltip("Drag to resize · double-click for its own size");
+        if (ImGui::IsItemActivated()) ed.snap(), sliderV0 = w, sliderX0 = ImGui::GetMousePos().x;
+        if (active) {
+            float dx = (ImGui::GetMousePos().x - sliderX0) * (left ? -1 : row.align == 1 ? 2 : 1);
+            uint16_t nw = uint16_t(std::clamp(float(sliderV0) + dx, 40.f, maxW));
+            if (nw != row.w) row.w = nw, resized = true;
         }
-        return h + capH;
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0) && row.w) ed.snap(), row.w = 0, resized = true;
+        dl->AddCircleFilled(hc, 6.5f, p.bg);
+        dl->AddCircleFilled(hc, 5, p.fn);
+        return h;
     }
 
     // "a = 2" (a name, =, a number): a drag handle after the line; dragging rewrites the number, and every result and
@@ -1754,52 +1934,93 @@ struct App {
         return h;
     }
 
+    // ↑/↓ over wrapped lines: the place on the visual line above/below nearest to the caret's x, from the positions
+    // the last frame drew. False when those are out of date (the note changed since) or there is no such line
+    int stopsGen = -1;
+    bool visualMove(int d) {
+        if (stopsGen != ed.gen) return false;
+        const Stop* at = nullptr;
+        for (auto& s : L.stops)
+            if (s.row == ed.cur.row && s.i == ed.cur.i) { at = &s; break; }
+        if (!at) return false;
+        float gap = FLT_MAX;
+        auto away = [&](const Stop& s) { return d < 0 ? at->y0 - s.y1 : s.y0 - at->y1; };
+        for (auto& s : L.stops)
+            if (ed.lineOf(s.row) >= 0 && away(s) > -1) gap = std::min(gap, away(s));
+        const Stop* best = nullptr;
+        for (auto& s : L.stops)
+            if (ed.lineOf(s.row) >= 0 && away(s) > -1 && away(s) <= gap + 1 && (!best || std::fabs(s.x - at->x) < std::fabs(best->x - at->x))) best = &s;
+        if (!best) return false;
+        ed.cur = {const_cast<Row*>(best->row), best->i};
+        ed.snapToCell();
+        return true;
+    }
+
     void drawDoc() {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 origin = ImGui::GetCursorScreenPos();
-        float avail = ImGui::GetContentRegionAvail().x, colW = printMode ? avail : std::min(pageWidth, avail);
-        float x0 = origin.x + std::max(0.f, (avail - colW) / 2) + 32, y = origin.y + 48, maxW = 0;
+        // the page: a sheet centred on the canvas, the text inside its margins
+        float avail = ImGui::GetContentRegionAvail().x, pad = printMode ? 32 : avail < 640 ? 24 : 64;
+        float colW = printMode ? avail : std::min(pageWidth, avail - 24), pageX = origin.x + std::max(0.f, (avail - colW) / 2);
+        float pageTop = origin.y + (printMode ? 0 : 20), x0 = pageX + pad, y = pageTop + 48, maxW = 0;
         if (printMode) y += 48 - printTop;
         L.dl = dl;
         L.ed = printMode ? nullptr : &ed;
         L.stops.clear();
         auto vl = printMode ? std::nullopt : vi.visualLines(ed);
         const Palette& p = pal();
-        float blockW = colW - 64;
-        bool slid = false;  // a slider changed the doc during this frame
+        float blockW = colW - 2 * pad;
+        bool slid = false;  // a slider or a picture's corner changed the doc during this frame
         L.eqNums = eqNumbers(ed.doc);  // ponytail: recounted every frame; cache on changes if long notes get slow
+        if (!printMode) dl->ChannelsSplit(2), dl->ChannelsSetCurrent(1);  // the sheet is drawn last, but under the text
+        int counters[MAX_INDENT + 2] = {};  // numbered lists count per nesting level
+        const Row* curTop = ed.topOf(ed.cur.row);
         for (size_t k = 0; k < ed.doc.size(); k++) {
-            const Row& row = ed.doc[k];
+            Row& row = ed.doc[k];
             Line kind = lineStyle(row).kind;
             if (printMode) lineStarts.push_back(y + printTop - 48);
-            bool here = !printMode && ed.topOf(ed.cur.row) == &row, first = k == 0 || lineStyle(ed.doc[k - 1]).kind != kind;
+            bool here = !printMode && curTop == &row, first = k == 0 || lineStyle(ed.doc[k - 1]).kind != kind;
+            bool lineSel = (vl && int(k) >= vl->first && int(k) <= vl->second) || (!printMode && ed.range && ed.range->row2 && ed.selOn(row));
+            int depth = std::min<int>(row.indent, MAX_INDENT);
+            L.listNum = kind == Line::Number ? ++counters[depth] : 0;
+            for (int d = depth + (kind == Line::Number); d <= MAX_INDENT; d++) counters[d] = 0;
+            float lx = x0 + depth * 1.6f * L.textSize, lw = std::max(80.f, blockW - depth * 1.6f * L.textSize);
+            L.wrapW = lw;
+            L.placeholder.clear();
             if (kind == Line::Table && first) tableTabs(k);
             if (kind != Line::Table) L.tabs.clear();
             L.tableHeader = kind == Line::Table && first;
-            // a divider or picture shows its source only while the cursor is on it; a stop keeps it clickable
-            if ((kind == Line::Rule || kind == Line::Image || kind == Line::Section) && !here) {
-                float h = kind == Line::Rule ? L.textSize * 1.4f : kind == Line::Section ? L.textSize * 3.2f
-                        : drawImage(row, x0, y + 6, blockW, false) + 12;
-                if (kind == Line::Rule) dl->AddLine({x0, y + h / 2}, {x0 + blockW, y + h / 2}, p.line, 1.5f);
-                else if (kind == Line::Section) {  // a banner: the title over a heavy rule; its own variables below
-                    float by = y + h - L.textSize * 0.7f;
-                    std::string t = sectionTitle(row);
-                    L.drawText("§", x0 - 22, by - 8, L.textSize, p.muted, bold);
-                    L.drawText(t.empty() ? "Section" : t, x0, by - 8, L.textSize * 1.1f, p.fg, bold);
-                    dl->AddRectFilled({x0, by}, {x0 + blockW, by + 2.5f}, p.fg, 1);
-                } else drawImage(row, x0, y + 6, blockW, true);
-                L.stops.push_back({&row, 0, x0, y, y + h});
+            if (kind == Line::Rule) {  // a divider: an object, picked out when the cursor is on it. Variables end here
+                float h = L.textSize * 1.6f;
+                if (here || lineSel) dl->AddRectFilled({lx - 6, y + 3}, {lx + lw + 6, y + h - 3}, here && !lineSel ? p.active : p.sel, 4);
+                dl->AddLine({lx, y + h / 2}, {lx + lw, y + h / 2}, here ? p.fn : p.line, 1.5f);
+                L.stops.push_back({&row, 3, lx, y, y + h});
                 y += h;
                 continue;
             }
+            float picTop = y;
+            if (kind == Line::Image) {  // the picture, then its caption as a small line of text under it
+                y += 8;
+                y += drawImage(row, lx, y, lw, here, int(k), slid) + 4;
+                std::string alt, path;
+                imageRef(row, alt, path);
+                if (alt.empty() && !here) {
+                    if (lineSel) dl->AddRectFilled({lx - 6, picTop}, {lx + lw + 6, y + 6}, alpha(p.sel, 0.5f), 4);
+                    L.stops.push_back({&row, 2, lx, picTop, y});
+                    y += 6;
+                    continue;
+                }
+                L.placeholder = "Caption";
+            }
+            if (kind == Line::Section) y += L.textSize * 1.1f, L.placeholder = "Section";
             Box b = L.measureLine(row);
             y += L.textSize * (k == 0 ? 0 : kind == Line::H1 ? 0.9f : kind == Line::H2 ? 0.6f : kind == Line::H3 ? 0.35f : 0);
-            float h = std::max(L.textSize * 1.7f, b.asc + b.desc + 10);
+            float h = kind == Line::Image ? b.asc + b.desc + 6 : std::max(L.textSize * 1.7f, b.asc + b.desc + 10);
             float base = std::round(y + (h - b.asc - b.desc) / 2 + b.asc);
-            if (vl && int(k) >= vl->first && int(k) <= vl->second) dl->AddRectFilled({x0 - 6, y}, {x0 + colW - 58, y + h}, p.sel);
+            if (lineSel && vl) dl->AddRectFilled({x0 - 6, y}, {x0 + blockW + 6, y + h}, p.sel);
             if (kind == Line::Table) {  // grid: borders at the column stops, a rule under the header
                 bool last = k + 1 == ed.doc.size() || lineStyle(ed.doc[k + 1]).kind != Line::Table;
-                float bx = x0 + 0.45f * L.textSize;  // the middle of a border's padding
+                float bx = lx + 0.45f * L.textSize;  // the middle of a border's padding
                 for (float t : L.tabs) dl->AddLine({bx + t, y}, {bx + t, y + h}, p.line, 1.2f);
                 float r = bx + (L.tabs.empty() ? 0 : L.tabs.back());
                 if (first) dl->AddRectFilled({bx, y}, {r, y + h}, alpha(p.line, 0.35f));
@@ -1807,55 +2028,67 @@ struct App {
                 if (first) dl->AddLine({bx, y + h}, {r, y + h}, p.muted, 1.2f);
                 if (last) dl->AddLine({bx, y + h}, {r, y + h}, p.line, 1.2f);
             }
-            L.drawLine(row, x0, base);
+            L.drawLine(row, lx, base);
+            float endX = lx + L.endX, endBase = base + L.endY;  // where the text stops: results and sliders go after it
+            if (kind == Line::Section) {  // a banner: the title over a heavy rule; its own variables below
+                L.drawText("§", lx - 22, base, L.textSize, p.muted, bold);
+                dl->AddRectFilled({lx, y + h - 2}, {lx + lw, y + h + 0.5f}, p.fg, 1);
+                h += 8;
+            }
             if (auto t = eqTag(row); t.first >= 0) {  // the equation's number at the right edge
                 auto f = L.eqNums.find(eqName(row, t));
                 std::string n = "(" + std::to_string(f == L.eqNums.end() ? 0 : f->second) + ")";
                 L.drawText(n, x0 + blockW - L.textWidth(n, L.textSize), base, L.textSize, p.fg, ui);
             }
-            if (kind == Line::Image) h += drawImage(row, x0, y + h, blockW, true) + 8;
             if (kind == Line::Plot && k < plots.size() && plots[k]) {
                 if (views.count(int(k)) && !viewPlots.count(int(k))) viewPlots[int(k)] = plot(ed, row, views[int(k)].data());
-                if (plots[k]->is3d()) h += drawPlot3D(*plots[k], x0, y + h, blockW, int(k)) + 12;
-                else h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], x0, y + h, blockW, int(k)) + 12;
+                if (plots[k]->is3d()) h += drawPlot3D(*plots[k], lx, y + h, lw, int(k)) + 12;
+                else h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], lx, y + h, lw, int(k)) + 12;
             }
-            float w = b.w;
             if (!printMode && k < ghosts.size() && ghosts[k]) {
-                L.drawText(ghosts[k]->text, x0 + b.w + 0.5f * L.textSize, base, L.textSize * 0.9f, ghosts[k]->warn ? IM_COL32(0xe5, 0x48, 0x4d, 255) : alpha(p.muted, 0.85f));
-                w += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
+                L.drawText(ghosts[k]->text, endX + 0.5f * L.textSize, endBase, L.textSize * 0.9f, ghosts[k]->warn ? IM_COL32(0xe5, 0x48, 0x4d, 255) : alpha(p.muted, 0.85f));
+                endX += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
             }
-            if (kind == Line::Text && sliders && !printMode && !(k > 0 && stepBar(ed.doc[k - 1]) >= 0)) slid = slider(ed.doc[k], x0 + w + 20, base, int(k)) || slid;
-            maxW = std::max(maxW, w);
+            if (kind == Line::Text && sliders && !printMode && !(k > 0 && stepBar(ed.doc[k - 1]) >= 0)) slid = slider(ed.doc[k], endX + 20, endBase, int(k)) || slid;
+            maxW = std::max(maxW, endX - x0);
             y += h;
         }
+        L.wrapW = 0, L.listNum = 0;
+        L.placeholder.clear();
         if (slid) {
             ed.reindex();
             changed();
             scrollToCaret = false;  // dragging a slider shouldn't scroll back to the cursor
         }
         if (printMode) { lineStarts.push_back(y + printTop - 48); return; }
+        float pageBottom = std::max(y + 96, origin.y + ImGui::GetWindowHeight() - 24);
+        dl->ChannelsSetCurrent(0);
+        dl->AddRectFilled({pageX + 1, pageTop + 3}, {pageX + colW + 1, pageBottom + 3}, IM_COL32(0, 0, 0, dark ? 70 : 22), 5);
+        dl->AddRectFilled({pageX, pageTop}, {pageX + colW, pageBottom}, p.bg, 5);
+        dl->AddRect({pageX, pageTop}, {pageX + colW, pageBottom}, alpha(p.line, dark ? 0.6f : 0.9f), 5);
+        dl->ChannelsSetCurrent(1);
         // search matches: everything the pattern hits, as you type it after "/"
         if (std::string pat = vi.highlight(); !pat.empty()) {
             std::unordered_map<const Row*, std::vector<const Stop*>> at;
             for (auto& s : L.stops) at[s.row].push_back(&s);
             for (auto& m : Vi::matches(ed, pat)) {
-                const Stop *a = nullptr, *b = nullptr;
-                for (auto* s : at[&ed.doc[m.line]]) {
-                    if (s->i == m.a) a = s;
-                    if (s->i == m.b) b = s;
-                }
-                if (a && b) dl->AddRectFilled({a->x, a->y0}, {b->x, a->y1}, IM_COL32(250, 204, 21, 80), 3);
+                auto& v = at[&ed.doc[m.line]];  // a line's stops are in order, one per item
+                for (int j = m.a; j < m.b && j + 1 < int(v.size()); j++)
+                    if (v[j]->y0 == v[j + 1]->y0 && v[j + 1]->x > v[j]->x) dl->AddRectFilled({v[j]->x, v[j]->y0}, {v[j + 1]->x, v[j]->y1}, IM_COL32(250, 204, 21, 80));
             }
         }
-        // caret: a bar in Insert, a block over the item under the cursor otherwise
+        // caret: a bar in Insert (in the accent colour while typing math), a block over the item under the cursor otherwise
         caretPos = {-1, -1};
+        bool object = !ed.inSlot() && lineStyle(*ed.cur.row).kind == Line::Rule;  // shown as picked, not with a caret
         for (size_t s = 0; s < L.stops.size(); s++) {
             const Stop& st = L.stops[s];
             if (st.row != ed.cur.row || st.i != ed.cur.i) continue;
             float y0 = st.y0, y1 = st.y1;
-            if (vi.mode == Mode::Insert) dl->AddRectFilled({st.x - 0.5f, y0}, {st.x + 1.5f, y1}, p.fg);
+            if (object) {}
+            else if (vi.mode == Mode::Insert) dl->AddRectFilled({st.x - 0.5f, y0}, {st.x + 1.5f, y1}, ed.mathMode || ed.inSlot() ? p.fn : p.fg);
             else {
-                float x1 = s + 1 < L.stops.size() && L.stops[s + 1].row == st.row ? L.stops[s + 1].x : st.x;
+                bool next = s + 1 < L.stops.size() && L.stops[s + 1].row == st.row && L.stops[s + 1].y0 == st.y0;
+                float x1 = next ? L.stops[s + 1].x : st.x;
                 if (x1 - st.x < 0.4f * L.textSize) x1 = st.x + 0.45f * L.textSize;
                 dl->AddRectFilled({st.x, y0}, {x1, y1}, alpha(p.fg, 0.4f));
             }
@@ -1869,8 +2102,10 @@ struct App {
             }
             break;
         }
+        dl->ChannelsMerge();
+        stopsGen = ed.gen;
         ImGui::SetCursorScreenPos(origin);  // sliders and plots placed widgets; size the scroll area from the top
-        ImGui::Dummy({std::max(maxW + 64, colW), y - origin.y + ImGui::GetWindowHeight() * 0.4f});
+        ImGui::Dummy({std::max(avail, x0 - origin.x + maxW + pad), pageBottom - origin.y + 28});
         // mouse: click places the cursor (Ctrl-click follows a [[link]]), drag selects
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
             sideFocus = false;
@@ -1887,8 +2122,9 @@ struct App {
                         return;
                     }
             Line kind = lineStyle(*ed.cur.row).kind;  // a click on a checkbox ticks it
+            float lx = x0 + ed.cur.row->indent * 1.6f * L.textSize;
             if ((kind == Line::Todo || kind == Line::Done) && ed.topOf(ed.cur.row) == ed.cur.row &&
-                ImGui::GetMousePos().x < x0 + 1.3f * L.textSize && ImGui::GetMousePos().x > x0)
+                ImGui::GetMousePos().x < lx + 1.3f * L.textSize && ImGui::GetMousePos().x > lx)
                 vi.toggleDone(ed);
             dragging = true;
             changed();
@@ -1896,10 +2132,10 @@ struct App {
             vi.mouse(ed, hit(ImGui::GetMousePos()), true);
         }
         if (!ImGui::IsMouseDown(0)) dragging = false;
-        // right-click in a table or matrix: add and remove rows and columns
+        // right-click: what can be done here (rows and columns in a table or matrix, paragraph formatting elsewhere)
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(1) && !ImGui::IsAnyItemHovered()) {
-            vi.mouse(ed, hit(ImGui::GetMousePos()), false);
-            if (ed.inGrid()) ImGui::OpenPopup("grid");
+            if (!ed.range) vi.mouse(ed, hit(ImGui::GetMousePos()), false);
+            ImGui::OpenPopup(ed.inGrid() ? "grid" : "context");
         }
         if (ImGui::BeginPopup("grid")) {
             bool m = ed.inSlot();
@@ -1910,6 +2146,13 @@ struct App {
             for (auto& [label, cmd] : OPS)
                 if (!label) ImGui::Separator();
                 else if (ImGui::MenuItem(label)) run(cmd);
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopup("context")) {
+            editItems();
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Paragraph")) { paragraphItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Insert")) { insertItems(); ImGui::EndMenu(); }
             ImGui::EndPopup();
         }
     }
@@ -1989,9 +2232,16 @@ struct App {
                 section("While you write");
                 check("Live results after each line", results, "The faint \"= 17\" at the end of a line; Tab writes it in", true);
                 check("Sliders on lines like a = 2", sliders, "Drag to change the number; results and plots follow");
+                check("Read math in text mode too", ed.autoMath,
+                      "Off: outside math mode (Ctrl-m) everything you type is plain text.\nOn: text like \"x = 5\" or \"2 m\" turns into math by itself, as in earlier versions");
+                section("Saving");
+                check("Autosave notes that have a file", autosaveOn,
+                      "A note is Untitled until Ctrl-s gives it a name and a folder. After that, with this on, changes are written to that file as you go.\n"
+                      "Off: only Ctrl-s writes the file. Either way unsaved changes survive a crash: they're recovered at the next start");
+                ImGui::BeginDisabled(!autosaveOn);
                 ImGui::SetNextItemWidth(200);
                 if (ImGui::SliderFloat("Autosave after", &autosave, 0.2f, 10, "%.1f s idle")) cfgDirty = true;
-                hint("Notes save themselves this long after you stop typing (Ctrl-s saves at once)");
+                ImGui::EndDisabled();
                 section("Start");
                 check("Open the last note at start (otherwise a new note)", openLast);
                 ImGui::EndTabItem();
@@ -2060,15 +2310,9 @@ struct App {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Files")) {
-                section("Library");
-                ImGui::TextWrapped("New notes are saved in %s", dir.string().c_str());
-                if (ImGui::Button("Change library folder…"))
-                    askPath(false, "Library folder", dir, {}, [this](std::string f) {
-                        saveNow();
-                        dir = f;
-                        saveCfg();
-                        listFiles();
-                    }, true);
+                section("Notes folder");
+                ImGui::TextWrapped("The sidebar lists the notes in %s, and Save starts there.", dir.string().c_str());
+                if (ImGui::Button("Change notes folder…")) openFolder();
                 ImGui::SameLine();
                 if (ImGui::Button("Open in file manager")) {
                     std::string keep = current;
@@ -2205,6 +2449,13 @@ struct App {
     std::vector<Action> actions() {
         std::vector<Action> a = {
             {"New note", "Ctrl-Shift-n", [this] { newDoc(); }},
+            {"Open folder…", "", [this] { openFolder(); }},
+            {"Align left", "Ctrl-Shift-l", [this] { run("align left"); }},
+            {"Centre", "Ctrl-Shift-e", [this] { run("align center"); }},
+            {"Align right", "Ctrl-Shift-r", [this] { run("align right"); }},
+            {"Indent more", "Tab", [this] { run("indent"); }},
+            {"Indent less", "Shift-Tab", [this] { run("outdent"); }},
+            {"Paste picture from the clipboard", "Ctrl-v", [this] { pasteImage(); }},
             {"Open note…", "Ctrl-Shift-o", [this] { openDialog(); }},
             {"Save", "Ctrl-s", [this] { run("w"); }},
             {"Save as…", "Ctrl-Shift-s", [this] { saveAsDialog(); }},
@@ -2213,7 +2464,7 @@ struct App {
             {"Export as LaTeX…", "", [this] { exportDialog("tex"); }},
             {"Export as PDF…", "", [this] { exportDialog("pdf"); }},
             {"Show in file manager", ":folder", [this] { revealFolder(); }},
-            {"Rename note…", ":rename", [this] { exCmd("rename "); }},
+            {"Rename note…", ":rename", [this] { exCmd("rename " + title()); }},
             {"Move note to trash", ":trash", [this] { run("trash"); }},
             {"Go back to the previous note", "Ctrl-o", [this] { run("back"); }},
             {"Settings", "Ctrl-,", [this] { showSettings = true; }},
@@ -2234,12 +2485,10 @@ struct App {
             {"Table/matrix: add column left", ":col left", [this] { run("col left"); }},
             {"Table/matrix: delete row", ":row delete", [this] { run("row delete"); }},
             {"Table/matrix: delete column", ":col delete", [this] { run("col delete"); }},
-            {"Insert section (new set of variables)", "Space =", [this] { run("section"); }},
-            {"Insert divider", "Space /", [this] { run("rule"); }},
-            {"Insert picture…", ":image", [this] {
-                 askPath(false, "Insert picture", home(), {{"Pictures", "*.png *.jpg *.jpeg *.gif *.bmp"}}, [this](std::string f) { addImage(f); });
-             }},
-            {"Math mode on/off", "Ctrl-m", [this] { ed.mathMode = !ed.mathMode; }},
+            {"Insert section (a titled divider)", "Space =", [this] { run("section"); }},
+            {"Insert divider (variables start afresh)", "Space /", [this] { run("rule"); }},
+            {"Insert picture…", ":image", [this] { pickImage(); }},
+            {"Math mode on/off", "Ctrl-m", [this] { ed.toggleMath(); }},
             {dark ? "Light theme" : "Dark theme", "", [this] { dark = !dark; saveCfg(); }},
             {"Bigger text", "Ctrl-=", [this] { run("zoom in"); }},
             {"Smaller text", "Ctrl--", [this] { run("zoom out"); }},
@@ -2248,7 +2497,7 @@ struct App {
             {mathOpts.decimals ? "Exact results (fractions)" : "Decimal results", "", [this] { run(mathOpts.decimals ? "set fractions" : "set decimals"); }},
             {vim ? "Standard keys (no vim modes)" : "Vim keys", "", [this] { run(vim ? "set standard" : "set vim"); }},
             {results ? "Hide live results" : "Show live results", "", [this] { results = !results; mathChanged(); }},
-            {"Quit", ":q", [this] { quit = true; }},
+            {"Quit", "Ctrl-q", [this] { requestQuit(); }},
         };
         for (auto& t : helpTopics()) {
             std::string title = t.title;
@@ -2256,7 +2505,7 @@ struct App {
         }
         for (auto& f : files) {
             std::string n = f.name;
-            a.push_back({"Open: " + titleOf(f.meta), "", [this, n] { openDoc(n); }});
+            a.push_back({"Open: " + nameOf(f.name), "", [this, n] { openDoc(n); }});
         }
         return a;
     }
@@ -2338,7 +2587,7 @@ struct App {
         ImGui::SameLine();
         if (ImGui::Button("Home")) browser.at = home();
         ImGui::SameLine();
-        if (ImGui::Button("Library")) browser.at = dir;
+        if (ImGui::Button("Notes")) browser.at = dir;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##path", path, sizeof path, ImGuiInputTextFlags_EnterReturnsTrue) && fs::is_directory(path, ec)) browser.at = path;
@@ -2394,43 +2643,220 @@ struct App {
         browser.open = open;
     }
 
-    void fileMenu() {
-        if (ImGui::MenuItem("New note", "Ctrl-Shift-n")) newDoc();
-        if (ImGui::MenuItem("Open…", "Ctrl-Shift-o")) openDialog();
+    // ---------- menus: the bar at the top, the right-click menu and the toolbar's popups share these ----------
+    bool acted = false;  // a menu item or toolbar button did something: results and autosave follow (see frame)
+    bool item(const char* label, const char* keys = nullptr, bool checked = false, bool enabled = true) {
+        bool r = ImGui::MenuItem(label, keys, checked, enabled);
+        acted = acted || r;
+        return r;
+    }
+    static void press(const char* keys) {  // as if typed, at the next frame
+        for (auto& k : Vi::parse(keys)) g_keys.push_back(k);
+    }
+    void pickImage() {
+        askPath(false, "Insert picture", home(), {{"Pictures", "*.png *.jpg *.jpeg *.gif *.bmp"}}, [this](std::string f) { addImage(f); });
+    }
+    void insertPlot() {
+        insertLines({""}, 0);
+        *ed.cur.row = {named(T::Fn, "plot"), M(" ")};
+        ed.cur.i = 2;
+        ed.reindex();
+        if (vi.mode == Mode::Normal) vi.key(ed, Vi::parse("a")[0]);
+        changed();
+    }
+    void openFolder() {
+        askPath(false, "Notes folder", dir, {}, [this](std::string f) {
+            dir = f;
+            saveCfg();
+            listFiles();
+            sidebar = true, sideTab = 0;
+        }, true);
+    }
+    // pick a table's size by hovering a grid, like a word processor
+    void tableGrid() {
+        static int hr = 3, hc = 2;
+        const Palette& p = pal();
+        ImDrawList* pd = ImGui::GetWindowDrawList();
+        const int R = 8, C = 8;
+        const float cell = 20;
+        ImVec2 o = ImGui::GetCursorScreenPos(), mp = ImGui::GetMousePos();
+        bool pick = ImGui::InvisibleButton("grid", {C * cell, R * cell});
+        if (ImGui::IsItemHovered()) hc = std::clamp(int((mp.x - o.x) / cell) + 1, 1, C), hr = std::clamp(int((mp.y - o.y) / cell) + 1, 1, R);
+        for (int r = 0; r < R; r++)
+            for (int c = 0; c < C; c++) {
+                ImVec2 a{o.x + c * cell + 2, o.y + r * cell + 2}, b{a.x + cell - 4, a.y + cell - 4};
+                bool on = r < hr && c < hc;
+                pd->AddRectFilled(a, b, on ? p.sel : p.side, 2);
+                pd->AddRect(a, b, on ? p.fn : p.line, 2);
+            }
+        ImGui::Text("%d × %d  (rows × columns)", hr, hc);
+        if (pick) {
+            run("table " + std::to_string(hr) + " " + std::to_string(hc));
+            acted = true;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    void fileItems() {
+        if (item("New", vim ? "Ctrl-Shift-n" : "Ctrl-n")) newDoc();
+        if (item("Open…", vim ? "Ctrl-Shift-o" : "Ctrl-o")) openDialog();
         if (ImGui::BeginMenu("Open recent")) {
             int keep = sort;
             sort = 0;
             auto list = sortedFiles();
             sort = keep;
             for (size_t j = 0; j < list.size() && j < 12; j++)
-                if (ImGui::MenuItem((titleOf(list[j].meta) + "##r" + std::to_string(j)).c_str(), ago(str(list[j].meta, "edited")).c_str()))
+                if (item((nameOf(list[j].name) + "##r" + std::to_string(j)).c_str(), ago(str(list[j].meta, "edited")).c_str()))
                     openDoc(list[j].name);
             if (list.empty()) ImGui::TextDisabled("No notes yet");
             ImGui::EndMenu();
         }
+        if (item("Open folder…")) openFolder();
         ImGui::Separator();
-        if (ImGui::MenuItem("Save", "Ctrl-s")) run("w");
-        if (ImGui::MenuItem("Save as…", "Ctrl-Shift-s")) saveAsDialog();
+        if (item("Save", "Ctrl-s")) save();
+        if (item("Save as…", "Ctrl-Shift-s")) saveAsDialog();
+        if (item("Rename…", nullptr, false, !current.empty())) exCmd("rename " + title());
+        ImGui::Separator();
         if (ImGui::BeginMenu("Export")) {
-            if (ImGui::MenuItem("Markdown (.md)…")) exportDialog("md");
-            if (ImGui::MenuItem("Web page (.html)…")) exportDialog("html");
-            if (ImGui::MenuItem("LaTeX (.tex)…")) exportDialog("tex");
-            if (ImGui::MenuItem("PDF (.pdf)…")) exportDialog("pdf");
-            if (ImGui::MenuItem("Table (.csv)…")) exportDialog("csv");
+            if (item("PDF (.pdf)…")) exportDialog("pdf");
+            if (item("Web page (.html)…")) exportDialog("html");
+            if (item("Markdown (.md)…")) exportDialog("md");
+            if (item("LaTeX (.tex)…")) exportDialog("tex");
+            if (item("Table (.csv)…")) exportDialog("csv");
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Import table (.csv)…")) run("import");
-        if (ImGui::MenuItem("Print…", vim ? ":print" : "Ctrl-p")) run("print");
+        if (item("Import table (.csv)…")) run("import");
+        if (item("Print…", vim ? ":print" : "Ctrl-p")) run("print");
         ImGui::Separator();
-        if (ImGui::MenuItem("Rename…")) exCmd("rename ");
-        if (ImGui::MenuItem("Show in file manager")) revealFolder();
-        if (ImGui::MenuItem("Move to trash")) run("trash");
+        if (item("Show in file manager", nullptr, false, !current.empty())) revealFolder();
+        if (item("Move to trash", nullptr, false, !current.empty())) run("trash");
         ImGui::Separator();
-        if (ImGui::MenuItem("Command palette", "Ctrl-Shift-p")) showPalette = true, paletteQuery[0] = 0, paletteSel = 0;
-        if (ImGui::MenuItem("Settings", "Ctrl-,")) showSettings = true;
-        if (ImGui::MenuItem("Help", "F1")) showHelp = true;
+        if (item("Quit", "Ctrl-q")) requestQuit();
+    }
+    void editItems() {
+        bool ins = vi.mode == Mode::Insert, sel = ed.range.has_value() || vi.mode == Mode::Visual || vi.mode == Mode::VisualLine;
+        if (item("Undo", vim ? "u" : "Ctrl-z", false, !ed.undoStack.empty())) ed.undo();
+        if (item("Redo", vim ? "Ctrl-r" : "Ctrl-y", false, !ed.redoStack.empty())) ed.redo();
         ImGui::Separator();
-        if (ImGui::MenuItem("Quit", ":q")) quit = true;
+        if (item("Cut", ins ? "Ctrl-x" : "d", false, sel)) press(ins ? "<C-x>" : "d");
+        if (item("Copy", ins ? "Ctrl-c" : "y", false, sel)) press(ins ? "<C-c>" : "y");
+        if (item("Paste", ins ? "Ctrl-v" : "p")) press(ins ? "<C-v>" : "p");
+        if (item("Paste picture")) pasteImage();
+        if (item("Select all", ins ? "Ctrl-a" : "ggVG")) {
+            if (ins) ed.range = Range{&ed.doc[0], 0, int(ed.doc.back().size()), &ed.doc.back()}, ed.cur = {&ed.doc.back(), int(ed.doc.back().size())};
+            else press("<Esc>ggVG");
+        }
+        ImGui::Separator();
+        if (item("Find…", vim ? "/" : "Ctrl-f")) vi.mode = Mode::Command, vi.prompt = '/', vi.cmdline.clear();
+        if (item("Find and replace…", ":%s/old/new/g")) exCmd("%s/");
+        ImGui::Separator();
+        if (item("Math mode", "Ctrl-m", ed.mathMode)) ed.toggleMath();
+    }
+    void insertItems() {
+        if (ImGui::BeginMenu("Table")) { tableGrid(); ImGui::EndMenu(); }
+        if (item("Picture…")) pickImage();
+        if (item("Picture from the clipboard", ins() ? "Ctrl-v" : nullptr)) pasteImage();
+        if (item("Plot")) insertPlot();
+        ImGui::Separator();
+        if (item("Divider", "---")) run("rule");
+        if (item("Section with a title", "===")) run("section");
+    }
+    bool ins() const { return vi.mode == Mode::Insert; }
+    static constexpr std::pair<const char*, uint16_t> COLORS[] = {{"Red", Red}, {"Orange", Orange}, {"Green", Green}, {"Teal", Teal},
+                                                                   {"Blue", Blue}, {"Purple", Purple}, {"Gray", Gray}};
+    void colorItems() {  // a row of swatches, then "none"
+        uint16_t now = fmtHere() & Colors;
+        for (auto& [name, flag] : COLORS) {
+            unsigned rgb = fmtColor(flag);
+            ImVec4 c = ImGui::ColorConvertU32ToFloat4(IM_COL32(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF, 255));
+            if (ImGui::ColorButton(name, c, ImGuiColorEditFlags_NoTooltip | (now == flag ? 0 : ImGuiColorEditFlags_NoBorder), {22, 22})) {
+                if (now != flag) vi.format(ed, flag);
+                acted = true;
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name);
+            ImGui::SameLine(0, 6);
+        }
+        ImGui::NewLine();
+        if (item("No colour", nullptr, false, now != 0)) vi.format(ed, now);
+    }
+    void sizeItems() {
+        uint16_t now = fmtHere() & Sizes;
+        if (item("Small", "Space S", now == Small)) vi.format(ed, Small);
+        if (item("Normal", nullptr, now == 0) && now) vi.format(ed, now);
+        if (item("Large", "Space +", now == Large)) vi.format(ed, Large);
+    }
+    void formatItems() {
+        uint16_t f = fmtHere();
+        if (item("Bold", "Ctrl-b", f & Bold)) vi.format(ed, Bold);
+        if (item("Italic", "Ctrl-i", f & Italic)) vi.format(ed, Italic);
+        if (item("Underline", "Ctrl-u", f & Underline)) vi.format(ed, Underline);
+        if (item("Strikethrough", "Space s", f & Strike)) vi.format(ed, Strike);
+        if (item("Code", "Space c", f & Code)) vi.format(ed, Code);
+        if (item("Highlight", "Space h", f & Mark)) vi.format(ed, Mark);
+        if (item("Superscript", "Space ^", f & Sup)) vi.format(ed, Sup);
+        if (item("Subscript", "Space _", f & Sub)) vi.format(ed, Sub);
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Text colour")) { colorItems(); ImGui::EndMenu(); }
+        if (ImGui::BeginMenu("Text size")) { sizeItems(); ImGui::EndMenu(); }
+        ImGui::Separator();
+        if (item("Clear formatting", "Space r")) vi.format(ed, 0);
+    }
+    void paragraphItems() {
+        const Row& top = *ed.topOf(ed.cur.row);
+        Line kind = lineStyle(top).kind;
+        static const std::tuple<const char*, const char*, Line> STYLES[] = {
+            {"Text", "Space 0", Line::Text}, {"Heading 1", "Space 1", Line::H1}, {"Heading 2", "Space 2", Line::H2}, {"Heading 3", "Space 3", Line::H3},
+            {"Quote", "Space >", Line::Quote}, {"Bulleted list", "Space -", Line::Bullet}, {"Numbered list", "Space n", Line::Number},
+            {"Checklist", "Space t", Line::Todo}};
+        for (auto& [label, keys, k] : STYLES)
+            if (item(label, keys, kind == k || (k == Line::Todo && kind == Line::Done)) && !(k == Line::Text && kind == Line::Text)) vi.setLine(ed, k);
+        ImGui::Separator();
+        if (item("Align left", "Ctrl-Shift-l", top.align == 0)) vi.align(ed, 0);
+        if (item("Centre", "Ctrl-Shift-e", top.align == 1)) vi.align(ed, 1);
+        if (item("Align right", "Ctrl-Shift-r", top.align == 2)) vi.align(ed, 2);
+        ImGui::Separator();
+        if (item("Indent more", vim ? "Tab · >>" : "Tab")) vi.indent(ed, 1);
+        if (item("Indent less", vim ? "Shift-Tab · <<" : "Shift-Tab")) vi.indent(ed, -1);
+    }
+    void viewItems() {
+        if (item("Sidebar", "Ctrl-\\", sidebar)) run("sidebar");
+        if (item("Outline", ":outline", sidebar && sideTab == 1)) run("outline");
+        if (item("Toolbar", nullptr, toolbar)) toolbar = !toolbar, saveCfg();
+        ImGui::Separator();
+        if (item("Dark theme", nullptr, dark)) dark = !dark, saveCfg();
+        if (item("Bigger text", "Ctrl-=")) run("zoom in");
+        if (item("Smaller text", "Ctrl--")) run("zoom out");
+        if (item("Normal text size", "Ctrl-0")) run("zoom reset");
+        ImGui::Separator();
+        if (item("Live results", nullptr, results)) results = !results, mathChanged();
+        if (item("Command palette…", "Ctrl-Shift-p")) showPalette = true, paletteQuery[0] = 0, paletteSel = 0;
+    }
+    void drawMenuBar() {
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {8, 6});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {10, 7});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10, 8});
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) { fileItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Edit")) { editItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Insert")) { insertItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Format")) { formatItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Paragraph")) { paragraphItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("View")) { viewItems(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Help")) {
+                if (item("Help", "F1")) showHelp = true;
+                if (item("Take the tour")) run("tour");
+                ImGui::Separator();
+                if (item("Settings…", "Ctrl-,")) showSettings = true;
+                ImGui::EndMenu();
+            }
+            // the open note and whether it is saved, at the right
+            std::string state = title() + (dirty() ? "  ●  not saved" : current.empty() ? "" : "  ✓  saved");
+            ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(state.c_str()).x - 14);
+            ImGui::TextDisabled("%s", state.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.empty() ? "Not in a file yet: Ctrl-s chooses a name and a folder" : current.c_str());
+            ImGui::EndMainMenuBar();
+        }
+        ImGui::PopStyleVar(3);
     }
 
     // headings and sections of the open note, for the sidebar's Outline tab
@@ -2588,9 +3014,9 @@ struct App {
             if (open) dl->AddRectFilled(a, {a.x + 3, a.y + 40}, IM_COL32(0x25, 0x63, 0xeb, 255));
             if (sideFocus && int(j) == sideSel) dl->AddRect(a, {a.x + w, a.y + 40}, IM_COL32(0x25, 0x63, 0xeb, 255), 6, 0, 1.5f);
             dl->PushClipRect(a, {a.x + w - 4, a.y + 40}, true);
-            L.drawText(titleOf(f.meta), a.x + 10, a.y + 18, 14, p.fg, bold);
+            L.drawText(nameOf(f.name), a.x + 10, a.y + 18, 14, p.fg, bold);
             std::string q = lower(filter), sub = ago(str(f.meta, "edited"));
-            if (!q.empty() && lower(titleOf(f.meta)).find(q) == std::string::npos) {  // matched in the text: show where
+            if (!q.empty() && lower(nameOf(f.name)).find(q) == std::string::npos) {  // matched in the text: show where
                 const std::string& t = noteText(f.name);
                 size_t at = t.find(q), s0 = at > 20 ? at - 20 : 0;
                 while (s0 > 0 && (t[s0] & 0xC0) == 0x80) s0--;
@@ -2602,7 +3028,7 @@ struct App {
             if (q.empty() && !inLibrary(f.name)) sub += "  ·  " + fs::path(f.name).parent_path().filename().string();
             L.drawText(sub, a.x + 10, a.y + 34, 12, p.muted, ui);
             dl->PopClipRect();
-            if (hov) ImGui::SetTooltip("%s\n%s", titleOf(f.meta).c_str(), f.name.c_str());
+            if (hov) ImGui::SetTooltip("%s\n%s", nameOf(f.name).c_str(), f.name.c_str());
         }
         if (list.empty()) ImGui::TextDisabled("  No documents");
         ImGui::EndChild();
@@ -2610,11 +3036,12 @@ struct App {
         ImGui::SetCursorPos({0, ImGui::GetWindowHeight() - metaH + 8});
         ImGui::Indent(12);
         ImGui::PushFont(bold, 13);
-        ImGui::TextUnformatted(titleOf(meta).c_str());
+        ImGui::TextUnformatted(title().c_str());
         ImGui::PopFont();
         ImGui::PushFont(ui, 12);
-        ImGui::TextDisabled("Edited %s", ago(str(meta, "edited")).c_str());
-        ImGui::TextDisabled("%d words · %d lines", meta.value("words", 0), meta.value("lines", 0));
+        if (current.empty()) ImGui::TextDisabled("Not saved to a file yet");
+        else ImGui::TextDisabled(dirty() ? "Changed · saved %s" : "Saved %s", ago(str(meta, "edited")).c_str());
+        if (!current.empty()) ImGui::TextDisabled("%s", fs::path(current).parent_path().string().c_str());
         if (meta.contains("defines") && meta["defines"].is_array() && !meta["defines"].empty()) {
             std::string d;
             for (auto& x : meta["defines"]) d += (d.empty() ? "" : ", ") + (x.is_string() ? x.get<std::string>() : "");
@@ -2624,7 +3051,7 @@ struct App {
         if (!backlinks.empty()) {
             ImGui::TextDisabled("Linked from");
             for (size_t j = 0; j < backlinks.size() && j < 4; j++)
-                if (ImGui::SmallButton((titleOf(backlinks[j].meta) + "##bl" + std::to_string(j)).c_str())) open = backlinks[j].name;
+                if (ImGui::SmallButton((nameOf(backlinks[j].name) + "##bl" + std::to_string(j)).c_str())) open = backlinks[j].name;
         }
         ImGui::Unindent(12);
         ImGui::PopFont();
@@ -2645,11 +3072,13 @@ struct App {
         ImDrawList* dl = L.dl = ImGui::GetWindowDrawList();
         ImVec2 o = ImGui::GetCursorScreenPos();
         float W = ImGui::GetContentRegionAvail().x, x = o.x + 8, cy = o.y + h / 2;
+        dl->AddRectFilled(o, {o.x + W, o.y + h}, p.side);
         dl->AddLine({o.x, o.y + h - 1}, {o.x + W, o.y + h - 1}, p.line);
         uint16_t f = fmtHere();
-        Line kind = lineStyle(*ed.topOf(ed.cur.row)).kind;
+        const Row& top = *ed.topOf(ed.cur.row);
+        Line kind = lineStyle(top).kind;
         bool act = false;
-        float limit = FLT_MAX;  // buttons past it don't fit: hidden (the palette has them all)
+        float limit = FLT_MAX;  // buttons past it don't fit: hidden (the menus have them all)
         auto btn = [&](const char* id, const char* tip, bool on, auto icon, float w = 30) {
             if (x + w > limit) { x += w + 2; return false; }
             ImGui::SetCursorScreenPos({x, o.y + 5});
@@ -2676,30 +3105,44 @@ struct App {
         auto lines = [&](ImVec2 c, ImU32 col, float x0) {
             for (int i = -1; i <= 1; i++) dl->AddLine({c.x + x0, c.y + i * 5.f}, {c.x + 8, c.y + i * 5.f}, col, 1.5f);
         };
-        if (btn("menu", "File: new, open, save as, export, settings, help", false, [&](ImVec2 c, ImU32 col) {
-                for (int i = -1; i <= 1; i++) dl->AddLine({c.x - 7, c.y + i * 5.f}, {c.x + 7, c.y + i * 5.f}, col, 1.6f);
-            }))
-            ImGui::OpenPopup("filemenu");
-        if (ImGui::BeginPopup("filemenu")) {
-            fileMenu();
-            ImGui::EndPopup();
-        }
-        // sidebar
-        if (btn("side", "Sidebar  (Ctrl-\\ · Space e)", sidebar, [&](ImVec2 c, ImU32 col) {
+        auto caret = [&](ImVec2 c, ImU32 col) { dl->AddTriangleFilled({c.x - 3.5f, c.y - 1.5f}, {c.x + 3.5f, c.y - 1.5f}, {c.x, c.y + 2.5f}, col); };
+        auto popup = [&](const char* id, auto body) {
+            ImGui::SetNextWindowPos({ImGui::GetItemRectMin().x, o.y + h - 2}, ImGuiCond_Appearing);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10, 8});
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {10, 7});
+            if (ImGui::BeginPopup(id)) {
+                body();
+                ImGui::EndPopup();
+            }
+            ImGui::PopStyleVar(2);
+        };
+        if (btn("side", "Sidebar: your notes and this note's outline  (Ctrl-\\)", sidebar, [&](ImVec2 c, ImU32 col) {
                 dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 3, 0, 1.5f);
                 dl->AddRectFilled({c.x - 8, c.y - 7}, {c.x - 3, c.y + 7}, col, 3);
             }))
             run("sidebar");
         sep();
-        float right = o.x + W - 3 * 32 - 12;  // palette, help, settings keep their place; formatting is cut off before them
+        float right = o.x + W - (86 + 2 * 32) - 12;  // math, palette and settings keep their place; the rest is cut off before them
         limit = right;
         if (toolbar) {
         if (btn("undo", vim ? "Undo  (u)" : "Undo  (Ctrl-z)", false, text("↶", L.math, 20))) ed.undo();
         if (btn("redo", vim ? "Redo  (Ctrl-r)" : "Redo  (Ctrl-y)", false, text("↷", L.math, 20))) ed.redo();
         sep();
-        if (btn("b", "Bold  (Ctrl-b · Space b)", f & Bold, text("B", bold, 16))) vi.format(ed, Bold);
-        if (btn("i", "Italic  (Ctrl-i · Space i)", f & Italic, text("I", ui, 16, true))) vi.format(ed, Italic);
-        if (btn("u", "Underline  (Ctrl-u · Space u)", f & Underline, [&](ImVec2 c, ImU32 col) {
+        {  // paragraph style: what kind of line this is
+            const char* name = kind == Line::H1 ? "Heading 1" : kind == Line::H2 ? "Heading 2" : kind == Line::H3 ? "Heading 3" : kind == Line::Quote ? "Quote"
+                             : kind == Line::Bullet ? "Bullets" : kind == Line::Number ? "Numbers" : kind == Line::Todo || kind == Line::Done ? "Checklist"
+                             : kind == Line::Section ? "Section" : "Text";
+            if (btn("style", "Paragraph style: text, headings, quote, lists", false, [&](ImVec2 c, ImU32 col) {
+                    L.drawText(name, c.x - 44, c.y + 5, 14, col, ui);
+                    caret({c.x + 40, c.y}, p.muted);
+                }, 104))
+                ImGui::OpenPopup("styles");
+            popup("styles", [&] { paragraphItems(); });
+        }
+        sep();
+        if (btn("b", "Bold  (Ctrl-b)", f & Bold, text("B", bold, 16))) vi.format(ed, Bold);
+        if (btn("i", "Italic  (Ctrl-i)", f & Italic, text("I", ui, 16, true))) vi.format(ed, Italic);
+        if (btn("u", "Underline  (Ctrl-u)", f & Underline, [&](ImVec2 c, ImU32 col) {
                 text("U", ui, 16)(c, col);
                 dl->AddLine({c.x - 6, c.y + 9}, {c.x + 6, c.y + 9}, col, 1.5f);
             }))
@@ -2709,130 +3152,129 @@ struct App {
                 dl->AddLine({c.x - 7, c.y}, {c.x + 7, c.y}, col, 1.5f);
             }))
             vi.format(ed, Strike);
-        if (btn("c", "Inline code  (Space c)", f & Code, text("</>", L.mono, 12), 34)) vi.format(ed, Code);
+        if (btn("c", "Code  (Space c)", f & Code, text("</>", L.mono, 12), 34)) vi.format(ed, Code);
         if (btn("h", "Highlight  (Space h)", f & Mark, [&](ImVec2 c, ImU32 col) {
                 dl->AddRectFilled({c.x - 9, c.y - 8}, {c.x + 9, c.y + 8}, IM_COL32(250, 204, 21, 110), 3);
                 text("A", bold, 14)(c, col);
             }))
             vi.format(ed, Mark);
-        if (btn("sup", "Superscript text  (Space ^)", f & Sup, [&](ImVec2 c, ImU32 col) {
+        {
+            unsigned rgb = fmtColor(f);
+            ImU32 sw = rgb ? IM_COL32(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF, 255) : p.fg;
+            if (btn("col", "Text colour", false, [&](ImVec2 c, ImU32 col) {
+                    text("A", bold, 15)(ImVec2{c.x - 4, c.y - 2}, col);
+                    dl->AddRectFilled({c.x - 12, c.y + 6}, {c.x + 4, c.y + 9}, sw, 1);
+                    caret({c.x + 11, c.y}, p.muted);
+                }, 40))
+                ImGui::OpenPopup("colors");
+            popup("colors", [&] { colorItems(); });
+        }
+        if (btn("size", "Text size: small, normal, large", f & Sizes, [&](ImVec2 c, ImU32 col) {
+                L.drawText("A", c.x - 13, c.y + 5, 12, col, ui);
+                L.drawText("A", c.x - 4, c.y + 6, 17, col, ui);
+                caret({c.x + 13, c.y}, p.muted);
+            }, 44))
+            ImGui::OpenPopup("sizes");
+        popup("sizes", [&] { sizeItems(); });
+        if (btn("sup", "Superscript  (Space ^)", f & Sup, [&](ImVec2 c, ImU32 col) {
                 L.drawText("x", c.x - 7, c.y + 6, 15, col, ui);
                 L.drawText("2", c.x + 1, c.y - 1, 10, col, ui);
             }))
             vi.format(ed, Sup);
-        if (btn("sub", "Subscript text  (Space _)", f & Sub, [&](ImVec2 c, ImU32 col) {
+        if (btn("sub", "Subscript  (Space _)", f & Sub, [&](ImVec2 c, ImU32 col) {
                 L.drawText("x", c.x - 7, c.y + 3, 15, col, ui);
                 L.drawText("2", c.x + 1, c.y + 8, 10, col, ui);
             }))
             vi.format(ed, Sub);
-        {  // colour: cycles red, green, blue, none
-            uint16_t now = f & Colors, next = now == 0 ? Red : now == Red ? Green : now == Green ? Blue : 0;
-            ImU32 sw = now == Red ? IM_COL32(0xe5, 0x48, 0x4d, 255) : now == Green ? IM_COL32(0x2f, 0x9e, 0x5b, 255)
-                     : now == Blue ? IM_COL32(0x3b, 0x82, 0xf6, 255) : p.muted;
-            if (btn("col", "Text colour: red, green, blue, none  (Space R · G · B)", now, [&](ImVec2 c, ImU32 col) {
-                    text("A", bold, 15)(ImVec2{c.x, c.y - 2}, col);
-                    dl->AddRectFilled({c.x - 8, c.y + 6}, {c.x + 8, c.y + 9}, sw, 1);
-                }))
-                vi.format(ed, next ? next : now);
-        }
         if (btn("r", "Clear formatting  (Space r)", false, [&](ImVec2 c, ImU32 col) {
                 text("T", ui, 16)(c, col);
                 dl->AddLine({c.x - 7, c.y + 7}, {c.x + 7, c.y - 7}, col, 1.5f);
             }))
             vi.format(ed, 0);
         sep();
-        if (btn("h1", "Heading 1  (Space 1)", kind == Line::H1, text("H1", bold, 13))) vi.setLine(ed, Line::H1);
-        if (btn("h2", "Heading 2  (Space 2)", kind == Line::H2, text("H2", bold, 13))) vi.setLine(ed, Line::H2);
-        if (btn("h3", "Heading 3  (Space 3)", kind == Line::H3, text("H3", bold, 13))) vi.setLine(ed, Line::H3);
-        if (btn("ul", "Bullet list  (Space -)", kind == Line::Bullet, [&](ImVec2 c, ImU32 col) {
+        for (int a = 0; a < 3; a++) {  // align left, centre, right: three lines, the middle one shorter
+            static const char* IDS[] = {"al", "ac", "ar"};
+            static const char* TIPS[] = {"Align left  (Ctrl-Shift-l)", "Centre  (Ctrl-Shift-e)", "Align right  (Ctrl-Shift-r)"};
+            if (btn(IDS[a], TIPS[a], top.align == a && a != 0, [&](ImVec2 c, ImU32 col) {
+                    for (int i = -1; i <= 1; i++) {
+                        float w = i == 0 ? 10 : 16, l = a == 0 ? c.x - 8 : a == 1 ? c.x - w / 2 : c.x + 8 - w;
+                        dl->AddLine({l, c.y + i * 5.f}, {l + w, c.y + i * 5.f}, col, 1.5f);
+                    }
+                }))
+                vi.align(ed, a);
+        }
+        sep();
+        if (btn("ul", "Bulleted list  (Space - · type \"- \")", kind == Line::Bullet, [&](ImVec2 c, ImU32 col) {
                 for (int i = -1; i <= 1; i++) dl->AddCircleFilled({c.x - 7, c.y + i * 5.f}, 1.7f, col);
                 lines(c, col, -3);
             }))
             vi.setLine(ed, Line::Bullet);
-        if (btn("ol", "Numbered list  (Space n)", kind == Line::Number, [&](ImVec2 c, ImU32 col) {
+        if (btn("ol", "Numbered list  (Space n · type \"1. \")", kind == Line::Number, [&](ImVec2 c, ImU32 col) {
                 L.drawText("1", c.x - 10, c.y - 1, 9, col, bold);
                 L.drawText("2", c.x - 10, c.y + 8, 9, col, bold);
                 dl->AddLine({c.x - 2, c.y - 4}, {c.x + 8, c.y - 4}, col, 1.5f);
                 dl->AddLine({c.x - 2, c.y + 4}, {c.x + 8, c.y + 4}, col, 1.5f);
             }))
             vi.setLine(ed, Line::Number);
-        if (btn("q", "Quote  (Space >)", kind == Line::Quote, [&](ImVec2 c, ImU32 col) {
-                dl->AddRectFilled({c.x - 8, c.y - 7}, {c.x - 5.5f, c.y + 7}, col, 1);
-                lines(c, col, -2);
-            }))
-            vi.setLine(ed, Line::Quote);
-        if (btn("t", "Checklist  (Space t · Space x or click the box to tick)", kind == Line::Todo || kind == Line::Done,
+        if (btn("t", "Checklist  (Space t · click a box to tick it)", kind == Line::Todo || kind == Line::Done,
                 [&](ImVec2 c, ImU32 col) {
                     dl->AddRect({c.x - 7, c.y - 7}, {c.x + 7, c.y + 7}, col, 3, 0, 1.5f);
                     ImVec2 ck[] = {{c.x - 4, c.y}, {c.x - 1, c.y + 3}, {c.x + 4, c.y - 3}};
                     dl->AddPolyline(ck, 3, col, 0, 1.5f);
                 }))
             vi.setLine(ed, Line::Todo);
+        for (int d : {-1, 1})  // indent less / more: lines with an arrow
+            if (btn(d < 0 ? "out" : "in", d < 0 ? "Indent less  (Shift-Tab)" : "Indent more  (Tab): a list inside a list", false, [&](ImVec2 c, ImU32 col) {
+                    dl->AddLine({c.x - 8, c.y - 6}, {c.x + 8, c.y - 6}, col, 1.5f);
+                    dl->AddLine({c.x - 1, c.y}, {c.x + 8, c.y}, col, 1.5f);
+                    dl->AddLine({c.x - 8, c.y + 6}, {c.x + 8, c.y + 6}, col, 1.5f);
+                    float t = d < 0 ? c.x - 8 : c.x - 4, b = d < 0 ? c.x - 4 : c.x - 8;
+                    dl->AddTriangleFilled({b, c.y - 3}, {b, c.y + 3}, {t, c.y}, col);
+                }))
+                vi.indent(ed, d);
         sep();
-        if (btn("tbl", "Table  (Space | · :table rows cols · | separates cells)", kind == Line::Table, [&](ImVec2 c, ImU32 col) {
+        if (btn("tbl", "Table", kind == Line::Table, [&](ImVec2 c, ImU32 col) {
                 dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 2, 0, 1.5f);
                 dl->AddLine({c.x - 8, c.y - 2}, {c.x + 8, c.y - 2}, col, 1.5f);
                 dl->AddLine({c.x, c.y - 7}, {c.x, c.y + 7}, col, 1.5f);
             }))
             ImGui::OpenPopup("tablesize");
-        if (ImGui::BeginPopup("tablesize")) {  // pick a size by hovering a grid, like a word processor
-            static int hr = 3, hc = 2;
-            ImDrawList* pd = ImGui::GetWindowDrawList();
-            const int R = 8, C = 8;
-            const float cell = 20;
-            ImVec2 o = ImGui::GetCursorScreenPos(), mp = ImGui::GetMousePos();
-            bool pick = ImGui::InvisibleButton("grid", {C * cell, R * cell});
-            if (ImGui::IsItemHovered()) hc = std::clamp(int((mp.x - o.x) / cell) + 1, 1, C), hr = std::clamp(int((mp.y - o.y) / cell) + 1, 1, R);
-            for (int r = 0; r < R; r++)
-                for (int c = 0; c < C; c++) {
-                    ImVec2 a{o.x + c * cell + 2, o.y + r * cell + 2}, b{a.x + cell - 4, a.y + cell - 4};
-                    bool on = r < hr && c < hc;
-                    pd->AddRectFilled(a, b, on ? p.sel : p.side, 2);
-                    pd->AddRect(a, b, on ? p.fn : p.line, 2);
-                }
-            ImGui::Text("%d × %d  (rows × columns)", hr, hc);
-            if (pick) {
-                run("table " + std::to_string(hr) + " " + std::to_string(hc));
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
-        }
-        if (btn("sec", "New section: its own variables, for the next exercise  (Space = · :section [title] · type ===)",
-                kind == Line::Section, text("§", bold, 17)))
-            run("section");
-        if (btn("hr", "Divider  (Space / · type ---)", kind == Line::Rule, [&](ImVec2 c, ImU32 col) {
-                dl->AddLine({c.x - 8, c.y}, {c.x + 8, c.y}, col, 2);
-            }))
-            run("rule");
-        if (btn("plot", "Plot  (type plot at the start of a line, Tab, then: sin(x), x^2, −3 < x < 3)", kind == Line::Plot, [&](ImVec2 c, ImU32 col) {
-                dl->AddLine({c.x - 8, c.y + 7}, {c.x + 8, c.y + 7}, col, 1.2f);
-                dl->AddLine({c.x - 8, c.y + 7}, {c.x - 8, c.y - 7}, col, 1.2f);
-                ImVec2 w[] = {{c.x - 7, c.y + 4}, {c.x - 3, c.y - 4}, {c.x + 1, c.y + 2}, {c.x + 7, c.y - 6}};
-                dl->AddPolyline(w, 4, col, 0, 1.6f);
-            }))
-        {
-            insertLines({""}, 0);
-            *ed.cur.row = {named(T::Fn, "plot"), M(" ")};
-            ed.cur.i = 2;
-            ed.reindex();
-            if (vi.mode == Mode::Normal) vi.key(ed, Vi::parse("a")[0]);
-            changed();
-        }
-        if (btn("img", "Picture: choose one, or drag it onto the window  (:image path)", kind == Line::Image, [&](ImVec2 c, ImU32 col) {
+        popup("tablesize", [&] { tableGrid(); });
+        if (btn("img", "Picture: choose a file, drag one onto the window, or paste a screenshot with Ctrl-v", kind == Line::Image, [&](ImVec2 c, ImU32 col) {
                 dl->AddRect({c.x - 8, c.y - 7}, {c.x + 8, c.y + 7}, col, 2, 0, 1.5f);
                 ImVec2 m[] = {{c.x - 6, c.y + 5}, {c.x - 1, c.y - 1}, {c.x + 2, c.y + 2}, {c.x + 4, c.y}, {c.x + 7, c.y + 5}};
                 dl->AddPolyline(m, 5, col, 0, 1.4f);
                 dl->AddCircleFilled({c.x + 3, c.y - 3.5f}, 1.6f, col);
             }))
-            askPath(false, "Insert picture", home(), {{"Pictures", "*.png *.jpg *.jpeg *.gif *.bmp"}}, [this](std::string f) { addImage(f); });
-        sep();
-        if (btn("m", "Math mode: everything typed is math  (Ctrl-m · Space m)", ed.mathMode, text("∑", L.math, 18))) ed.mathMode = !ed.mathMode;
+            pickImage();
+        if (btn("plot", "Plot: then type what to draw, such as sin(x), x^2, −3 < x < 3", kind == Line::Plot, [&](ImVec2 c, ImU32 col) {
+                dl->AddLine({c.x - 8, c.y + 7}, {c.x + 8, c.y + 7}, col, 1.2f);
+                dl->AddLine({c.x - 8, c.y + 7}, {c.x - 8, c.y - 7}, col, 1.2f);
+                ImVec2 w[] = {{c.x - 7, c.y + 4}, {c.x - 3, c.y - 4}, {c.x + 1, c.y + 2}, {c.x + 7, c.y - 6}};
+                dl->AddPolyline(w, 4, col, 0, 1.6f);
+            }))
+            insertPlot();
+        if (btn("hr", "Divider: a line across the page. Variables start afresh below it  (type ---)", kind == Line::Rule, [&](ImVec2 c, ImU32 col) {
+                dl->AddLine({c.x - 8, c.y}, {c.x + 8, c.y}, col, 2);
+            }))
+            run("rule");
+        if (btn("sec", "Section: a divider with a title, for the next exercise  (type ===)", kind == Line::Section, text("§", bold, 17)))
+            run("section");
         }
         limit = FLT_MAX;
         x = right + 8;
+        // math mode: the one switch between writing text and writing math
+        if (btn("m", ed.mathMode ? "Math mode is on: what you type is math. Ctrl-m goes back to text"
+                                 : "Text mode: what you type is plain text. Ctrl-m switches to math",
+                ed.mathMode, [&](ImVec2 c, ImU32 col) {
+                    if (!ed.mathMode) dl->AddRect({c.x - 40, c.y - 13}, {c.x + 40, c.y + 13}, p.line, 6);
+                    L.drawText("∑", c.x - 30, c.y + 6, 17, col, L.math);
+                    L.drawText(ed.mathMode ? "Math" : "Text", c.x - 10, c.y + 5, 14, col, bold);
+                }, 80))
+            ed.toggleMath();
+        x += 4;
         if (btn("pal", "Command palette: find any action, setting or note  (Ctrl-Shift-p)", showPalette, text("⌘", L.math, 17)))
             showPalette = true, paletteQuery[0] = 0, paletteSel = 0;
-        if (btn("help", "Help  (F1)", showHelp, text("?", bold, 16))) showHelp = !showHelp;
         if (btn("set", "Settings  (Ctrl-,)", showSettings, [&](ImVec2 c, ImU32 col) {
                 dl->AddCircle(c, 4, col, 0, 1.6f);
                 for (int i = 0; i < 8; i++) {
@@ -2841,7 +3283,7 @@ struct App {
                 }
             }))
             showSettings = !showSettings;
-        if (act) changed();
+        if (act) acted = true;
     }
 
     void drawStatus(float h) {
@@ -2856,15 +3298,6 @@ struct App {
         if (sideFocus) left = "-- FILES --  j/k move · Enter open · / filter · Esc back";
         if (!vim && vi.mode == Mode::Insert) left.clear();  // standard keys: always typing, no mode to show
         float x = a.x + 12;
-        {  // Ctrl-m toggle beside the mode: filled when everything typed is math
-            std::string t = ed.mathMode ? "MATH" : "TEXT";
-            float tw = L.textWidth(t, 11) + 14;
-            ImU32 c = ed.mathMode ? p.fn : p.muted;
-            if (ed.mathMode) dl->AddRectFilled({x, base - 14}, {x + tw, base + 5}, alpha(c, 0.2f), 9);
-            dl->AddRect({x, base - 14}, {x + tw, base + 5}, alpha(c, ed.mathMode ? 1 : 0.5f), 9);
-            L.drawText(t, x + 7, base - 1, 11, c, bold);
-            x += tw + 10;
-        }
         L.drawText(left, x, base, 14, vi.mode == Mode::Command ? p.fg : IM_COL32(0x25, 0x63, 0xeb, 255), vi.mode == Mode::Command ? ui : bold);
         x += L.textWidth(left, 14);
         if (vi.mode == Mode::Command) {
@@ -2873,40 +3306,46 @@ struct App {
         }
         std::string msg = !vi.message.empty() ? vi.message : message;
         if (vi.leader())
-            L.drawText("SPACE   b bold · i italic · u underline · s strike · c code · h highlight · r clear · 1 2 3 heading · 0 text · "
-                       "^ sup · _ sub · R G B colour · - bullets · n numbers · > quote · t checklist · x tick · | table · / rule · = section · m math · e sidebar",
+            L.drawText("SPACE   b bold · i italic · u underline · s strike · c code · h highlight · r clear · 1 2 3 heading · 0 text · ^ sup · _ sub · "
+                       "R O G T B P A colour · S small · + large · [ \\ ] align · - bullets · n numbers · > quote · t checklist · x tick · | table · / divider · = section · m math",
                        x + 4, base, 12, p.fg, ui);
-        else if (!msg.empty()) L.drawText(msg, x + 16, base, 14, p.muted, ui);
+        else if (!msg.empty()) L.drawText(msg, x + (left.empty() ? 0 : 16), base, 14, p.muted, ui);
         else if (left.empty())
-            L.drawText(vim ? "i insert · Esc normal · Space formatting · Ctrl-m math · Ctrl-Shift-p commands · F1 help"
-                           : "Ctrl-m math · Tab takes a result · Ctrl-z undo · Ctrl-f find · Ctrl-Shift-p commands · F1 help",
-                       x + 4, base, 12, alpha(p.muted, 0.8f), ui);
+            L.drawText(vim ? "i types · Esc stops · Ctrl-m math · Space formats · Ctrl-s saves · F1 help"
+                           : "Ctrl-m math · Tab takes a result · Ctrl-s saves · Ctrl-f finds · F1 help",
+                       x, base, 12, alpha(p.muted, 0.8f), ui);
         int k = ed.lineOf(ed.topOf(ed.cur.row)) + 1;
-        std::string right = titleOf(meta) + (docJson(ed.doc).dump() == savedJson ? "" : " [+]") + "   " + std::to_string(k) + "/" +
-                            std::to_string(ed.doc.size());
+        std::string right = std::to_string(stats()["words"].get<int>()) + " words   line " + std::to_string(k) + " of " + std::to_string(ed.doc.size()) + "   " +
+                            std::to_string(int(std::round(textSize / 18 * 100))) + "%";
         L.drawText(right, a.x + w - L.textWidth(right, 13) - 12, base, 13, p.muted, ui);
         ImGui::Dummy({w, h});
     }
 
     void frame() {
         input();
-        panelFocused = false;  // the panels drawn below set it again
+        panelFocused = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);  // a menu has the keys; panels drawn below add to it
         pdfDone();
-        if (changedAt >= 0 && nowSec() - changedAt > std::max(0.2f, autosave)) saveNow();
-        if (!vi.message.empty() || !message.empty()) {}
+        if (changedAt >= 0 && nowSec() - changedAt > std::max(0.2f, autosave)) {  // idle: into its file, else the recovery file
+            if (autosaveOn && !current.empty()) saveNow();
+            else writeRecovery(), changedAt = -1;
+        }
         applyColors();
+        drawMenuBar();
         ImGuiViewport* vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(vp->Pos);
-        ImGui::SetNextWindowSize(vp->Size);
+        ImGui::SetNextWindowPos(vp->WorkPos);
+        ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
         ImGui::Begin("##root", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        float statusH = 28;
+        float statusH = 28, toolH = 42;
+        ImGui::BeginChild("tools", {0, toolH}, 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawToolbar(toolH);
+        ImGui::EndChild();
         if (sidebar) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(pal().side));
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {6, 6});
-            ImGui::BeginChild("side", {270, -statusH});
+            ImGui::BeginChild("side", {250, -statusH});
             drawSidebar();
             ImGui::EndChild();
             ImGui::PopStyleVar();
@@ -2915,11 +3354,7 @@ struct App {
             ImGui::GetWindowDrawList()->AddLine({b.x, a.y}, {b.x, b.y}, pal().line);
             ImGui::SameLine(0, 0);
         }
-        ImGui::BeginGroup();
-        float toolH = 40;
-        ImGui::BeginChild("tools", {0, toolH}, 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawToolbar(toolH);
-        ImGui::EndChild();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(pal().canvas));
         ImGui::BeginChild("doc", {0, -statusH}, 0, ImGuiWindowFlags_HorizontalScrollbar);
         drawDoc();
         if (plotAspect > 0) {  // the window changed shape: shapes re-fit so a circle stays round
@@ -2931,7 +3366,7 @@ struct App {
             scrollToCaret = scroll;
         }
         ImGui::EndChild();
-        ImGui::EndGroup();
+        ImGui::PopStyleColor();
         drawStatus(statusH);
         ImGui::End();
         ImGui::PopStyleVar(2);
@@ -2940,6 +3375,8 @@ struct App {
         drawHelp();
         drawPalette();
         drawBrowser();
+        drawAskSave();
+        if (std::exchange(acted, false)) changed();
     }
 };
 
@@ -3015,7 +3452,7 @@ int main(int argc, char** argv) {
     fs::path arg = argc > 1 ? fs::path(argv[1]) : fs::path();  // UTF-8 on Windows too (packaging/opman.manifest)
     std::error_code ec;
     if (!arg.empty() && fs::is_regular_file(arg, ec)) app.openPath(arg.string());  // opman note.opman (a double-click)
-    else app.openMostRecent();
+    else app.start();
     const char* keys = std::getenv("OPMAN_KEYS");
     // OPMAN_MOUSE="m 600 400; d; u; d; u; w -2": one mouse step per frame after the keys (move to x y in window
     // coordinates, button down/up, wheel), for testing plots and sliders
@@ -3029,13 +3466,22 @@ int main(int argc, char** argv) {
     }
     double shotAt = std::getenv("OPMAN_SHOT_AFTER") ? std::atof(std::getenv("OPMAN_SHOT_AFTER")) : 1.5;
     int frames = 0;
+    size_t keyAt = 0;
 
-    while (!glfwWindowShouldClose(win) && !app.quit) {
+    app.ed.visualLine = [&app](int d) { return app.visualMove(d); };
+    while (!app.quit) {
+        if (glfwWindowShouldClose(win)) {  // the window's close button asks about unsaved changes like Quit does
+            glfwSetWindowShouldClose(win, GLFW_FALSE);
+            app.requestQuit();
+        }
         // ponytail: idle-friendly loop; wakes 4x a second for the autosave timer
         glfwWaitEventsTimeout(shot ? 1.0 / 60 : 0.25);
-        if (keys && frames == 2) {
-            for (auto& k : Vi::parse(keys)) g_keys.push_back(k);
-            keys = nullptr;
+        if (keys && frames >= 2 && frames % 3 == 2) {  // "<Wait>" in OPMAN_KEYS: the rest is typed a few frames later
+            std::string all = keys;
+            size_t w = all.find("<Wait>", keyAt);
+            for (auto& k : Vi::parse(all.substr(keyAt, w == std::string::npos ? w : w - keyAt))) g_keys.push_back(k);
+            keyAt = w == std::string::npos ? 0 : w + 6;
+            if (w == std::string::npos) keys = nullptr;
         }
         frames++;
         if (frames > 4 && !mouse.empty()) {
@@ -3064,7 +3510,7 @@ int main(int argc, char** argv) {
         }
         ImGui::NewFrame();
         app.frame();
-        std::string title = "opman — " + App::titleOf(app.meta);
+        std::string title = (app.dirty() ? "● " : "") + app.title() + " — opman";
         static std::string shownTitle;
         if (title != shownTitle) glfwSetWindowTitle(win, (shownTitle = title).c_str());
         ImGui::Render();
@@ -3085,7 +3531,6 @@ int main(int argc, char** argv) {
         glfwSwapBuffers(win);
         if (app.pdfWanted) app.renderPdf();
     }
-    app.saveNow();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

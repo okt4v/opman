@@ -2,6 +2,7 @@
 // selection, matrices and the completion catalog.
 #pragma once
 #include "doc.hpp"
+#include <functional>
 #include <map>
 #include <optional>
 #include <unordered_map>
@@ -54,7 +55,11 @@ struct Editor {
     Cur cur{&doc[0], 0};
     std::optional<Range> range;
     uint16_t style = 0;     // Fmt bits given to typed text (Insert mode: Ctrl-b/i/u, toolbar)
-    bool mathMode = false;  // Ctrl-m: everything typed is math, so "(a+b)/2" at a line start isn't text
+    bool mathMode = false;  // Ctrl-m: what is typed is math. Off, a line takes plain text and numbers
+    static inline bool autoMathDefault = false;
+    bool autoMath = autoMathDefault;  // setting: text mode still reads "x = 5" or "2 m" as math, as corca did
+    int gen = 0;            // bumped by reindex(): rows may have moved, so pointers kept from before are stale
+    std::function<bool(int)> visualLine;  // the app's: move the cursor a wrapped line up/down, false if it can't
     std::unordered_map<const Row*, Parent> parents;
     struct Snap {
         Doc doc;
@@ -94,9 +99,17 @@ struct Editor {
     void exitSlot();
     void right();
     void left();
-    void vertical(int d);
+    void vertical(int d, bool visual = true);  // visual: wrapped lines count as lines
     void backspace();
+    void del();    // the Delete key: the item after the cursor, or the line break
     void enter();
+    int lineStart() const;  // the first place the cursor can be in its row: after a line's hidden prefix
+    void clampCur();        // keep the cursor out of a line's hidden prefix and tail
+    void syncMode();        // math mode follows the cursor: on next to math, off next to text
+    void softBreak();       // Shift-Enter: a long calculation goes on in the next line, still one line to the math
+    void toggleMath();      // Ctrl-m; turning it off inside a fraction, root… steps out to the line first
+    void indent(int a, int b, int d);  // lines a..b one level in (d = 1) or out (-1)
+    void setAlign(int a, int b, int align);
     // formatting
     void setLine(Row& line, Line kind, int num = 1);           // replace a top-level line's Markdown prefix
     void toggleFmt(Row& row, int a, int b, uint16_t flag);       // on text chars in [a,b): set, or clear if all have it; 0 clears all

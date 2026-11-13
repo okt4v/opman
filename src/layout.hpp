@@ -10,7 +10,8 @@ namespace om {
 
 struct Palette {
     ImU32 bg, fg, muted, constant, fn, sel, active, side, line, pop;
-    float varL;  // lightness of variable colours
+    float varL;    // lightness of variable colours
+    ImU32 canvas;  // what the page lies on
 };
 extern const Palette DARK, LIGHT;
 
@@ -37,6 +38,10 @@ struct Layout {
     std::vector<float> tabs;     // table lines: x of each cell border, relative to the line (empty: natural widths)
     bool tableHeader = false;    // the table line being drawn is its table's first (bold)
     std::map<std::string, int> eqNums;  // equation numbers of the document (set by the app each frame)
+    float wrapW = 0;          // a top-level line wraps at this width and aligns within it (0: one long line)
+    int listNum = 0;          // the number a numbered line shows (0: the one typed in its prefix)
+    std::string placeholder;  // shown faintly in a line with nothing after its prefix (a caption, a section title)
+    float endX = 0, endY = 0; // after drawLine: where the text ends, relative to its x and first baseline
 
     // a top-level line: text with math runs
     Box measureLine(const Row& row);

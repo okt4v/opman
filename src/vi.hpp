@@ -41,6 +41,8 @@ struct Vi {
     void format(Editor& ed, uint16_t flag);  // 0 clears
     void setLine(Editor& ed, Line kind);    // toggles the line style of the current/selected lines
     void toggleDone(Editor& ed);
+    void align(Editor& ed, int a);   // 0 left, 1 centre, 2 right: the current/selected lines
+    void indent(Editor& ed, int d);  // nest them a level (1) or bring them back out (-1)
     bool leader() const { return pending == " "; }
     static std::vector<Key> parse(const std::string& s);  // "if(x)<Esc>dd": chars, <Esc> <CR> <Tab> <BS> <S-CR> <C-r>
     std::optional<std::pair<int, int>> visualLines(const Editor& ed) const;  // VisualLine: first, last line

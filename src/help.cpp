@@ -9,9 +9,9 @@ const std::vector<HelpTopic>& helpTopics() {
 New here? The "Open the tour" button above makes an example note that shows the main features (also :tour).
 
 ## The basics
-- Every note is a .opman file. New notes go to your library folder (Settings > Files) and show in the sidebar.
-- Notes save themselves as you type. Ctrl-s saves now; Save as (Ctrl-Shift-s) puts the note anywhere you like.
-- Math is recognised as you type: x^2 + 1, a/b, sqrt, sin(x). Ctrl-m makes everything you type math.
+- A new note is Untitled until you save it: Ctrl-s asks for a name and a folder. After that it saves itself as you type.
+- What you type is plain text. Ctrl-m (or the ∑ button) switches to math mode: x^2 + 1, a/b, sqrt, sin(x). Ctrl-m again goes back to text.
+- The menus at the top and the toolbar have everything: styles, colours, sizes, alignment, lists, tables, pictures, plots.
 - A faint "= 17" after a line is its live result. Tab writes it into the note.
 - The popup under the cursor offers completions: symbols, functions, results, steps, solutions.
 
@@ -25,16 +25,21 @@ opman starts with vim keys: press i to type, Esc to stop. If you'd rather type s
         {"Files and saving", R"(## Your notes are files
 Each note is one .opman file holding its text, math, tables and pictures (pictures are packed inside the file, so a note can be copied, emailed or put in a cloud folder on its own).
 
-`Ctrl-s` save now (:w)
-`Ctrl-Shift-s` Save as: choose a folder and name (:saveas, :w path)
+A new note is Untitled and not in a file. The first Ctrl-s asks where to put it and what to call it; the name of the file is the name of the note. The top right corner shows the name and whether it is saved.
+
+`Ctrl-s` save (:w); asks for a name and folder the first time
+`Ctrl-Shift-s` Save as: another folder or name (:saveas, :w path)
 `Ctrl-Shift-o` open a note from anywhere (:open, :e path)
-`Ctrl-Shift-n` new note (:new [title])
-`:rename title` give the note a title
-`:trash` move the note to the library's .trash folder
+`Ctrl-Shift-n` new note (:new [name]); in standard keys also Ctrl-n
+`:rename name` rename the note's file
+`:trash` move the note to the notes folder's .trash folder
+`Ctrl-q` quit (:q)
+
+Once a note has a file, changes are written to it as you type (Settings > Editor > Saving turns that off; then only Ctrl-s writes). Closing, quitting or opening another note with unsaved changes asks first. Unsaved changes are also kept aside, so after a crash they come back at the next start.
 `:folder` show the note's folder in the file manager
 
-## The library
-New notes are created in the library folder (Documents/opman unless you change it in Settings > Files). Their file names follow their titles: a note that starts with "# Vectors" is saved as Vectors.opman. Notes you open or save elsewhere stay where they are and show in the sidebar under their title too.
+## The notes folder
+The sidebar lists the notes in one folder (Documents/opman unless you change it with File > Open folder), and Save starts there. Notes you open or save elsewhere stay where they are and show in the sidebar too.
 
 ## Opening from the file manager
 The Windows installer and the Linux package register .opman files: double-click one to open it in opman, or run opman path/to/note.opman.
@@ -62,13 +67,20 @@ Type the prefix at the start of a line, or use the toolbar:
 `1. ` numbered list (Space n)
 `> ` quote (Space >)
 `- [ ] ` checklist (Space t); Space x or a click on the box ticks it
-`---` a divider line (Space /)
+`---` a divider line (Space /). Variables start afresh below it, as with a section
+`Tab` `Shift-Tab` indent a list item or a line (>> and << in Normal mode)
+Space `[` `\` `]` align left, centre, right (Ctrl-Shift-l, Ctrl-Shift-e, Ctrl-Shift-r)
+Space `R O G T B P A` colour, Space `S` small, Space `+` large
+Long lines wrap at the edge of the page. A long calculation breaks before a + − · = and goes on indented below.
+`Shift-Enter` continue in the next line yourself: it stays one line, with one result. Backspace joins it again.
 Enter continues a list; Enter on an empty item ends it.
 
 ## Links between notes
 Write [[Other note]] to link to a note by title. Ctrl-click it, or press Enter or gf on it in Normal mode, to open it (it is created if it doesn't exist). Ctrl-o goes back. The sidebar shows "Linked from" for notes that link to the open one.)"},
 
-        {"Typing math", R"(Math is recognised as you type it: letters next to operators, numbers, x^2, a/b. Text stays text. Ctrl-m (or the ∑ button, or Space m) switches to math mode, where everything you type is math.
+        {"Typing math", R"(Ctrl-m (or the ∑ button, or Space m) switches to math mode, where everything you type is math; the cursor turns blue. Ctrl-m again goes back to text. Outside math mode everything is plain text: 2 apples, x = 5 and (a/b) stay as typed. After a line of only math, Enter stays in math mode.
+
+If you'd rather have math recognised in text as you type it, as earlier versions did, turn on Settings > Editor > Read math in text mode too (:set automath).
 
 ## Structures
 `/` a fraction: 1/2 becomes ½ with the cursor in the denominator
@@ -221,7 +233,7 @@ A header cell that is a name (t, h, mass) makes its column a list for the statis
 mean(h) = 15, max(h) = 20, sum(t) = 3, stdev(h)…
 plot table draws the columns as points.)"},
 
-        {"Pictures", R"(Drag a picture (png, jpg, gif, bmp) onto the window, or type :image path. It becomes a line ![caption](media/name.png); write a caption between the brackets.
+        {"Pictures", R"(Drag a picture (png, jpg, gif, bmp) onto the window, choose one with Insert > Picture, paste a screenshot with Ctrl-v (:pasteimage), or type :image path. Click it and drag the dot at its corner to resize it (double-click the dot for its own size); align it with the alignment buttons; type under it for a caption. Backspace or dd removes it.
 
 Pictures are stored inside the .opman file, so they travel with the note. Exports to HTML embed them; LaTeX, PDF and Markdown exports reference them.)"},
 

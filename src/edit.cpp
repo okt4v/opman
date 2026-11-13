@@ -212,6 +212,7 @@ std::vector<Entry> Editor::search(const std::string& q) const {
 
 // ---------- model ----------
 void Editor::reindex() {
+    gen++;
     parents.clear();
     auto walk = [&](auto& self, Row& row) -> void {
         for (auto& n : row)
@@ -326,6 +327,8 @@ std::vector<Entry> Editor::suggestions() {
     // program functions only for a word alone at the start of a top-level line, so "plot" in a sentence stays text
     bool alone = !inSlot() && cur.i == int(w.size()) && cur.i == int(cur.row->size());
     if (!alone) std::erase_if(hits, [](auto& e) { return e.cat == "Program"; });
+    // plain text offers no symbols: only the program functions (Ctrl-Space still opens everything)
+    if (!inSlot() && !mathMode && !autoMath && !forced && !(*cur.row)[cur.i - 1].m) std::erase_if(hits, [](auto& e) { return e.cat != "Program"; });
     // a plain text word with nothing to offer but "Variable notes" gets no popup, so Enter still makes a new line
     bool textWord = w.size() > 1 && !(*cur.row)[cur.i - 1].m;
     bool onlyVars = std::all_of(hits.begin(), hits.end(), [](auto& e) { return e.cat == "Variable" || e.cat == "Constant"; });
@@ -397,6 +400,30 @@ static bool alnum(const std::string& c) { return isLetter(c) || isDigit(c); }
 static std::string jsC(const Item& it) { return it.t == T::Ch ? it.c : (it.t == T::Paren || it.t == T::Mat) ? it.cl : ""; }
 
 void Editor::insertChar(std::string c) {
+    if (!inSlot() && lineStyle(*cur.row).kind == Line::Rule) {  // a divider holds no text: typing starts the line below it
+        int k = lineOf(cur.row);
+        doc.insert(doc.begin() + k + 1, Row{});
+        cur = {&doc[k + 1], 0};
+        reindex();
+    }
+    if (!inSlot()) {
+        if (!mathMode && !autoMath && lineStyle(*cur.row).kind != Line::Plot) {  // text mode: just the character
+            Item it = ch(c, false);
+            it.f = style;
+            cur.row->insert(cur.row->begin() + cur.i, it);
+            cur.i++;
+            // "1. " or "# " typed at the start of a list item or heading changes what the line is
+            auto styled = [](Line l) { return l >= Line::H1 && l <= Line::Done; };
+            if (LineStyle ls = lineStyle(*cur.row); c == " " && styled(ls.kind) && cur.i > ls.len) {
+                Row typed(cur.row->begin() + ls.len, cur.row->begin() + cur.i);
+                if (LineStyle in = lineStyle(typed); styled(in.kind) && in.len == int(typed.size())) {
+                    cur.row->erase(cur.row->begin(), cur.row->begin() + ls.len);
+                    cur.i -= ls.len;
+                }
+            }
+            return;
+        }
+    }
     if (c == "(" && !inSlot()) {
         const Entry* e = completeOpts.convert ? autoEntry(pendingWord()) : nullptr;
         if (e && e->cat == "Function")  // "det(" or "sin(" typed as text turns into the function
@@ -558,10 +585,47 @@ void Editor::right() {
     else if (int k = lineOf(row); k < int(doc.size()) - 1) cur = {&doc[k + 1], 0};
 }
 
+int Editor::lineStart() const { return inSlot() ? 0 : lineStyle(*cur.row).len; }
+
+void Editor::clampCur() {
+    if (inSlot()) return;
+    LineStyle ls = lineStyle(*cur.row);
+    cur.i = std::clamp(cur.i, std::min(ls.len, int(cur.row->size())), std::max(ls.len, int(cur.row->size()) - ls.tail));
+}
+
+void Editor::syncMode() {
+    if (inSlot() || cur.row->empty() || lineStyle(*cur.row).kind == Line::Plot) return;
+    int i = cur.i, start = lineStart();
+    const Row& r = *cur.row;
+    mathMode = i > start ? isMath(r[i - 1]) : i < int(r.size()) && isMath(r[i]);
+}
+
+void Editor::softBreak() {
+    if (inSlot() || lineStyle(*cur.row).kind == Line::Table) return enter();
+    cur.row->insert(cur.row->begin() + cur.i++, ch("\n", false));
+    reindex();
+}
+
+void Editor::toggleMath() {
+    mathMode = !mathMode;
+    if (mathMode || !inSlot()) return;
+    Row* r = cur.row;
+    Parent p{};
+    for (auto f = parents.find(r); f != parents.end(); f = parents.find(r)) p = f->second, r = p.row;
+    cur = {p.row, idxIn(p.row, p.node) + 1};
+}
+
+void Editor::indent(int a, int b, int d) {
+    for (int k = a; k <= b && k < int(doc.size()); k++) doc[k].indent = uint8_t(std::clamp(int(doc[k].indent) + d, 0, MAX_INDENT));
+}
+void Editor::setAlign(int a, int b, int align) {
+    for (int k = a; k <= b && k < int(doc.size()); k++) doc[k].align = uint8_t(align);
+}
+
 void Editor::left() {
     Row* row = cur.row;
     int i = cur.i;
-    if (i > 0) {
+    if (i > lineStart()) {
         auto& s = (*row)[i - 1].s;
         cur = s.empty() ? Cur{row, i - 1} : Cur{&s.back(), int(s.back().size())};
         return;
@@ -576,7 +640,7 @@ void Editor::left() {
 
 // ↑/↓ move between stacked slots (numerator/denominator, upper/lower limit, matrix rows, exponent/base),
 // otherwise between lines
-void Editor::vertical(int d) {
+void Editor::vertical(int d, bool visual) {
     for (Row* r = cur.row; parents.count(r); r = parents.at(r).row) {
         Parent p = parents.at(r);
         auto& s = p.node->s;
@@ -599,6 +663,7 @@ void Editor::vertical(int d) {
         return;
     }
     if (cellMove(0, d)) return;  // table to table: the same column
+    if (visual && !inSlot() && visualLine && visualLine(d)) return;
     Row* top = topOf(cur.row);
     int k = lineOf(top) + d;
     if (k >= 0 && k < int(doc.size())) cur = {&doc[k], std::min(top == cur.row ? cur.i : 0, int(doc[k].size()))};
@@ -607,6 +672,28 @@ void Editor::vertical(int d) {
 void Editor::backspace() {
     Row* row = cur.row;
     int i = cur.i;
+    if (!inSlot()) {
+        // at the start of a line Backspace takes its formatting away step by step: nesting, then the list/heading/
+        // section style; a divider or a picture goes entirely
+        LineStyle ls = lineStyle(*row);
+        if (i <= ls.len && (ls.len || row->indent)) {
+            if (ls.kind == Line::Rule || ls.kind == Line::Image) row->clear(), row->w = 0, cur.i = 0;
+            else if (row->indent) row->indent--;
+            else row->erase(row->begin(), row->begin() + ls.len), cur.i = 0;
+            reindex();
+            return;
+        }
+        int k = lineOf(row);
+        if (i == 0 && k > 0) {  // a divider or picture above goes as a whole, rather than its source joining this line
+            Line above = lineStyle(doc[k - 1]).kind;
+            if (above == Line::Rule || above == Line::Image) {
+                doc.erase(doc.begin() + k - 1);
+                reindex();
+                cur = {&doc[k - 1], 0};
+                return;
+            }
+        }
+    }
     if (i > 0) {
         auto& s = (*row)[i - 1].s;
         if (std::any_of(s.begin(), s.end(), [](const Row& r) { return !r.empty(); })) cur = {&s.back(), int(s.back().size())};
@@ -638,10 +725,40 @@ void Editor::backspace() {
     }
 }
 
+void Editor::del() {
+    Row& row = *cur.row;
+    int i = cur.i, n = int(row.size());
+    if (!inSlot() && i >= n - lineStyle(row).tail) {  // at the end of a line: the next one joins it, without its prefix
+        int k = lineOf(&row);
+        if (k + 1 >= int(doc.size())) return;
+        LineStyle here = lineStyle(row), next = lineStyle(doc[k + 1]);
+        auto block = [](Line l) { return l == Line::Rule || l == Line::Image || l == Line::Plot || l == Line::Table || l == Line::Section; };
+        if (next.kind == Line::Rule || next.kind == Line::Image || doc[k + 1].empty()) doc.erase(doc.begin() + k + 1);
+        else if (row.empty()) { doc.erase(doc.begin() + k); reindex(); cur = {&doc[k], lineStyle(doc[k]).len}; return; }
+        else if (block(here.kind) || block(next.kind)) return;
+        else {
+            row.insert(row.end(), doc[k + 1].begin() + next.len, doc[k + 1].end());
+            doc.erase(doc.begin() + k + 1);
+        }
+        reindex();
+        cur = {&doc[k], i};
+        return;
+    }
+    if (i < n && row[i].s.empty()) row.erase(row.begin() + i);
+}
+
 void Editor::enter() {
     if (inSlot()) return exitSlot();
     int k = lineOf(cur.row);
+    Line kind = lineStyle(*cur.row).kind;
+    if (kind == Line::Rule || kind == Line::Image || kind == Line::Section) {  // these stay whole: a new line below
+        doc.insert(doc.begin() + k + 1, Row{});
+        cur = {&doc[k + 1], 0};
+        reindex();
+        return;
+    }
     Row rest(std::make_move_iterator(cur.row->begin() + cur.i), std::make_move_iterator(cur.row->end()));
+    rest.align = cur.row->align, rest.indent = cur.row->indent;
     cur.row->erase(cur.row->begin() + cur.i, cur.row->end());
     doc.insert(doc.begin() + k + 1, std::move(rest));
     cur = {&doc[k + 1], 0};
@@ -1017,10 +1134,10 @@ void Editor::setLine(Row& line, Line kind, int num) {
 void Editor::toggleFmt(Row& row, int a, int b, uint16_t flag) {
     bool all = true, any = false;
     for (int j = a; j < b; j++)
-        if (row[j].t == T::Ch && !row[j].m && !isSpace(row[j])) any = true, all = all && (row[j].f & flag);
+        if (row[j].t == T::Ch && !row[j].m && !isSpace(row[j])) any = true, all = all && fmtHas(row[j].f, flag);
     if (!any) return;
     for (int j = a; j < b; j++)
-        if (row[j].t == T::Ch && !row[j].m) row[j].f = !flag ? 0 : all ? row[j].f & ~flag : (row[j].f & ~fmtGroup(flag)) | flag;
+        if (row[j].t == T::Ch && !row[j].m) row[j].f = !flag ? 0 : all ? row[j].f & ~fmtGroup(flag) : (row[j].f & ~fmtGroup(flag)) | flag;
 }
 
 void Editor::tableRow(const Row& from, Row& to) {
@@ -1048,8 +1165,9 @@ bool Editor::listEnter() {
         return true;
     }
     if (!isList(s.kind) || cur.i < s.len) return false;
-    if (int(line.size()) == s.len) {  // an empty item ends the list
-        setLine(line, Line::Text);
+    if (int(line.size()) == s.len) {  // an empty item steps out a level, then ends the list
+        if (line.indent) line.indent--;
+        else setLine(line, Line::Text);
         return true;
     }
     enter();

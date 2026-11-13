@@ -299,7 +299,7 @@ std::vector<Tok> tokens(const Row& row) {
         const Item& it = row[j];
         bool hasC = it.t == T::Ch || it.t == T::Sym;
         const std::string& c = it.c;
-        if (hasC && c == " ") continue;
+        if (hasC && (c == " " || c == "\n")) continue;
         if (numChar(it)) {
             std::string s = c;
             while (j + 1 < row.size() && (numChar(row[j + 1]) || isDecimalComma(row, j + 1))) s += row[++j].c == "," ? "." : row[j].c;

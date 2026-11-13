@@ -12,8 +12,16 @@
 namespace om {
 
 struct Item;
-using Row = std::vector<Item>;
+// a row of items, and for a top-level line its paragraph formatting (slots leave these at 0)
+struct Row : std::vector<Item> {
+    using std::vector<Item>::vector;
+    uint8_t align = 0;   // 0 left, 1 centred, 2 right
+    uint8_t indent = 0;  // nesting level: lists inside lists, indented paragraphs
+    uint16_t w = 0;      // a picture's shown width in px; 0: its own size
+    bool operator==(const Row& o) const;
+};
 using Doc = std::vector<Row>;
+constexpr int MAX_INDENT = 6;
 
 enum class T : uint8_t { Ch, Var, Const, Unit, Sym, Fn, Frac, Sup, Sub, Sqrt, Paren, Mat, Big, Lim };
 
@@ -32,9 +40,14 @@ struct Item {
 // inline text formatting
 enum Fmt : uint16_t {
     Bold = 1, Italic = 2, Underline = 4, Strike = 8, Code = 16, Mark = 32, Sup = 64, Sub = 128, Red = 256, Green = 512, Blue = 1024,
-    Script = Sup | Sub, Colors = Red | Green | Blue, AllFmt = 2047
+    Small = 2048, Large = 4096,
+    // the three colour bits together name seven colours
+    Orange = Red | Green, Purple = Red | Blue, Teal = Green | Blue, Gray = Red | Green | Blue,
+    Script = Sup | Sub, Colors = Red | Green | Blue, Sizes = Small | Large, AllFmt = 8191
 };
-uint16_t fmtGroup(uint16_t flag);  // bits that exclude each other: Sup/Sub, the colours
+uint16_t fmtGroup(uint16_t flag);  // bits that exclude each other: Sup/Sub, the colours, the sizes
+inline bool fmtHas(uint16_t f, uint16_t flag) { return flag && (f & fmtGroup(flag)) == flag; }
+unsigned fmtColor(uint16_t f);     // 0xRRGGBB of the text colour in f, or 0 for none
 
 // line formatting is a Markdown prefix typed into the line itself ("# ", "- ", "1. ", "> ", "- [ ] "), so notes stay
 // plain corca documents; the renderer draws the prefix as a heading size, bullet, number, quote bar or checkbox
@@ -43,8 +56,9 @@ uint16_t fmtGroup(uint16_t flag);  // bits that exclude each other: Sup/Sub, the
 enum class Line : uint8_t { Text, H1, H2, H3, Bullet, Number, Quote, Todo, Done, Rule, Image, Plot, Table, Section };
 struct LineStyle {
     Line kind = Line::Text;
-    int len = 0;  // items in the prefix
-    int num = 0;  // Number: the number typed
+    int len = 0;   // items in the prefix
+    int num = 0;   // Number: the number typed
+    int tail = 0;  // items hidden at the end: a picture's "](path)". The cursor lives in [len, size - tail]
 };
 LineStyle lineStyle(const Row& row);
 inline bool isList(Line l) { return l >= Line::Bullet && l <= Line::Done && l != Line::Quote; }
@@ -52,7 +66,7 @@ std::string linePrefix(Line kind, int num = 1);
 bool imageRef(const Row& row, std::string& alt, std::string& path);  // a whole line "![alt](path)"
 std::vector<std::pair<int, int>> tableCells(const Row& row);         // a table line's cells: [a, b) between the pipes
 std::string sectionTitle(const Row& row);                            // "=== Exercise 2" -> "Exercise 2"
-std::pair<int, int> sectionOf(const Doc& doc, int k);                // lines [a, b) of the section line k is in
+std::pair<int, int> sectionOf(const Doc& doc, int k);                // lines [a, b) of the section line k is in: sections and dividers bound it
 std::vector<std::pair<int, int>> linkSpans(const Row& row);          // "[[note title]]" in text: items [a, b), brackets included
 std::string linkTitle(const Row& row, std::pair<int, int> span);
 // equation numbers: "E = mc^2 #energy" tags a line (numbered in document order); "[#energy]" refers to it.
@@ -95,7 +109,8 @@ Item mat(std::string o, std::string c, std::vector<std::vector<Row>> rows);
 bool isLetter(const std::string& c);  // ASCII A-Za-z, one char
 bool isDigit(const std::string& c);
 inline bool isMath(const Item& it) { return it.t != T::Ch || it.m; }
-inline bool isSpace(const Item& it) { return it.t == T::Ch && it.c == " "; }
+inline bool isBreak(const Item& it) { return it.t == T::Ch && it.c == "\n"; }  // Shift-Enter: the line goes on below
+inline bool isSpace(const Item& it) { return it.t == T::Ch && (it.c == " " || it.c == "\n"); }
 bool isOp(const Item* it);
 bool isRel(const Item* it);
 const Item* prevNonSpace(const Row& row, int i);

@@ -1070,8 +1070,49 @@ static void checkVi() {
     CHECK(lineTex(ed.doc.back()).find("\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}") != std::string::npos);
 }
 
+// text mode types plain text; dividers bound variables; line attributes survive the file
+static void checkText() {
+    Editor ed;
+    Vi vi;
+    ed.autoMath = false;
+    keys(ed, vi, "i2 apples and x = 5 (a/b)<Esc>");
+    for (auto& it : ed.doc[0]) CHECK(it.t == T::Ch && !it.m);  // no variable, no fraction
+    keys(ed, vi, "o<C-m>x = 5<Esc>");
+    CHECK(std::any_of(ed.doc[1].begin(), ed.doc[1].end(), [](const Item& it) { return it.m || it.t != T::Ch; }));
+    keys(ed, vi, "o---<Esc>");
+    CHECK(lineStyle(ed.doc[2]).kind == Line::Rule);
+    keys(ed, vi, "ox + 1<Esc>");
+    int last = int(ed.doc.size()) - 1;
+    CHECK_EQ(sectionOf(ed.doc, 1).second, 2);     // x = 5 stops at the divider
+    CHECK_EQ(sectionOf(ed.doc, last).first, 2);   // and the line below starts afresh, at the divider
+    keys(ed, vi, "<Space>\\>>");  // Space \ centres
+    CHECK_EQ(int(ed.doc[last].align), 1);
+    CHECK_EQ(int(ed.doc[last].indent), 1);
+    ed.doc[last].w = 320;
+    Doc back = docFromJson(docJson(ed.doc));
+    CHECK(back == ed.doc);
+    CHECK_EQ(int(back[last].align), 1);
+    CHECK_EQ(int(back[last].indent), 1);
+    CHECK_EQ(int(back[last].w), 320);
+    // Shift-Enter: the calculation goes on in the next line and is still one line
+    {
+        Editor e2;
+        Vi v2;
+        keys(e2, v2, "i<C-m>1+2<S-CR>+3<Esc>");
+        CHECK_EQ(int(e2.doc.size()), 1);
+        CHECK(std::any_of(e2.doc[0].begin(), e2.doc[0].end(), isBreak));
+        CHECK_EQ(noSpaces(lineTex(e2.doc[0])), "$1+2+3$");
+    }
+    // backspace at the start of a line under a divider removes the divider, never lands inside it
+    keys(ed, vi, "<<0i<BS><Esc>");
+    CHECK(std::none_of(ed.doc.begin(), ed.doc.end(), [](const Row& r) { return lineStyle(r).kind == Line::Rule; }));
+}
+
 int main() {
+    // the scenarios below are corca's typing model, where text mode still reads math; checkText covers plain text
+    Editor::autoMathDefault = E.autoMath = true;
     checkCorca();
     checkVi();
+    checkText();
     std::puts("all checks passed");
 }

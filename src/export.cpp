@@ -153,7 +153,8 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
             for (auto& c : ext) c = char(std::tolower((unsigned char)c));
             out += "\\begin{center}\n";
             if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".pdf")
-                out += "\\includegraphics[width=0.8\\linewidth,height=0.4\\textheight,keepaspectratio]{" + p.generic_string() + "}\n";
+                out += "\\includegraphics[width=" + (doc[k].w ? std::to_string(std::min(1.0, doc[k].w / 760.0)) : std::string("0.8")) +  // 760: the page's text width in the app
+                       "\\linewidth,height=0.4\\textheight,keepaspectratio]{" + p.generic_string() + "}\n";
             else out += "\\texttt{" + esc(path) + "}\n";  // pdflatex reads png, jpg and pdf only
             if (!alt.empty()) out += "\\\\[2pt]{\\small " + esc(alt) + "}\n";
             out += "\\end{center}\n\n";
@@ -237,7 +238,7 @@ std::string latex(Editor& ed, const std::filesystem::path& base) {
             bool allMath = std::all_of(mask.begin() + a, mask.end(), [](bool m) { return m; });
             std::string n = eqNum(doc[k], nums);
             if (allMath) out += "\\[ " + tex(Row(row.begin() + a, row.end())) + (n.empty() ? "" : " \\tag{" + n.substr(1, n.size() - 2) + "}") + " \\]\n\n";  // a line of only math is displayed
-            else out += body + "\n\n";
+            else out += (doc[k].align == 1 ? "{\\centering " : doc[k].align == 2 ? "{\\raggedleft " : "") + body + (doc[k].align ? "\\par}" : "") + "\n\n";
         }
         }
     }
@@ -271,7 +272,7 @@ static std::string mathml(const Row& row) {
         const Item& it = row[j];
         switch (it.t) {
         case T::Ch: {
-            if (it.c == " ") break;
+            if (it.c == " " || it.c == "\n") break;
             if (isDigit(it.c) || (it.c == "." && j + 1 < row.size() && isDigit(row[j + 1].c))) {
                 std::string n;
                 for (; j < row.size() && row[j].t == T::Ch && (isDigit(row[j].c) || row[j].c == "." || (row[j].c == "," && j + 1 < row.size() && decimalComma && isDigit(row[j + 1].c))); j++) n += row[j].c;
@@ -321,14 +322,19 @@ static std::string mathml(const Row& row) {
 static std::string htmlText(const Row& row, int a, int b) {
     static const struct { uint16_t f; const char *open, *close; } MK[] = {
         {Mark, "<mark>", "</mark>"}, {Underline, "<u>", "</u>"}, {Strike, "<s>", "</s>"}, {Bold, "<b>", "</b>"},
-        {Italic, "<i>", "</i>"}, {Red, "<span class=r>", "</span>"}, {Green, "<span class=g>", "</span>"},
-        {Blue, "<span class=b>", "</span>"}, {Sup, "<sup>", "</sup>"}, {Sub, "<sub>", "</sub>"}, {Code, "<code>", "</code>"}};
+        {Italic, "<i>", "</i>"}, {Sup, "<sup>", "</sup>"}, {Sub, "<sub>", "</sub>"}, {Code, "<code>", "</code>"}};
     auto mask = mathMask(row, true);
     std::string out;
     uint16_t on = 0;
     auto set = [&](uint16_t f) {
         if (f == on) return;
-        for (int m = 10; m >= 0; m--) if (on & MK[m].f) out += MK[m].close;
+        for (int m = int(std::size(MK)) - 1; m >= 0; m--) if (on & MK[m].f) out += MK[m].close;
+        if (on & (Colors | Sizes)) out += "</span>";
+        if (f & (Colors | Sizes)) {
+            char col[32] = "";
+            if (f & Colors) std::snprintf(col, sizeof col, "color:#%06x;", fmtColor(f));
+            out += std::string("<span style=\"") + col + (fmtHas(f, Small) ? "font-size:.82em" : fmtHas(f, Large) ? "font-size:1.3em" : "") + "\">";
+        }
         for (auto& m : MK) if (f & m.f) out += m.open;
         on = f;
     };
@@ -480,7 +486,7 @@ blockquote { border-left: 3px solid var(--line); margin: .4em 0; padding-left: 1
 table { border-collapse: collapse; margin: .6em 0; } td, th { border: 1px solid var(--line); padding: 4px 12px; text-align: left; }
 th { background: var(--side); } img { max-width: 100%; border-radius: 6px; } figure { margin: 1em 0; } figcaption { color: var(--muted); font-size: .9em; }
 code { font-family: "JetBrains Mono", monospace; background: var(--side); padding: 0 4px; border-radius: 4px; }
-mark { background: #facc1566; color: inherit; } .r { color: #e5484d; } .g { color: #2f9e5b; } .b { color: #3b82f6; }
+mark { background: #facc1566; color: inherit; }
 .link { color: #3b82f6; } .eqn { float: right; } li.done { text-decoration: line-through; color: var(--muted); }
 .plot { width: 100%; background: var(--side); border-radius: 8px; } .plot text { font-size: 12px; fill: var(--muted); }
 .plot .grid { stroke: var(--line); } ul.todo { list-style: none; padding-left: 1.2em; }
@@ -507,15 +513,19 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
         LineStyle ls = lineStyle(row);
         std::string body = htmlText(row, ls.len, int(row.size()));
         if (std::string n = eqNum(doc[k], nums); !n.empty()) body = "<span class=eqn>" + n + "</span>" + body;
+        // ponytail: indent is a left margin, not nested <ul>s; nest them if list numbering per level matters in exports
+        std::string st = doc[k].align ? std::string("text-align:") + (doc[k].align == 1 ? "center;" : "right;") : "";
+        if (doc[k].indent) st += "margin-left:" + std::to_string(2 * doc[k].indent) + "em;";
+        if (!st.empty()) st = " style=\"" + st + "\"";
         switch (ls.kind) {
-        case Line::H1: open(""); out += "<h1>" + body + "</h1>\n"; break;
-        case Line::H2: open(""); out += "<h2>" + body + "</h2>\n"; break;
-        case Line::H3: open(""); out += "<h3>" + body + "</h3>\n"; break;
-        case Line::Bullet: open("ul"); out += "<li>" + body + "</li>\n"; break;
-        case Line::Todo: open("ul class=todo"); out += "<li>☐ " + body + "</li>\n"; break;
-        case Line::Done: open("ul class=todo"); out += "<li class=done>☑ " + body + "</li>\n"; break;
-        case Line::Number: open("ol"); out += "<li>" + body + "</li>\n"; break;
-        case Line::Quote: open("blockquote"); out += "<p>" + body + "</p>\n"; break;
+        case Line::H1: open(""); out += "<h1" + st + ">" + body + "</h1>\n"; break;
+        case Line::H2: open(""); out += "<h2" + st + ">" + body + "</h2>\n"; break;
+        case Line::H3: open(""); out += "<h3" + st + ">" + body + "</h3>\n"; break;
+        case Line::Bullet: open("ul"); out += "<li" + st + ">" + body + "</li>\n"; break;
+        case Line::Todo: open("ul class=todo"); out += "<li" + st + ">☐ " + body + "</li>\n"; break;
+        case Line::Done: open("ul class=todo"); out += "<li class=done" + st + ">☑ " + body + "</li>\n"; break;
+        case Line::Number: open("ol"); out += "<li" + st + ">" + body + "</li>\n"; break;
+        case Line::Quote: open("blockquote"); out += "<p" + st + ">" + body + "</p>\n"; break;
         case Line::Rule: open(""); out += "<hr>\n"; break;
         case Line::Section: open(""); out += "<div class=section>" + htmlEsc(sectionTitle(row)) + "</div>\n"; break;
         case Line::Image: {
@@ -529,9 +539,9 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
             std::string ext = p.extension().string().substr(std::min<size_t>(1, p.extension().string().size()));
             for (auto& c : ext) c = char(std::tolower((unsigned char)c));
             if (ext == "jpg") ext = "jpeg";
-            out += "<figure>";
+            out += "<figure" + st + ">";
             if (bytes.empty()) out += "<p>Image not found: " + htmlEsc(path) + "</p>";
-            else out += "<img alt=\"" + htmlEsc(alt) + "\" src=\"data:image/" + ext + ";base64," + base64(bytes) + "\">";  // one shareable file
+            else out += "<img alt=\"" + htmlEsc(alt) + "\"" + (doc[k].w ? " width=" + std::to_string(int(doc[k].w)) : "") + " src=\"data:image/" + ext + ";base64," + base64(bytes) + "\">";  // one shareable file
             if (!alt.empty()) out += "<figcaption>" + htmlEsc(alt) + "</figcaption>";
             out += "</figure>\n";
             break;
@@ -569,7 +579,7 @@ std::string html(Editor& ed, const std::filesystem::path& base, const std::strin
             auto mask = mathMask(row, true);
             if (std::all_of(mask.begin() + a, mask.end(), [](bool m) { return m; }))
                 out += (eqNum(doc[k], nums).empty() ? "<p>" : "<p><span class=eqn>" + eqNum(doc[k], nums) + "</span>") + "<math display=\"block\">" + mathml(Row(row.begin() + a, row.end())) + "</math></p>\n";
-            else out += "<p>" + body + "</p>\n";
+            else out += "<p" + st + ">" + body + "</p>\n";
         }
         }
     }

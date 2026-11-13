@@ -61,6 +61,9 @@ Item mat(std::string o, std::string c, std::vector<std::vector<Row>> rows) {
         for (auto& cell : r) it.s.push_back(std::move(cell));
     return it;
 }
+bool Row::operator==(const Row& o) const {
+    return static_cast<const std::vector<Item>&>(*this) == static_cast<const std::vector<Item>&>(o) && align == o.align && indent == o.indent && w == o.w;
+}
 int matRows(const Item& n) { return n.cols ? int(n.s.size()) / n.cols : 0; }
 
 bool isLetter(const std::string& c) { return c.size() == 1 && ((c[0] >= 'A' && c[0] <= 'Z') || (c[0] >= 'a' && c[0] <= 'z')); }
@@ -173,7 +176,7 @@ static std::string texItem(const Item& it) {
     case T::Ch:
         if (!it.m) return it.c;
         if (it.c == "*") return "\\cdot ";
-        if (it.c == " ") return "";
+        if (it.c == " " || it.c == "\n") return "";
         if (it.c == "−") return "-";
         if (it.c == "%" || it.c == "#" || it.c == "&" || it.c == "$") return "\\" + it.c;  // TeX specials ("50%")
         return it.c;
@@ -253,8 +256,8 @@ std::string styled(const Row& row, int a, int b, const Mk (&mk)[N], std::string 
     uint16_t on = 0;
     auto set = [&](uint16_t f) {
         if (f == on) return;
-        for (int m = int(N) - 1; m >= 0; m--) if (on & mk[m].f) out += mk[m].close;
-        for (auto& m : mk) if (f & m.f) out += m.open;
+        for (int m = int(N) - 1; m >= 0; m--) if (fmtHas(on, mk[m].f)) out += mk[m].close;
+        for (auto& m : mk) if (fmtHas(f, m.f)) out += m.open;
         on = f;
     };
     for (int j = a; j < b;) {
@@ -294,6 +297,9 @@ std::string markdown(const Row& row) {
     static const Mk MK[] = {{Bold, "**", "**"}, {Italic, "*", "*"}, {Strike, "~~", "~~"}, {Mark, "==", "=="},
                             {Underline, "<u>", "</u>"}, {Red, "<span style=\"color:red\">", "</span>"},
                             {Green, "<span style=\"color:green\">", "</span>"}, {Blue, "<span style=\"color:blue\">", "</span>"},
+                            {Orange, "<span style=\"color:darkorange\">", "</span>"}, {Purple, "<span style=\"color:purple\">", "</span>"},
+                            {Teal, "<span style=\"color:teal\">", "</span>"}, {Gray, "<span style=\"color:gray\">", "</span>"},
+                            {Small, "<small>", "</small>"}, {Large, "<big>", "</big>"},
                             {Sup, "<sup>", "</sup>"}, {Sub, "<sub>", "</sub>"}, {Code, "`", "`"}};
     return styled(row, 0, int(row.size()), MK, same);
 }
@@ -301,7 +307,8 @@ std::string markdown(const Row& row) {
 std::string latexText(const Row& row, int a, int b) {
     static const Mk MK[] = {{Mark, "\\hl{", "}"}, {Underline, "\\uline{", "}"}, {Strike, "\\sout{", "}"}, {Bold, "\\textbf{", "}"},
                             {Italic, "\\textit{", "}"}, {Red, "\\textcolor{red}{", "}"}, {Green, "\\textcolor{green!50!black}{", "}"},
-                            {Blue, "\\textcolor{blue}{", "}"}, {Sup, "\\textsuperscript{", "}"}, {Sub, "\\textsubscript{", "}"},
+                            {Blue, "\\textcolor{blue}{", "}"}, {Orange, "\\textcolor{orange}{", "}"}, {Purple, "\\textcolor{violet}{", "}"},
+                            {Teal, "\\textcolor{teal}{", "}"}, {Gray, "\\textcolor{gray}{", "}"}, {Small, "{\\small ", "}"}, {Large, "{\\large ", "}"}, {Sup, "\\textsuperscript{", "}"}, {Sub, "\\textsubscript{", "}"},
                             {Code, "\\texttt{", "}"}};
     return styled(row, a, b, MK, texEsc);
 }
@@ -367,19 +374,37 @@ std::string plain(const Row& row) {
     return out;
 }
 
-uint16_t fmtGroup(uint16_t flag) { return flag & Script ? Script : flag & Colors ? Colors : flag; }
-
-bool imageRef(const Row& row, std::string& alt, std::string& path) {
-    std::string s;
-    for (auto& it : row) {
-        if (it.t != T::Ch) return false;
-        s += it.c;
+uint16_t fmtGroup(uint16_t flag) { return flag & Script ? Script : flag & Colors ? Colors : flag & Sizes ? Sizes : flag; }
+unsigned fmtColor(uint16_t f) {
+    switch (f & Colors) {
+    case Red: return 0xe5484d;
+    case Green: return 0x2f9e5b;
+    case Blue: return 0x3b82f6;
+    case Orange: return 0xe8890c;
+    case Purple: return 0x8b5cf6;
+    case Teal: return 0x14a3a3;
+    case Gray: return 0x8a8a8e;
     }
-    size_t mid = s.find("](");
-    if (!s.starts_with("![") || !s.ends_with(")") || mid == std::string::npos) return false;
-    alt = s.substr(2, mid - 2);
-    path = s.substr(mid + 2, s.size() - mid - 3);
-    return !path.empty();
+    return 0;
+}
+
+// "![alt](path)": the index of the "]" before "(path)", or -1
+static int imageMid(const Row& row) {
+    int n = int(row.size());
+    for (auto& it : row)
+        if (it.t != T::Ch) return -1;
+    if (n < 6 || row[0].c != "!" || row[1].c != "[" || row[n - 1].c != ")") return -1;
+    for (int j = 2; j + 2 < n; j++)
+        if (row[j].c == "]" && row[j + 1].c == "(") return j;
+    return -1;
+}
+bool imageRef(const Row& row, std::string& alt, std::string& path) {
+    int mid = imageMid(row), n = int(row.size());
+    if (mid < 0) return false;
+    alt.clear(), path.clear();
+    for (int j = 2; j < mid; j++) alt += row[j].c;
+    for (int j = mid + 2; j < n - 1; j++) path += row[j].c;
+    return true;
 }
 
 // ponytail: a pipe inside math stays an absolute value, so only text pipes split cells
@@ -406,8 +431,9 @@ std::string sectionTitle(const Row& row) {
 
 std::pair<int, int> sectionOf(const Doc& doc, int k) {
     int a = k, b = k + 1, n = int(doc.size());
-    while (a > 0 && lineStyle(doc[a]).kind != Line::Section) a--;
-    while (b < n && lineStyle(doc[b]).kind != Line::Section) b++;
+    auto bound = [&](int j) { Line l = lineStyle(doc[j]).kind; return l == Line::Section || l == Line::Rule; };
+    while (a > 0 && !bound(a)) a--;
+    while (b < n && !bound(b)) b++;
     return {a, b};
 }
 
@@ -484,11 +510,11 @@ LineStyle lineStyle(const Row& row) {
     for (size_t i = 0; i < row.size() && i < 12 && row[i].t == T::Ch; i++) s += row[i].c;
     auto is = [&](const char* p) { return s.starts_with(p); };
     auto n = [](const char* p) { return int(std::string(p).size()); };
-    if (row.size() == 3 && s == "---") return {Line::Rule};
-    if (is("===")) return {Line::Section};
+    if (row.size() == 3 && s == "---") return {Line::Rule, 3};
+    if (is("===")) return {Line::Section, 3 + (row.size() > 3 && isSpace(row[3]))};
     if (is("|")) return {Line::Table};
     if (!row.empty() && row[0].t == T::Fn && row[0].c == "plot") return {Line::Plot};  // the program function, not the word
-    if (std::string alt, path; is("![") && imageRef(row, alt, path)) return {Line::Image};
+    if (int mid = is("![") ? imageMid(row) : -1; mid >= 0) return {Line::Image, 2, 0, int(row.size()) - mid};
     if (is("- [ ] ")) return {Line::Todo, 6};
     if (is("- [x] ") || is("- [X] ")) return {Line::Done, 6};
     if (is("### ")) return {Line::H3, 4};
@@ -637,6 +663,7 @@ static json itemJson(const Item& it) {
 
 json toJson(const Row& row) {
     json a = json::array();
+    if (row.align || row.indent || row.w) a.push_back({{"t", "ln"}, {"a", row.align}, {"i", row.indent}, {"w", row.w}});  // paragraph formatting
     for (auto& it : row) a.push_back(itemJson(it));
     return a;
 }
@@ -677,8 +704,14 @@ static Item itemFromJson(const json& j) {
 
 Row rowFromJson(const json& j) {
     Row r;
-    if (j.is_array())
-        for (auto& x : j) r.push_back(itemFromJson(x));
+    if (!j.is_array()) return r;
+    for (auto& x : j) {
+        if (x.is_object() && str(x, "t") == "ln") {
+            r.align = uint8_t(std::clamp(x.value("a", 0), 0, 2));
+            r.indent = uint8_t(std::clamp(x.value("i", 0), 0, MAX_INDENT));
+            r.w = uint16_t(std::clamp(x.value("w", 0), 0, 4000));
+        } else r.push_back(itemFromJson(x));
+    }
     return r;
 }
 json docJson(const Doc& doc) {

@@ -11,6 +11,7 @@ static int len(const Row* r) { return int(r->size()); }
 
 void Vi::refresh(Editor& ed) {
     ed.reindex();
+    ed.clampCur();
     items = mode == Mode::Insert && !ed.range ? ed.suggestions() : std::vector<Entry>{};
     if (ed.pick >= int(items.size())) ed.pick = 0;
 }
@@ -26,6 +27,8 @@ void Vi::mouse(Editor& ed, Cur p, bool drag) {
     if (!drag) {
         ed.cur = p;
         ed.snapToCell();  // a click on a table border lands in a cell
+        ed.clampCur();
+        ed.syncMode();
         dragFrom = ed.cur;
         ed.range.reset();
         if (mode != Mode::Insert) mode = Mode::Normal;
@@ -55,6 +58,10 @@ std::vector<Key> Vi::parse(const std::string& s) {
             else if (t == "S-Space") k.ch = " ", k.shift = true;
             else if (t == "Space") k.ch = " ";
             else if (t == "Tab") k.sp = Key::Tab;
+            else if (t == "S-Tab") k.sp = Key::Tab, k.shift = true;
+            else if (t == "Del") k.sp = Key::Delete;
+            else if (t == "Home") k.sp = Key::Home;
+            else if (t == "End") k.sp = Key::End;
             else if (t == "BS") k.sp = Key::Backspace;
             else if (t == "F1") k.sp = Key::F1;
             else if (t == "S-Down") k.sp = Key::Down, k.shift = true;
@@ -82,6 +89,8 @@ void Vi::toInsert(Editor& ed, bool snapped) {
     if (!snapped) ed.snap();
     mode = Mode::Insert;
     ed.range.reset();
+    ed.clampCur();
+    ed.syncMode();
     const Row& r = *ed.cur.row;  // keep typing in the style of the text before the cursor
     int i = ed.cur.i;
     ed.style = i > 0 && r[i - 1].t == T::Ch && !r[i - 1].m && !isSpace(r[i - 1]) ? r[i - 1].f : 0;
@@ -120,7 +129,7 @@ void Vi::format(Editor& ed, uint16_t flag) {
         return done();
     }
     if (mode == Mode::Insert) {
-        ed.style = !flag ? 0 : ed.style & flag ? ed.style & ~flag : (ed.style & ~fmtGroup(flag)) | flag;
+        ed.style = !flag ? 0 : fmtHas(ed.style, flag) ? ed.style & ~fmtGroup(flag) : (ed.style & ~fmtGroup(flag)) | flag;
         return;
     }
     Row& r = *ed.cur.row;  // Normal: the word under the cursor
@@ -149,10 +158,22 @@ void Vi::toggleDone(Editor& ed) {
     if (mode == Mode::Visual || mode == Mode::VisualLine) mode = Mode::Normal, ed.range.reset();
 }
 
+void Vi::align(Editor& ed, int al) {
+    auto [a, b] = lines(ed);
+    ed.snap();
+    ed.setAlign(a, b, al);
+}
+void Vi::indent(Editor& ed, int d) {
+    auto [a, b] = lines(ed);
+    ed.snap();
+    ed.indent(a, b, d);
+}
+
 void Vi::leaderKey(Editor& ed, const std::string& c) {
     static const std::map<std::string, uint16_t> FMT = {{"b", Bold}, {"i", Italic}, {"u", Underline}, {"s", Strike}, {"c", Code},
                                                         {"h", Mark}, {"^", Sup}, {"_", Sub}, {"R", Red}, {"G", Green},
-                                                        {"B", Blue}, {"r", 0}};
+                                                        {"B", Blue}, {"O", Orange}, {"P", Purple}, {"T", Teal}, {"A", Gray},
+                                                        {"+", Large}, {"S", Small}, {"r", 0}};
     static const std::map<std::string, Line> LINE = {{"0", Line::Text}, {"1", Line::H1}, {"2", Line::H2}, {"3", Line::H3},
                                                      {"-", Line::Bullet}, {"n", Line::Number}, {">", Line::Quote}, {"t", Line::Todo}};
     if (c == "|") return cmds.push_back("table 3 2");  // a 3×2 table below
@@ -161,7 +182,8 @@ void Vi::leaderKey(Editor& ed, const std::string& c) {
     if (auto f = FMT.find(c); f != FMT.end()) format(ed, f->second);
     else if (auto l = LINE.find(c); l != LINE.end()) setLine(ed, l->second);
     else if (c == "x") toggleDone(ed);
-    else if (c == "m") ed.mathMode = !ed.mathMode;
+    else if (c == "m") ed.toggleMath();
+    else if (c == "[" || c == "]" || c == "\\") align(ed, c == "[" ? 0 : c == "]" ? 2 : 1);  // left, right, centre
     else if (c == "e") cmds.push_back("sidebar");
     else message = "Space " + c + " is not mapped";
 }
@@ -202,7 +224,7 @@ void Vi::key1(Editor& ed, const Key& k) {
     else if (k.ctrl && (k.ch == "b" || k.ch == "i" || k.ch == "u") && mode != Mode::Command)
         format(ed, k.ch == "b" ? Bold : k.ch == "i" ? Italic : Underline);
     else if (k.ctrl && k.ch == "s") cmds.push_back("w");
-    else if (k.ctrl && k.ch == "m") ed.mathMode = !ed.mathMode;
+    else if (k.ctrl && k.ch == "m") ed.toggleMath();
     else if (mode == Mode::Insert) insertKey(ed, k);
     else if (mode == Mode::Command) commandKey(ed, k);
     else {
@@ -248,13 +270,22 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         if (k.ch.size() == 1 && k.ch[0] >= '1' && k.ch[0] <= '9') pickItem(ed, k.ch[0] - '1');
         else if (n && (k.ch == "n" || k.ch == "p")) ed.pick = (ed.pick + (k.ch == "n" ? 1 : n - 1)) % n, navigated = true;
         else if (k.ch == "a") ed.selectAll();
-        else if (k.ch == "v" && getClip) { ed.deleteSelection(); pasteText(ed, getClip()); }
+        else if (k.ch == "v" && getClip) {  // what was copied here goes back as it was (math stays math); other text is typed in
+            ed.deleteSelection();
+            if (std::string t = getClip(); !copied.empty() && t == copied && !reg.lines) {
+                if (!reg.parts.empty()) ed.insertLines(reg.parts);
+                else ed.insertItems(reg.items);
+            } else pasteText(ed, t);
+        }
         else if (k.ch == "z") k.shift ? ed.redo() : ed.undo();
         else if (k.ch == "y") ed.redo();
         else if ((k.ch == "c" || k.ch == "x") && ed.range) {
             Doc parts = ed.selectedLines();
             copied = parts.size() > 1 ? markdown(parts) : markdown(parts[0]);
             if (parts.size() > 1 && copied.ends_with("\n")) copied.pop_back();
+            reg.lines = false;
+            reg.items = parts.size() == 1 ? parts[0] : Row{};
+            reg.parts = parts.size() > 1 ? parts : Doc{};
             if (setClip) setClip(copied);
             if (k.ch == "x") ed.snap(), ed.deleteSelection();
         } else if (k.ch == "f") mode = Mode::Command, prompt = '/', cmdline.clear();
@@ -267,9 +298,17 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         if (!standard) mode = Mode::Normal;
         return;
     case Key::Enter:
-        if (k.shift) { if (!ed.addMatrixRow() && !ed.gridOp('j')) ed.enter(); }  // a matrix or table row
+        if (k.shift) { if (!ed.addMatrixRow() && !ed.gridOp('j')) ed.softBreak(); }  // a matrix or table row, else the line goes on below
         else if (n && !items[0].insert && (navigated || (completeOpts.accept != 1 && enterPicks(ed)))) pickItem(ed, ed.pick);
-        else { ed.deleteSelection(); if (!ed.listEnter()) ed.enter(); }
+        else {
+            ed.deleteSelection();
+            // after a line with text in it the next one starts as text; a run of math lines stays in math
+            const Row& r = *ed.cur.row;
+            bool top = !ed.inSlot(), allMath = top && !r.empty() && std::all_of(r.begin(), r.end(), [](auto& x) { return isMath(x) || isSpace(x); });
+            bool decide = top && !r.empty() && lineStyle(r).kind != Line::Plot;  // (r moves when the line is added)
+            if (!ed.listEnter()) ed.enter();
+            if (decide && !allMath) ed.mathMode = false;
+        }
         return;
     case Key::Tab:
         if (n && (items[0].insert || navigated || items[ed.pick].cat == "Program" || (completeOpts.accept != 0 && enterPicks(ed))))
@@ -292,6 +331,9 @@ void Vi::insertKey(Editor& ed, const Key& k) {
             }
             ed.cur.i = cells[c].second;
             ed.snapToCell();  // after the cell's text, like the arrows
+        } else if (LineStyle ls = ed.inSlot() ? LineStyle{} : lineStyle(*ed.cur.row); !ed.inSlot() && (isList(ls.kind) || ed.cur.i <= ls.len)) {
+            int at = ed.lineOf(ed.cur.row);  // a list item, or the start of a line: nest it (Shift-Tab: back out)
+            ed.indent(at, at, k.shift ? -1 : 1);
         } else ed.exitSlot();
         return;
     case Key::Up: case Key::Down:
@@ -302,7 +344,7 @@ void Vi::insertKey(Editor& ed, const Key& k) {
             ed.reindex();
             ed.selectBetween(from, ed.cur);
         } else if (n) ed.pick = (ed.pick + (k.sp == Key::Down ? 1 : n - 1)) % n, navigated = true;
-        else { ed.collapseSelection(k.sp == Key::Down); ed.range.reset(); ed.vertical(k.sp == Key::Up ? -1 : 1); }
+        else { ed.collapseSelection(k.sp == Key::Down); ed.range.reset(); ed.vertical(k.sp == Key::Up ? -1 : 1); ed.reindex(); ed.clampCur(); ed.syncMode(); }
         return;
     case Key::Left: case Key::Right:
         if (k.shift) ed.extendSelection(k.sp == Key::Left ? -1 : 1);
@@ -311,12 +353,12 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         else if (ed.cellMove(k.sp == Key::Left ? -1 : 1, 0)) {}  // tables: cell to cell
         else if (k.sp == Key::Left) ed.left();
         else ed.right();
+        if (!k.shift) ed.reindex(), ed.clampCur(), ed.syncMode();
         return;
-    case Key::Home: case Key::End: ed.range.reset(); ed.home(k.sp == Key::End); return;
+    case Key::Home: case Key::End: ed.range.reset(); ed.home(k.sp == Key::End); ed.clampCur(); ed.syncMode(); return;
     case Key::Backspace: if (!ed.deleteSelection()) ed.backspace(); return;
     case Key::Delete:
-        if (!ed.deleteSelection() && ed.cur.i < len(ed.cur.row) && (*ed.cur.row)[ed.cur.i].s.empty())
-            ed.cur.row->erase(ed.cur.row->begin() + ed.cur.i);
+        if (!ed.deleteSelection()) ed.del();
         return;
     case Key::None:
         navigated = false;
@@ -342,12 +384,12 @@ bool Vi::motion(Editor& ed, const std::string& m, int n, bool hasCount, bool str
     if (m == "h" || m == "l") {
         for (int k = 0; k < n; k++) {
             if (!structural) ed.cur.i = std::clamp(ed.cur.i + (m == "h" ? -1 : 1), 0, len(row));
-            else if (m == "h" && !(ed.cur.i == 0 && !ed.inSlot())) ed.left();
+            else if (m == "h" && !(ed.cur.i <= ed.lineStart() && !ed.inSlot())) ed.left();
             else if (m == "l" && !(ed.cur.i == len(ed.cur.row) && !ed.inSlot())) ed.right();
             ed.reindex();
         }
     } else if (m == "j" || m == "k") {
-        for (int k = 0; k < n; k++) ed.vertical(m == "j" ? 1 : -1);
+        for (int k = 0; k < n; k++) ed.vertical(m == "j" ? 1 : -1, structural);  // an operator's j/k count whole lines
         linewise = true;
     } else if (m == "w" || m == "e" || m == "b") {  // words run on over line ends, not out of a slot
         int line = ed.inSlot() ? -1 : ed.lineOf(row), last = int(ed.doc.size()) - 1, i = ed.cur.i;
@@ -382,7 +424,7 @@ bool Vi::motion(Editor& ed, const std::string& m, int n, bool hasCount, bool str
         }
         ed.cur = {row, i};
         inclusive = m == "e";
-    } else if (m == "0") ed.cur.i = 0;
+    } else if (m == "0") ed.cur.i = ed.lineStart();
     else if (m == "^") {
         int i = 0;
         while (i < len(row) && sp(i)) i++;
@@ -452,6 +494,13 @@ void Vi::normalKey(Editor& ed, const std::string& c0, const Key& k) {
     if (c.empty()) return;
     if (leader()) { pending.clear(); return leaderKey(ed, c); }
     if (c == " " && pending.empty()) { pending = " "; return; }
+    if (c == ">" || c == "<") {  // >> and <<: nest the line, or bring it back out
+        if (pending != c) { pending = c; return; }
+        pending.clear();
+        ed.snap();
+        ed.indent(lineIdx(ed), lineIdx(ed), c == ">" ? 1 : -1);
+        return;
+    }
     // r<c>: replace the item under the cursor by typing c there
     if (pending.ends_with("r")) {
         pending.clear();
@@ -689,6 +738,12 @@ void Vi::visualKey(Editor& ed, const std::string& c, const Key& k) {
         if (!lineMode) visualSelect(ed);
         return;
     }
+    if (c == ">" || c == "<") {
+        auto [a, b] = lines(ed);
+        ed.snap();
+        ed.indent(a, b, c == ">" ? 1 : -1);
+        return leave();
+    }
     if (c == "o" && !lineMode) {
         std::swap(anchor, ed.cur);
         visualSelect(ed);
@@ -750,7 +805,7 @@ void Vi::commandKey(Editor& ed, const Key& k) {
         std::string name = c.substr(0, c.find(' '));
         static const std::vector<std::string> known = {"w", "q", "q!", "wq", "x", "e", "new", "rename", "trash", "set", "export",
                                                        "image", "table", "rule", "section", "row", "col", "print", "tour", "import", "copytable", "saveas", "open", "help", "settings",
-                                                       "palette", "outline", "zoom", "folder"};
+                                                       "palette", "outline", "zoom", "folder", "align", "indent", "outdent", "pasteimage", "close"};
         bool subst = name.starts_with("s/") || name.starts_with("%s/");
         if (!subst && std::find(known.begin(), known.end(), name) == known.end()) { message = "Not an editor command: " + c; return; }
         cmds.push_back(c);
