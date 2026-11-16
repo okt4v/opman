@@ -1,0 +1,20 @@
+Math engine: not handled yet
+
+Integrals
+- substitution beyond a linear argument (ax + b), e.g. ∫ 2x·cos(x²) dx
+- partial fractions, e.g. ∫ 1/(x² − 1) dx
+  (anything not covered still falls back to the numeric answer)
+
+Factoring
+- cubics and higher without a rational root
+
+Solving formulas
+- a letter inside a function, e.g. y = sin(x) solved for x
+
+Algebra
+- adding fractions with different denominators automatically (only offered as Combine fractions)
+- fractional exponents as real exponents (x^(1/2) · x is kept as written)
+- double-angle and other trig identities beyond sin² + cos² = 1, tan = sin/cos
+
+Typing
+- 1/2 + 1/4 puts "+ 1/4" into the denominator unless → is pressed first
