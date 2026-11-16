@@ -167,7 +167,7 @@ static void checkCorca() {
     newLine(); type("x"); pick("Variable x"); type("^2-4 = 0 =>");
     CHECK_EQ(names()[0], "x = -2, x = 2");
     newLine(); type("x"); pick("Variable x"); type("^2 = 2 =>");
-    CHECK_EQ(names(), (std::vector<std::string>{"x = ± √2", "x = -1.414213562, x = 1.414213562", "Show the working"}));
+    CHECK_EQ(names(), (std::vector<std::string>{"x = ± √2", "x = −√2, x = √2", "x = -1.414213562, x = 1.414213562", "Show the working"}));
     newLine(); type("3x + 1 = 7 =>");
     CHECK_EQ(names()[0], "x = 2");
     newLine(); type("cos"); pick("cos"); type("(x) = x =>");
@@ -188,7 +188,7 @@ static void checkCorca() {
     newLine(); type("5 m/s"); E.exitSlot(); type(" * 3 s =");
     CHECK_EQ(names()[0], "= 15 m");
     newLine(); type("2 km + 300 m =");
-    CHECK_EQ(names()[0], "= 23/10 km");
+    CHECK_EQ(names(), (std::vector<std::string>{"= 2.3 km", "= 2300 m"}));
     newLine(); type("v"); pick("Variable v"); type(" = 90 km/h");
     newLine(); type("v"); pick("Variable v"); type(" * 2 h =");
     CHECK_EQ(names()[0], "= 180 km");
@@ -512,7 +512,7 @@ static void checkVi() {
         mathOpts.degrees = true;
         keys(e, v, "osin(30)<Esc>");
         CHECK_EQ(ghost(e, e.doc.back())->text, "= 1/2");
-        mathOpts.decimals = true;
+        mathOpts.form = 1;
         CHECK_EQ(ghost(e, e.doc.back())->text, "= 0.5");
         mathOpts = {};
         // exact forms of decimals: roots, π, quadratic roots; sin(1) stays a decimal
@@ -918,18 +918,21 @@ static void checkVi() {
         Vi v;
         v.mode = Mode::Insert;
         keys(e, v, "<C-m>a = 2,5<CR>a+1");
+        CHECK_EQ(ghost(e, e.doc[1])->text, "= 3,5");  // a decimal in, a decimal out (a is 2,5)
+        mathOpts.form = 0;
         CHECK_EQ(ghost(e, e.doc[1])->text, "= 7/2");
+        CHECK_EQ(ghost(e, e.doc[1])->picked(1).text, "= 3,5");
         keys(e, v, "<CR>max(1;2,5)");
         CHECK_EQ(ghost(e, e.doc[2])->text, "= 5/2");
         keys(e, v, "<CR>max(1, 2,5)");
         CHECK_EQ(ghost(e, e.doc[3])->text, "= 5/2");
-        mathOpts.decimals = true;
+        mathOpts.form = 1;
         keys(e, v, "<CR>a/2");
         auto g = ghost(e, e.doc[4]);
         CHECK_EQ(g->text, "= 1,25");
         CHECK_EQ(plain(g->insert).find("1,25") != std::string::npos, true);
         CHECK_EQ(lineTex(e.doc[0]).find("2{,}5") != std::string::npos, true);
-        mathOpts.decimals = false;
+        mathOpts.form = 2;
         decimalComma = false;
         CHECK_EQ(localNum("2.5"), "2.5");
     }
@@ -995,8 +998,8 @@ static void checkVi() {
         Editor m;
         Vi n;
         keys(m, n, "i<C-m>x = 3<CR>x^2<Right> = 2 =>");
-        CHECK_EQ(int(n.items.size()), 3);
-        keys(m, n, "<C-3>");
+        CHECK_EQ(int(n.items.size()), 4);
+        keys(m, n, "<C-4>");
         CHECK_EQ(noSpaces(plain(m.doc.back())), "x=±√2");
         Editor o;  // a line above that isn't a value (x = 1 ± 2) doesn't stop solving
         Vi r;
@@ -1108,11 +1111,100 @@ static void checkText() {
     CHECK(std::none_of(ed.doc.begin(), ed.doc.end(), [](const Row& r) { return lineStyle(r).kind == Line::Rule; }));
 }
 
+// the math engine as typed in math mode (Ctrl-m), the way the app is used now
+static void checkEngine() {
+    auto calc = [](const std::string& typed) {  // the faint result of a one-line note
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>" + typed + "<Esc>");
+        auto g = ghost(e, e.doc[0]);
+        return g ? g->text : std::string("-");
+    };
+    CHECK_EQ(calc("2 * -3"), "= -6");       // a sign after an operator
+    CHECK_EQ(calc("12% * 50"), "= 6");
+    CHECK_EQ(calc("17 mod 5"), "= 2");
+    CHECK_EQ(calc("sin(pi/6)"), "= 1/2");   // ")" leaves the denominator and closes the bracket
+    CHECK_EQ(calc("ln(e^2)"), "= 2");       // and the exponent
+    CHECK_EQ(calc("abs(-5) + floor(7/2)"), "= 8");
+    CHECK_EQ(calc("0.1 + 0.2"), "= 0.3");   // decimals in, decimals out
+    CHECK_EQ(calc("3 + 4 = 8"), "≠ 7");     // a wrong answer is flagged
+    CHECK_EQ(calc("2 + 2 = 4 = 5"), "≠ 4");
+    CHECK_EQ(calc("3 + 4 = 7"), "-");
+    CHECK_EQ(calc("pi = 3.14"), "-");       // right to the places written
+    CHECK_EQ(calc("pi = 3.2"), "≠ π");
+    CHECK_EQ(calc("2^40"), "= 1099511627776");
+
+    // definitions follow the lines: a later x = 5 doesn't change the lines above it, a = a + 1 counts on
+    Editor e;
+    Vi v;
+    keys(e, v, "i<C-m>x = 2<CR>x + 1<CR>x = 5<CR>x + 1<CR>a = 1<CR>a = a + 1<CR>a*10<Esc>");
+    CHECK_EQ(ghost(e, e.doc[1])->text, "= 3");
+    CHECK_EQ(ghost(e, e.doc[3])->text, "= 6");
+    CHECK_EQ(ghost(e, e.doc[6])->text, "= 20");
+    // a name defined further down is still found (A = πr² above r = 2)
+    keys(e, v, "oy = z + 1<CR>z = 4<CR>y<Esc>");
+    CHECK_EQ(ghost(e, e.doc[9])->text, "= 5");
+    // --- and === start afresh, also typed in math mode
+    keys(e, v, "o---<CR>x + 1<CR>===<CR>a<Esc>");
+    CHECK(lineStyle(e.doc[10]).kind == Line::Rule && lineStyle(e.doc[12]).kind == Line::Section);
+    CHECK(!ghost(e, e.doc[11]) && !ghost(e, e.doc[13]));
+    keys(e, v, "ox = 7<CR>x<Esc>");
+    CHECK_EQ(ghost(e, e.doc[15])->text, "= 7");
+
+    // the result's other forms: Ctrl-↓ / Ctrl-n go through them, Tab writes the one shown, the setting picks the first
+    {
+        Editor f;
+        Vi w;
+        keys(f, w, "i<C-m>1/4<Right> + 1");
+        auto g = ghost(f, f.doc[0]);
+        CHECK_EQ(g->text, "= 5/4");
+        CHECK_EQ(int(g->alts.size()), 3);  // 5/4, 1.25, the steps
+        CHECK_EQ(g->picked(1).text, "= 1.25");
+        keys(f, w, "<C-Down><C-Down><C-Up><Tab><Esc>");
+        CHECK_EQ(noSpaces(plain(f.doc[0])), "1/4+1=1.25");
+        mathOpts.form = 3;
+        CHECK(!ghost(f, f.doc[0]));  // 1.25 is right
+    }
+    mathOpts = {};
+    {
+        Editor f;
+        Vi w;
+        keys(f, w, "i<C-m>2^3 + 1");
+        mathOpts.form = 3;
+        CHECK_EQ(noSpaces(ghost(f, f.doc[0])->text), "=8+1=9");
+        mathOpts.form = 1;
+        keys(f, w, "<CR>1/8");
+        CHECK_EQ(ghost(f, f.doc[1])->text, "= 0.125");
+        mathOpts = {};
+        keys(f, w, "<Esc>o2^30");
+        auto g = ghost(f, f.doc[2]);
+        CHECK(std::any_of(g->alts.begin(), g->alts.end(), [](auto& a) { return a.first == "= 1.073741824 × 10^9"; }));
+    }
+    // units: in each unit used, and in SI
+    {
+        Editor f;
+        Vi w;
+        keys(f, w, "i<C-m>5 km + 300 m");
+        auto g = ghost(f, f.doc[0]);
+        CHECK_EQ(g->text, "= 5.3 km");
+        CHECK_EQ(g->picked(1).text, "= 5300 m");
+    }
+    // solving: roots of periodic functions near 0, exactly where they can be
+    {
+        Editor f;
+        Vi w;
+        keys(f, w, "i<C-m>sin(x) = 1/2<Right> =>");
+        auto it = std::find_if(w.items.begin(), w.items.end(), [](auto& x) { return x.cat == "Solve"; });
+        CHECK(it != w.items.end() && it->name.find("x = π/6, x = 5π/6") != std::string::npos);
+    }
+}
+
 int main() {
     // the scenarios below are corca's typing model, where text mode still reads math; checkText covers plain text
     Editor::autoMathDefault = E.autoMath = true;
     checkCorca();
     checkVi();
     checkText();
+    checkEngine();
     std::puts("all checks passed");
 }

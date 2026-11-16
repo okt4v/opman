@@ -18,7 +18,7 @@ goes to `.old/`). Open/save dialogs are the system's (Linux: zenity or kdialog),
 ## Settings, help, commands
 
 - **Settings** (Ctrl-, or the gear): theme, text size, page width, vim or standard keys, CapsLock-as-Escape, live
-  results, sliders, autosave delay, significant digits, degrees/radians, exact/decimal results, decimal point or comma, default plot range,
+  results, sliders, autosave delay, significant digits, degrees/radians, which form of a result comes first, decimal point or comma, default plot range,
   library and export folders, the pdflatex command, system or built-in dialogs.
 - **Help** (F1 or ?): every feature, searchable.
 - **Command palette** (Ctrl-Shift-p): any action, setting, note or help topic by name.
@@ -60,7 +60,7 @@ Ctrl-c/x/v clipboard, Ctrl-f find.
 
 Ex commands: `:w [path] :saveas [path] :open [path] :q :q! :wq :e <title|path> :new [title] :rename <title> :trash
 :folder :export [md|html|tex|pdf|path] :image <path> :table [rows] [cols] :rule :section [title] :s/a/b/g :%s/a/b/g :noh
-:set dark|light|degrees|radians|decimals|fractions|comma|point|digits=N|vim|standard :help [topic] :settings :palette :outline
+:set dark|light|degrees|radians|exact|decimals|asinput|steps|comma|point|digits=N|vim|standard :help [topic] :settings :palette :outline
 :zoom in|out|reset`.
 
 In Insert mode the popup offers completions: Tab takes a computed result or a program function, Enter takes the entry
@@ -101,7 +101,13 @@ Also:
   `\mid` in LaTeX).
 - **Decimal comma**: Settings > Math > Numbers (`:set comma`): `2,5` is a number and `;` separates arguments, as in
   `max(1; 2,5)`. A comma with a space after it still separates, so plot lines and `max(1, 2,5)` keep working.
-- **Exact answers**: `√8 = 2√2`, `arctan(1) = π/4`; Tab writes the exact form.
+- **Exact answers**: `√8 = 2√2`, `arctan(1) = π/4`; Tab writes the exact form. Decimals in give decimals out (`0.1 + 0.2 = 0.3`).
+- **Other forms**: at the end of a line Ctrl-↓ / Ctrl-↑ (Ctrl-n / Ctrl-p in vim) cycle the result through exact, decimal,
+  scientific, the steps and other units; Tab writes the one shown. Settings > Math > *Results first as* (`:set exact|decimals|asinput|steps`)
+  picks the default.
+- **Checking**: `3 + 4 = 8` is flagged `≠ 7`; decimals count to the places written.
+- **Definitions** follow the lines: a later `x = 5` changes `x` from there on, `a = a + 1` counts on, `---` and `===` start afresh.
+- **Typing**: `2 · −3`, `12%`, `17 mod 5`, `abs(` `floor(` `ceil(`; `)` closes a bracket from inside an exponent or denominator.
 - **Equation numbers**: end a line with `#name` to number it `(1)`; `[#name]` refers to it (Ctrl-click jumps).
 - **Tour**: `:tour` (or Help > Open the tour) types an example note.
 - **Spreadsheets**: paste cells copied from Excel to get a table; `:import file.csv` reads CSV or tab-separated files

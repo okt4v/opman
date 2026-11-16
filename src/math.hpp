@@ -10,7 +10,10 @@ namespace om {
 struct MathOpts {
     int digits = 10;        // significant digits of decimal results
     bool degrees = false;   // sin/cos/tan take degrees, arcsin/arccos/arctan return them
-    bool decimals = false;  // live results show 0.75 rather than 3/4
+    // which form of a result comes first (the faint result, Tab, the popup's first entry); Ctrl-↓ / Ctrl-n go through
+    // the others: 0 exact (3/4, 2√2), 1 decimal, 2 decimal when the calculation has a decimal in it (else exact), 3 the steps
+    int form = 2;
+    bool decimals() const { return form == 1; }
     double plotX0 = -10, plotX1 = 10;  // a plot's x range when the line gives none
     double plotAspect = 2.4;           // width / height of the plot area, so a circle comes out round (the app sets it)
 };
@@ -25,6 +28,13 @@ struct Ghost {
     std::string text;
     Row insert;
     bool warn = false;  // not a result: this line doesn't follow from the transformation step above it
+    // every form on offer, the first is text/insert: exact, decimal, scientific, the steps, other units
+    std::vector<std::pair<std::string, Row>> alts;
+    Ghost picked(int k) const {  // the k-th form (wrapping), what Ctrl-↓ shows
+        Ghost g = *this;
+        if (!alts.empty()) std::tie(g.text, g.insert) = alts[((k % int(alts.size())) + int(alts.size())) % int(alts.size())];
+        return g;
+    }
 };
 std::optional<Ghost> ghost(Editor& ed, const Row& row);
 

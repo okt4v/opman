@@ -159,6 +159,9 @@ static const std::map<std::string, const Entry*> AUTO = [] {
     for (auto& e : CATALOG)
         if (e.cat == "Function" || (e.cat == "Greek" && (e.kw[0].size() > 2 || e.kw[0] == "pi"))) m[e.kw[0]] = &e;
     m["sqrt"] = &CATALOG[3];
+    m["abs"] = &entryNamed("Absolute value");  // abs( floor( ceil( : the bars, typed into
+    m["floor"] = &entryNamed("Floor");
+    m["ceil"] = &entryNamed("Ceiling");
     m["infty"] = &entryNamed("Infinity");
     return m;
 }();
@@ -458,7 +461,14 @@ void Editor::insertChar(std::string c) {
         const char* leaves = p.node->t == T::Sup || p.node->t == T::Sub ? "+-*/=<>, "
                            : (p.node->t == T::Frac && p.slot == 1) || p.node->t == T::Sqrt ? "=<>,"
                            : (p.node->t == T::Big && p.slot == 1) || limDone ? " " : "";
-        if (!(*leaves && !cur.row->empty() && cur.i == int(cur.row->size()) && in(leaves, c))) break;
+        // ")" at the end of an exponent or denominator closes the bracket around it: sin(π/6) and ln(e^2) as typed
+        bool closes = c == ")" && !cur.row->empty() && cur.i == int(cur.row->size()) &&
+                      (p.node->t == T::Sup || p.node->t == T::Sub || (p.node->t == T::Frac && p.slot == 1)) && [&] {
+                          for (auto f = parents.find(p.row); f != parents.end(); f = parents.find(f->second.row))
+                              if (f->second.node->t == T::Paren || f->second.node->t == T::Sqrt) return f->second.node->o != "{";
+                          return false;
+                      }();
+        if (!closes && !(*leaves && !cur.row->empty() && cur.i == int(cur.row->size()) && in(leaves, c))) break;
         exitSlot();
     }
     Row& row = *cur.row;
@@ -479,7 +489,7 @@ void Editor::insertChar(std::string c) {
     if (mathCtx && (c == "^" || c == "_")) return insertNode(node(c == "^" ? T::Sup : T::Sub));
     if (mathCtx && c == "(") return insertNode(paren("(", ")"));
     if (mathCtx && c == "{") return insertNode(paren("{", "}"));  // a set: L = {2; 3; 5}
-    if (c == ")" && p && (p->node->o == "(" || p->node->t == T::Sqrt) && i == int(row.size())) return exitSlot();
+    if (c == ")" && p && (p->node->o == "(" || p->node->o == "|" || p->node->o == "⌊" || p->node->o == "⌈" || p->node->t == T::Sqrt) && i == int(row.size())) return exitSlot();
     if (c == "|" && p && p->node->o == "|" && i == int(row.size())) return exitSlot();
     if (c == "}" && p && p->node->o == "{" && i == int(row.size())) return exitSlot();
     if (mathCtx && c == "'") return insertNode(sym("′", "'"));
@@ -559,6 +569,7 @@ void Editor::combine() {
         }
         auto f = COMBOS.find(key);
         if (!ok || f == COMBOS.end()) continue;
+        if (key == "===" && i == n && !inSlot()) return;  // a section banner, also typed in math mode
         auto t = SYM_TEX.find(f->second);
         row.erase(row.begin() + (i - n), row.begin() + i);
         row.insert(row.begin() + (i - n), sym(f->second, t == SYM_TEX.end() ? "" : t->second));

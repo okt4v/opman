@@ -24,6 +24,7 @@ std::optional<std::pair<int, int>> Vi::visualLines(const Editor& ed) const {
 
 // one undo step per insert session (commands that already changed the doc snapped before that change)
 void Vi::mouse(Editor& ed, Cur p, bool drag) {
+    ed.ghostPick = 0;
     if (!drag) {
         ed.cur = p;
         ed.snapToCell();  // a click on a table border lands in a cell
@@ -67,6 +68,7 @@ std::vector<Key> Vi::parse(const std::string& s) {
             else if (t == "S-Down") k.sp = Key::Down, k.shift = true;
             else if (t == "S-Up") k.sp = Key::Up, k.shift = true;
             else if (t == "Down") k.sp = Key::Down;
+            else if (t == "C-Down" || t == "C-Up") k.sp = t == "C-Up" ? Key::Up : Key::Down, k.ctrl = true;
             else if (t == "Up") k.sp = Key::Up;
             else if (t == "Left") k.sp = Key::Left;
             else if (t == "Right") k.sp = Key::Right;
@@ -252,15 +254,27 @@ void Vi::pickItem(Editor& ed, size_t j) {
 }
 
 void Vi::insertKey(Editor& ed, const Key& k) {
+    int ghostPick = ed.ghostPick;  // the form shown, for Tab
     auto ghostHere = [&]() -> std::optional<Ghost> {
         if (ed.inSlot() || ed.cur.i != len(ed.cur.row)) return std::nullopt;
-        return ghost(ed, *ed.cur.row);
+        auto g = ghost(ed, *ed.cur.row);
+        if (g) *g = g->picked(ghostPick);
+        return g;
     };
     // standard keys have no insert sessions to undo as one step: typing merges (Editor::snap), anything else is its own step
     if (standard && (k.ctrl ? k.ch == "v" : k.sp == Key::Enter || k.sp == Key::Tab || k.sp == Key::Backspace || k.sp == Key::Delete || (k.sp == Key::None && !k.ch.empty())))
         ed.snap(!ed.range && !k.ctrl && k.sp != Key::Enter && k.sp != Key::Tab ? "char" : "");
     auto sel = ed.selRange();
     int n = int(items.size());
+    // Ctrl-↓ / Ctrl-↑ (and Ctrl-n / Ctrl-p without a popup) show the result's other forms; any other key starts over
+    bool cycle = k.ctrl && (k.sp == Key::Down || k.sp == Key::Up || (n == 0 && (k.ch == "n" || k.ch == "p")));
+    if (cycle) {
+        if (auto g = ghostHere(); g && g->alts.size() > 1) {
+            ed.ghostPick += k.sp == Key::Up || k.ch == "p" ? -1 : 1;
+            return;
+        }
+    }
+    ed.ghostPick = 0;
     // a Ctrl-Space popup lasts while you type letters of its word
     if (ed.forced && (k.ctrl || k.sp != Key::None || !isLetter(k.ch)) && !(k.ctrl && k.ch == " ") && k.sp != Key::Up && k.sp != Key::Down &&
         !(k.ctrl && (k.ch == "n" || k.ch == "p")))

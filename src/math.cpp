@@ -67,9 +67,9 @@ Value F0(double f) {
     return std::isfinite(f) && std::fabs(f - r) < 1e-12 * std::max(1.0, std::fabs(f)) ? F(r) : F(f);
 }
 // floats from numeric methods snap to a nearby simple fraction (1/3 from an integral)
-Value nearQ(double f, double tol = 1e-11) {
+Value nearQ(double f, double tol = 1e-11, int maxD = 1000) {
     if (!std::isfinite(f)) return F(f);
-    for (int d = 1; d <= 1000; d++) {
+    for (int d = 1; d <= maxD; d++) {
         double n = jsRound(f * d);
         if (std::fabs(n / d - f) < tol * std::max(1.0, std::fabs(f))) return Q(n, d);
     }
@@ -231,6 +231,7 @@ Ast bin(std::string op, Ast l, Ast r) { return mk(Ast::Bin, {std::move(l), std::
 struct Def {
     std::vector<std::string> params;
     Row body;
+    std::optional<Value> value;  // a name's value as of its line (x = 2 … x = 5: lines between use 2; a = a + 1 counts on)
 };
 // ponytail: file-level state like corca's globals; the UI is single-threaded
 Editor* ED = nullptr;
@@ -266,7 +267,7 @@ const std::vector<std::string> NAMED = {"N", "J", "W", "Pa", "V", "Hz"};
 
 // ---------- tokens and parsing (the editor tree, not a string) ----------
 struct Tok {
-    enum K : uint8_t { Num, Var, Op, Bang, Prime, A, Pow, Paren, Fn, Big, Lim } k;
+    enum K : uint8_t { Num, Var, Op, Bang, Pct, Prime, A, Pow, Paren, Fn, Big, Lim } k;
     Value v;
     std::string n;  // Var name, Fn name, Op
     Ast a;          // A, Pow
@@ -313,6 +314,7 @@ std::vector<Tok> tokens(const Row& row) {
         else if (hasC && (c == "*" || c == "⋅" || c == "×")) out.push_back({Tok::Op, {}, "*"});
         else if (hasC && (c == "/" || c == "÷")) out.push_back({Tok::Op, {}, "/"});
         else if (hasC && c == "!") out.push_back({Tok::Bang});
+        else if (hasC && c == "%") out.push_back({Tok::Pct});
         else if (hasC && c == "′") out.push_back({Tok::Prime});
         else if (hasC && c == "∞") out.push_back({Tok::Num, Fl(INFINITY)});
         else if (it.t == T::Var || it.t == T::Const || it.t == T::Unit) out.push_back({Tok::Var, {}, c});
@@ -397,6 +399,9 @@ struct Parser {
             if (n && n->k == Tok::Op && (n->n == "*" || n->n == "/")) {
                 p++;
                 a = bin(n->n, std::move(a), power());
+            } else if (n && n->k == Tok::Fn && n->n == "mod" && !(p + 1 < t.size() && t[p + 1].k == Tok::Paren)) {
+                p++;  // 17 mod 5
+                a = mk(Ast::Call, {std::move(a), power()}, "mod");
             } else if (n && n->k != Tok::Op) a = bin("*", std::move(a), power());
             else return a;
         }
@@ -410,6 +415,9 @@ struct Parser {
             } else if (peek() && peek()->k == Tok::Bang) {
                 p++;
                 a = mk(Ast::Fact, {std::move(a)});
+            } else if (peek() && peek()->k == Tok::Pct) {  // 12% = 12/100
+                p++;
+                a = bin("/", std::move(a), num(Q(100)));
             } else return a;
         }
     }
@@ -417,6 +425,10 @@ struct Parser {
         if (p >= t.size()) fail();
         const Tok& n = t[p++];
         switch (n.k) {
+        case Tok::Op:  // 2 · −3, 2^x · +1: a sign after an operator
+            if (n.n == "-") return mk(Ast::Neg, {power()});
+            if (n.n == "+") return power();
+            fail();
         case Tok::Num: return num(n.v);
         case Tok::A: return n.a;
         case Tok::Paren: return parenAst(n);
@@ -607,6 +619,7 @@ Value evaluate(const Ast& a, const Scope& scope, int depth) {
     case Ast::Var: {
         if (auto f = scope.find(a.n); f != scope.end()) return f->second;
         const Def* d = def(a.n);
+        if (d && d->value) return *d->value;
         if (d && d->params.empty()) return evaluate(parse(d->body), {}, depth + 1);
         if (isConst(a.n)) return Fl(constVal(a.n));
         fail();
@@ -647,7 +660,9 @@ Value evaluate(const Ast& a, const Scope& scope, int depth) {
             if (mathOpts.degrees && isTrig(a.n)) x *= std::numbers::pi / 180;
             double r = f->second(x);
             if (mathOpts.degrees && isArc(a.n)) r *= 180 / std::numbers::pi;
-            return mathOpts.degrees && (isTrig(a.n) || isArc(a.n)) ? nearQ(r) : F0(r);  // sin(30) = 1/2 exactly
+            if (mathOpts.degrees && (isTrig(a.n) || isArc(a.n))) return nearQ(r);  // sin(30) = 1/2 exactly
+        Value v = F0(r);
+        return exact(v) ? v : nearQ(r, 1e-14, 64);  // sin(π/6) = 1/2, not 0.49999999999999994
         }
         fail();
     }
@@ -998,13 +1013,36 @@ Row numItems(const Value& v) {
         r.push_back(std::move(f));
         return r;
     }
-    if (!exact(v) && !mathOpts.decimals && !DECIMAL)
+    if (!exact(v) && !mathOpts.decimals() && !DECIMAL)
         if (auto e = exactForm(v.f)) return e->items;
     Row r;
     for (char c : fmt(v)) r.push_back(M(c == '-' ? "−" : std::string(1, c)));
     return r;
 }
 
+// a number typed with a decimal point (or comma) in the calculation, or in a definition it uses: answer in decimals
+bool typedDecimal(const Row& r) {
+    for (size_t j = 0; j < r.size(); j++) {
+        if (r[j].t == T::Ch && (r[j].c == "." || isDecimalComma(r, j)) && j + 1 < r.size() && isDigit(r[j + 1].c)) return true;
+        for (auto& s : r[j].s)
+            if (typedDecimal(s)) return true;
+    }
+    return false;
+}
+bool typedDecimal(const Row& seg, const Ast& ast) {
+    if (typedDecimal(seg)) return true;
+    for (auto& n : freeVars(ast))
+        if (const Def* d = def(n); d && typedDecimal(d->body)) return true;
+    return false;
+}
+
+Row decItems(const Value& v) {
+    DECIMAL = true;
+    struct Reset {
+        ~Reset() { DECIMAL = false; }
+    } reset;
+    return numItems(v);
+}
 Row cat(Row a, const Row& b) {
     a.insert(a.end(), b.begin(), b.end());
     return a;
@@ -1101,7 +1139,7 @@ Row toItems(const Ast& a, double ctx = 0) {
 }
 
 // ---------- definitions ----------
-void defsIn(const Row& run) {
+void defsIn(const Row& run, bool later) {
     Row items;
     for (auto& x : run)
         if (!isSpace(x)) items.push_back(x);
@@ -1115,8 +1153,12 @@ void defsIn(const Row& run) {
     Row body(items.begin() + eq + 1, items.begin() + end), lhs(items.begin(), items.begin() + eq);
     auto name = varName(lhs[0]);
     if (body.empty() || !name) return;
-    if (lhs.size() == 1) DEFS[*name] = {{}, body};
-    else if (lhs.size() == 2 && lhs[1].t == T::Paren && lhs[1].o == "(") {
+    if (later && DEFS.count(*name)) return;  // below the line: only what isn't defined above it yet
+    if (lhs.size() == 1) {
+        Def d{{}, body};
+        try { d.value = evaluate(parse(body)); } catch (...) {}  // needs a name defined further down, or units: kept as written
+        DEFS[*name] = std::move(d);
+    } else if (lhs.size() == 2 && lhs[1].t == T::Paren && lhs[1].o == "(") {
         std::vector<std::string> params;
         for (auto& part : splitArgs(lhs[1].s[0])) {
             Row q;
@@ -1167,8 +1209,8 @@ void collectColumns(int a, int b) {
 
 void collectDefs(const Row* exclude, int upto = 0) {
     DEFS.clear();
-    int k = exclude ? ED->lineOf(exclude) : -1;
-    auto [a, b] = k >= 0 ? sectionOf(ED->doc, k) : std::pair{0, int(ED->doc.size())};
+    int self = exclude ? ED->lineOf(exclude) : -1;
+    auto [a, b] = self >= 0 ? sectionOf(ED->doc, self) : std::pair{0, int(ED->doc.size())};
     collectColumns(a, b);
     for (int n = a; n < b; n++) {
         const Row& whole = ED->doc[n];
@@ -1179,7 +1221,7 @@ void collectDefs(const Row* exclude, int upto = 0) {
         for (size_t j = 0; j < line.size();) {
             size_t k = j;
             while (k < line.size() && mask[k] == mask[j]) k++;
-            if (mask[j]) defsIn(Row(line.begin() + j, line.begin() + k));
+            if (mask[j]) defsIn(Row(line.begin() + j, line.begin() + k), self >= 0 && n > self);
             j = k;
         }
     }
@@ -1359,6 +1401,7 @@ Quantity uev(const Ast& a) {
     }
     case Ast::Var: {
         const Def* d = def(a.n);
+        if (d && d->value) return {*d->value, {}};
         if (d && d->params.empty()) return uev(parse(d->body));
         if (const Unit* u = unit(a.n)) return {u->size, u->d};
         return {evaluate(a), {}};
@@ -1441,8 +1484,20 @@ std::vector<Entry> unitSuggestions(const Row& seg, const Row& lead) {
     for (auto& n : freeVars(ast))
         if (const Def* d = def(n); d && d->params.empty()) unitsIn(parse(d->body), used);
     if (used.empty()) fail();
-    auto [v, units] = expressIn(q, used);
-    return {result("= " + fmt(v) + " " + unitText(units), "Units", cat(cat(cat(lead, numItems(v)), {M(" ")}), unitItems(units)))};
+    std::vector<Entry> out;
+    auto add = [&](std::pair<Value, Dims> r) {
+        auto& [v, units] = r;
+        if (exact(v) && v.d != 1) v = Fl(v.n / v.d);  // 5.3 km, not 53/10 km
+        std::string name = "= " + fmt(v) + (units.empty() ? "" : " " + unitText(units));
+        for (auto& e : out)
+            if (e.name == name) return;
+        out.push_back(result(name, "Units", units.empty() ? cat(lead, numItems(v)) : cat(cat(cat(lead, numItems(v)), {M(" ")}), unitItems(units))));
+    };
+    add(expressIn(q, used));
+    for (auto& u : used)  // 5 km + 300 m: also in m; 90 km/h: also in m/s
+        if (dimsEqual(unit(u)->d, q.d)) add({div(q.v, unit(u)->size), {{u, 1}}});
+    add(expressIn(q, {}));
+    return out;
 }
 
 std::vector<Entry> expandSuggestions(const Ast& ast, const Row& lead) {
@@ -1466,15 +1521,23 @@ std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
     if (vars.empty()) diff = written, vars = freeVars(diff);  // "x = 2" above: ⇒ still means x is the unknown here
     if (vars.size() != 1) return {};
     std::string v = vars[0];
-    auto answer = [&](const std::vector<Value>& roots) {
+    auto answerAs = [&](const std::vector<Value>& roots, bool decimal) {
         if (roots.empty()) return result("No real solution", "Solve", cat(lead, {M("∅")}));
         std::string name;
         std::vector<Row> parts;
-        for (size_t k = 0; k < roots.size(); k++) {
-            name += (k ? ", " : "") + v + " = " + fmt(roots[k]);
-            parts.push_back(cat({named(T::Var, v), M("=")}, numItems(roots[k])));
+        for (auto r : roots) {
+            if (decimal && exact(r) && r.d != 1) r = Fl(r.n / r.d);
+            auto ef = !decimal && !exact(r) ? exactForm(r.f) : std::nullopt;
+            name += (name.empty() ? "" : ", ") + v + " = " + (ef ? ef->text : fmt(r));
+            parts.push_back(cat({named(T::Var, v), M("=")}, ef ? ef->items : decimal ? decItems(r) : numItems(r)));
         }
-        return result(name, "Solve", cat(lead, join(parts, {M(","), M(" ")})));
+        return result(name, decimal ? "Decimal" : "Solve", cat(lead, join(parts, {M(","), M(" ")})));
+    };
+    // exact roots first, their decimals as a second choice (the other way round when results come as decimals)
+    auto answer = [&](const std::vector<Value>& roots) -> std::vector<Entry> {
+        std::vector<Entry> out = {answerAs(roots, false)};
+        if (Entry d = answerAs(roots, true); d.name != out[0].name) out.insert(mathOpts.form == 1 || (mathOpts.form == 2 && typedDecimal(seg)) ? out.begin() : out.end(), d);
+        return out;
     };
     std::optional<Poly> p;
     try { p = poly(diff); } catch (...) {}
@@ -1485,22 +1548,23 @@ std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
     int deg = 0;
     if (p)
         for (auto& [k, c] : *p) deg = std::max(deg, degree(k));
-    if (p && deg == 1) return {answer({div(neg(coef(0)), coef(1))})};
+    if (p && deg == 1) return answer({div(neg(coef(0)), coef(1))});
     if (p && deg == 2) {
         // x = c ± √s with c = −b/2a, s = (b² − 4ac)/4a²
         Value a2 = coef(2), b = coef(1), c0 = coef(0);
         Value center = div(neg(b), mul(Q(2), a2));
         Value s = div(add(mul(b, b), neg(mul(Q(4), mul(a2, c0)))), mul(Q(4), mul(a2, a2)));
-        if (val(s) < 0) return {answer({})};
+        if (val(s) < 0) return answer({});
         std::optional<Value> root = exact(s) ? exactFn("sqrt", s) : std::nullopt;
-        if (root) return {answer(isZero(*root) ? std::vector{center} : std::vector{add(center, neg(*root)), add(center, *root)})};
+        if (root) return answer(isZero(*root) ? std::vector{center} : std::vector{add(center, neg(*root)), add(center, *root)});
         Item sq = node(T::Sqrt);
         sq.s[0] = numItems(s);
         Row ins = cat(lead, {named(T::Var, v), M("=")});
         if (!isZero(center)) ins = cat(ins, numItems(center));
         ins = cat(ins, {sym("±", "\\pm"), sq});
-        return {result(v + " = " + (isZero(center) ? "" : fmt(center) + " ") + "± √" + fmt(s), "Solve", ins),
-                answer({Fl(val(center) - std::sqrt(val(s))), Fl(val(center) + std::sqrt(val(s)))})};
+        auto out = answer({Fl(val(center) - std::sqrt(val(s))), Fl(val(center) + std::sqrt(val(s)))});
+        out.insert(out.begin(), result(v + " = " + (isZero(center) ? "" : fmt(center) + " ") + "± √" + fmt(s), "Solve", ins));
+        return out;
     }
     // anything else: scan for sign changes and bisect
     auto f = [&](double x) {
@@ -1509,7 +1573,7 @@ std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
     std::vector<Value> roots;
     const double step = 0.01;
     double x0 = -100, y0 = f(x0);
-    for (double x1 = x0 + step; x1 <= 100 && roots.size() < 6; x1 += step) {
+    for (double x1 = x0 + step; x1 <= 100 && roots.size() < 200; x1 += step) {
         double y1 = f(x1);
         if (std::isfinite(y0) && std::isfinite(y1) && (y0 == 0 || y0 * y1 < 0)) {
             double lo = x0, hi = x1;
@@ -1524,7 +1588,11 @@ std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
         }
         x0 = x1, y0 = y1;
     }
-    return {answer(roots)};
+    // sin(x) = 1/2 has roots everywhere: the six nearest 0, in order
+    std::sort(roots.begin(), roots.end(), [](auto& a, auto& b) { return std::fabs(val(a)) < std::fabs(val(b)); });
+    if (roots.size() > 6) roots.resize(6);
+    std::sort(roots.begin(), roots.end(), [](auto& a, auto& b) { return val(a) < val(b); });
+    return answer(roots);
 }
 
 }  // namespace
@@ -1867,6 +1935,50 @@ std::optional<Entry> derivWorking(const Ast& ast, const Row& seg, const Row& lea
 }
 }  // namespace
 
+namespace {
+// the forms a value can be written in: name (popup), category, text (faint result), items after "= "
+struct Alt {
+    std::string name, cat, text;
+    Row items;
+};
+std::vector<Alt> valueAlts(const Value& v, const Ast& ast, const Row& seg) {
+    std::vector<Alt> out;
+    std::optional<ExactForm> ef = !exact(v) && !isMat(v) ? exactForm(v.f) : std::nullopt;
+    bool frac = exact(v) && v.d != 1;
+    if (ef) out.push_back({"= " + ef->text, "Result", "= " + ef->text + " ≈ " + fmt(v), ef->items});
+    else out.push_back({"= " + fmt(v), "Result", "= " + fmt(v), frac ? numItems(v) : decItems(v)});
+    if (frac || ef) {
+        Value d = frac ? Fl(v.n / v.d) : v;
+        out.push_back({"= " + fmt(d), "Decimal", "= " + fmt(d), decItems(d)});
+    }
+    if (double x = isMat(v) ? 0 : val(v); std::isfinite(x) && x != 0 && (std::fabs(x) >= 1e6 || std::fabs(x) < 1e-3)) {
+        int e = int(std::floor(std::log10(std::fabs(x))));
+        double m = toPrecision(x / std::pow(10.0, e), mathOpts.digits);
+        if (std::fabs(m) >= 10) m = toPrecision(m / 10, mathOpts.digits), e++;
+        Item sup = node(T::Sup);
+        sup.s[0] = numItems(Q(e));
+        std::string t = "= " + fmt(Fl(m)) + " × 10^" + std::to_string(e);
+        out.push_back({t, "Scientific", t, cat(decItems(Fl(m)), {M("*"), M("1"), M("0"), sup})});
+    }
+    try {  // mean(h) of a table column has a value but no steps
+        if (auto st = steps(ast); st.size() > 1) {
+            std::vector<Row> parts;
+            for (auto& x : st) parts.push_back(toItems(x));
+            Row r = join(parts, EQ);
+            out.push_back({"Fill in the steps", "Steps", "= " + plain(r), r});
+        }
+    } catch (...) {}
+    int form = mathOpts.form == 2 ? (typedDecimal(seg, ast) ? 1 : 0) : mathOpts.form;
+    auto first = [&](const char* c) {
+        auto f = std::find_if(out.begin(), out.end(), [&](auto& a) { return a.cat == c; });
+        if (f != out.end()) std::rotate(out.begin(), f, f + 1);
+    };
+    if (form == 1) first("Decimal");
+    if (form == 3) first("Steps");
+    return out;
+}
+}  // namespace
+
 static std::vector<Entry> evalSuggestions0(Editor& ed) {
     ED = &ed;
     const Row& row = *ed.cur.row;
@@ -1905,24 +2017,8 @@ static std::vector<Entry> evalSuggestions0(Editor& ed) {
             } catch (...) {}
             return out;
         }
-        std::vector<Entry> out = {result("= " + fmt(v), "Result", cat(lead, numItems(v)))};
-        if (!exact(v) && !isMat(v))
-            if (auto e = exactForm(v.f)) {
-                out[0].name = "= " + e->text;
-                DECIMAL = true;
-                out.push_back(result("= " + fmt(v), "Decimal", cat(lead, numItems(v))));
-                DECIMAL = false;
-            }
-        if (exact(v) && v.d != 1) {
-            double d = toPrecision(v.n / v.d, mathOpts.digits);
-            out.push_back(result("= " + jsNum(d), "Decimal", cat(lead, numItems(Fl(v.n / v.d)))));
-        }
-        auto st = steps(ast);
-        if (st.size() > 1) {
-            std::vector<Row> parts;
-            for (auto& x : st) parts.push_back(toItems(x));
-            out.push_back(result("Fill in the steps", "Steps", cat(lead, join(parts, EQ))));
-        }
+        std::vector<Entry> out;
+        for (auto& a : valueAlts(v, ast, seg)) out.push_back(result(a.name, a.cat, cat(lead, a.items)));
         return out;
     } catch (...) {
         return {};
@@ -1973,7 +2069,35 @@ static std::optional<Ghost> ghost0(Editor& ed, const Row& row) {
         };
         int s0 = end - int(seg.size());
         while (s0 > 0 && isSpace(row[s0 - 1])) s0--;
-        if (s0 > 0 && row[s0 - 1].c == "=" && !named(ast)) return std::nullopt;
+        if (s0 > 0 && row[s0 - 1].c == "=" && !named(ast)) {
+            // 3 + 4 = 8: an answer written after "=" that isn't what the numbers on the left come to
+            try {
+                Row lhs = segmentBefore(row, s0 - 1, relItem);
+                Ast la = parse(lhs);
+                std::function<bool(const Ast&)> names = [&](const Ast& x) {  // sin(30) is a number, x and f(2) aren't
+                    if (x.k == Ast::Var) return x.n != "π" && x.n != "e";
+                    if (x.k == Ast::Call && def(x.n)) return true;
+                    return x.k == Ast::Deriv || x.k == Ast::Big || x.k == Ast::Lim || std::any_of(x.a.begin(), x.a.end(), names);
+                };
+                if (names(la)) return std::nullopt;
+                Value l = evaluate(la), r = evaluate(ast);
+                if (isMat(l) || isMat(r)) return std::nullopt;
+                double tol = 1e-9 * std::max(1.0, std::fabs(val(l)));
+                if (typedDecimal(seg)) {  // π = 3.14 is right to the places written
+                    int places = 0;
+                    std::string t = plain(seg);
+                    if (auto dot = t.find_first_of(".,"); dot != std::string::npos)
+                        while (dot + 1 + places < t.size() && std::isdigit((unsigned char)t[dot + 1 + places])) places++;
+                    tol = std::max(tol, 0.5000001 * std::pow(10.0, -places));
+                }
+                bool same = exact(l) && exact(r) && !typedDecimal(seg) ? l == r : std::fabs(val(l) - val(r)) <= tol;
+                if (!same) {
+                    auto ef = exact(l) ? std::nullopt : exactForm(l.f);
+                    return Ghost{"≠ " + (ef ? ef->text : fmt(l)), {}, true};
+                }
+            } catch (...) {}
+            return std::nullopt;
+        }
         // already a plain number or a matrix of numbers: nothing to compute
         if (ast.k == Ast::Num || (ast.k == Ast::Neg && ast.a[0].k == Ast::Num) ||
             (ast.k == Ast::Mat && std::all_of(ast.a.begin(), ast.a.end(), [](auto& x) { return x.k == Ast::Num; })))
@@ -1998,16 +2122,16 @@ static std::optional<Ghost> ghost0(Editor& ed, const Row& row) {
                          cat({M(" "), M("="), M(" ")}, toItems(fitAst(c, deg < 0, x)))};
         }
         Value v = evaluate(ast);
-        if (mathOpts.decimals && exact(v) && v.d != 1) v = Fl(v.n / v.d);
-        if (!exact(v) && !isMat(v) && !mathOpts.decimals)
-            if (auto e = exactForm(v.f)) return Ghost{"= " + e->text + " ≈ " + fmt(v), cat({M(" "), M("="), M(" ")}, e->items)};
-        return Ghost{"= " + fmt(v), cat({M(" "), M("="), M(" ")}, numItems(v))};
+        Ghost g;
+        for (auto& a : valueAlts(v, ast, seg)) g.alts.push_back({a.text, cat({M(" "), M("="), M(" ")}, a.items)});
+        return g.picked(0);
     } catch (...) {
         try {
             bool calc = std::any_of(seg.begin(), seg.end(), [](auto& x) { return !isSpace(x) && (isOp(&x) || x.t == T::Frac || x.t == T::Sup); });
             if (!calc) return std::nullopt;  // "2 m" alone is not a calculation
-            auto u = unitSuggestions(seg, {M(" ")});
-            return Ghost{u[0].name, cat({M(" "), M("=")}, *u[0].insert)};
+            Ghost g;
+            for (auto& u : unitSuggestions(seg, {M(" ")})) g.alts.push_back({u.name, cat({M(" "), M("=")}, *u.insert)});
+            return g.picked(0);
         } catch (...) {
             return std::nullopt;
         }
@@ -2016,7 +2140,10 @@ static std::optional<Ghost> ghost0(Editor& ed, const Row& row) {
 
 std::optional<Ghost> ghost(Editor& ed, const Row& row) {
     auto g = ghost0(ed, row);
-    if (g && decimalComma) g->text = localNum(g->text), localize(g->insert);
+    if (g && decimalComma) {
+        g->text = localNum(g->text), localize(g->insert);
+        for (auto& [t, r] : g->alts) t = localNum(t), localize(r);
+    }
     return g;
 }
 

@@ -72,6 +72,7 @@ struct Editor {
     std::string dismissed;  // popupKey() the popup was dismissed at
     bool forced = false;    // Ctrl-Space opened the popup: it stays open for the word being typed
     int pick = 0;
+    int ghostPick = 0;  // which form of the faint result at the cursor is shown (Ctrl-↓ / Ctrl-n go through them)
     std::map<std::string, int> usage;
 
     // model

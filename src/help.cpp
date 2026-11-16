@@ -117,7 +117,16 @@ Type a name and pick it from the popup: alpha, beta, pi, theta, infinity, sum, i
         {"Live results and calculator", R"(Write an expression and its value shows faintly at the end of the line: 2^10 shows "= 1024". Tab writes the result into the note.
 
 ## Exact answers
-Decimals that are really roots or multiples of π show their exact form first: √8 = 2√2 ≈ 2.828, arctan(1) = π/4, (1 + √5)/2. Tab writes the exact form; the popup also offers the decimal. Turn on Settings > Math > decimals to always get decimals.
+Decimals that are really roots or multiples of π show their exact form first: √8 = 2√2 ≈ 2.828, arctan(1) = π/4, (1 + √5)/2. Tab writes the exact form; the popup also offers the decimal. A calculation with a decimal in it answers in decimals: 0.1 + 0.2 = 0.3.
+
+## Other forms of a result
+At the end of a line, Ctrl-↓ and Ctrl-↑ (Ctrl-n and Ctrl-p in vim keys) go through the other ways to write the result: exact, decimal, scientific (1.07 × 10^9), the steps, or other units (5.3 km, 5300 m). Tab writes the one shown. Settings > Math > "Results first as" picks the one shown first: exact, decimal, like the input, or the steps.
+
+## Checking answers
+A number written after = that isn't what the left side comes to is flagged in red: 3 + 4 = 8 shows ≠ 7. Decimals count to the places written, so π = 3.14 passes.
+
+## Definitions
+x = 2 defines x for the lines that follow; a later x = 5 changes it from there on, and a = a + 1 counts on from the a above. A name used before its definition takes the first one below it. A divider (---) or a section (===) starts afresh.
 
 ## Equation numbers
 End a line with #name to number it: E = mc^2 #energy shows (1) at the right edge. Write [#energy] anywhere to refer to it; it shows as (1), and Ctrl-click jumps there. Numbers follow the order of the note, and exports keep them.
@@ -144,7 +153,7 @@ Type matrix and pick a size from the popup (2×2, 3×3, column or row vector; de
 Numbers can carry units: 90 km/h * 2 h = 180 km. Known units: m km cm mm g kg s ms min h N J W Hz Pa A V K L.
 
 ## Settings that change results
-Settings > Math: significant digits, degrees or radians, fractions or decimals. :set degrees, :set decimals, :set digits=6 do the same from the command line.)"},
+Settings > Math: significant digits, degrees or radians, and which form comes first. :set degrees, :set exact, :set decimals, :set asinput, :set steps, :set digits=6 do the same from the command line.)"},
 
         {"Functions", R"(## Built in
 `sin cos tan` `cot sec csc` trigonometry (radians, or degrees: Settings > Math)
@@ -325,7 +334,7 @@ Everything else (the popup, Tab, the toolbar, the palette) works the same in bot
 `:export md|html|tex|pdf|path`
 `:image path` `:table rows cols` `:rule` `:section [title]`
 `:s/a/b/g` `:%s/a/b/g` replace
-`:set dark|light|degrees|radians|decimals|fractions|digits=N|vim|standard`
+`:set dark|light|degrees|radians|exact|decimals|asinput|steps|digits=N|vim|standard`
 `:help [topic]` `:settings` `:palette` `:outline` `:zoom in|out|reset` `:noh`
 `:q` `:wq` `:q!` quit (notes are saved anyway, except with :q!)
 `:12` go to line 12)"},
@@ -347,7 +356,7 @@ Everything else (the popup, Tab, the toolbar, the palette) works the same in bot
         {"Settings", R"(Ctrl-, (or the gear in the toolbar) opens the settings; changes apply at once and are remembered.
 - Appearance: theme, text size, page width, formatting toolbar.
 - Editor: vim or standard keys, CapsLock as Escape, live results, sliders, autosave delay, what opens at start.
-- Math: significant digits, degrees or radians, fractions or decimals, decimal point or comma (2,5, with ; between arguments), default plot range.
+- Math: significant digits, degrees or radians, which form of a result comes first (exact, decimal, like the input, steps), decimal point or comma (2,5, with ; between arguments), default plot range.
 - Files: library folder, export folder, PDF export (pdflatex or built-in), pdflatex command, system or built-in file dialogs.
 Settings live in config.json in your user settings folder (%APPDATA%\opman, ~/Library/Application Support/opman, ~/.config/opman).)"},
     };

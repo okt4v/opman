@@ -300,7 +300,7 @@ struct App {
         completeOpts.learn = cfg.value("completeLearn", true);
         mathOpts.digits = std::clamp(cfg.value("digits", 10), 2, 15);
         mathOpts.degrees = cfg.value("angles", std::string("radians")) == "degrees";
-        mathOpts.decimals = cfg.value("decimals", false);
+        mathOpts.form = std::clamp(cfg.value("resultForm", cfg.value("decimals", false) ? 1 : 2), 0, 3);
         decimalComma = cfg.value("decimalComma", false);
         plotMarks = cfg.value("plotMarks", true);
         mathOpts.plotX0 = cfg.value("plotX0", -10.0);
@@ -345,7 +345,7 @@ struct App {
         cfg["completeLearn"] = completeOpts.learn;
         cfg["digits"] = mathOpts.digits;
         cfg["angles"] = mathOpts.degrees ? "degrees" : "radians";
-        cfg["decimals"] = mathOpts.decimals;
+        cfg["resultForm"] = mathOpts.form;
         cfg["decimalComma"] = decimalComma;
         cfg["plotMarks"] = plotMarks;
         cfg["plotX0"] = mathOpts.plotX0;
@@ -960,7 +960,8 @@ struct App {
             int n = 0;
             if (arg == "dark" || arg == "light") dark = arg == "dark";
             else if (arg == "degrees" || arg == "radians") mathOpts.degrees = arg == "degrees";
-            else if (arg == "decimals" || arg == "fractions") mathOpts.decimals = arg == "decimals";
+            else if (arg == "decimals" || arg == "fractions" || arg == "exact" || arg == "asinput" || arg == "steps")
+                mathOpts.form = arg == "decimals" ? 1 : arg == "asinput" ? 2 : arg == "steps" ? 3 : 0;
             else if (arg == "comma" || arg == "point") decimalComma = arg == "comma";
             else if (arg == "marks" || arg == "nomarks") plotMarks = arg == "marks";
             else if (arg == "pdf=auto" || arg == "pdf=latex" || arg == "pdf=builtin") pdfEngine = arg == "pdf=auto" ? 0 : arg == "pdf=latex" ? 1 : 2;
@@ -968,7 +969,7 @@ struct App {
             else if (arg == "automath" || arg == "noautomath") ed.autoMath = arg == "automath";
             else if (arg == "autosave" || arg == "noautosave") autosaveOn = arg == "autosave";
             else if (std::sscanf(arg.c_str(), "digits=%d", &n) == 1) mathOpts.digits = std::clamp(n, 2, 15);
-            else { message = "Unknown option: " + arg + " (dark light · degrees radians · decimals fractions · digits=N · vim standard)"; return; }
+            else { message = "Unknown option: " + arg + " (dark light · degrees radians · exact decimals asinput steps · digits=N · vim standard)"; return; }
             mathChanged();
             message = "Set " + arg;
         } else if (name == "export") exportTo(arg);
@@ -2046,8 +2047,17 @@ struct App {
                 else h += drawPlot(views.count(int(k)) ? viewPlots[int(k)] : *plots[k], lx, y + h, lw, int(k)) + 12;
             }
             if (!printMode && k < ghosts.size() && ghosts[k]) {
-                L.drawText(ghosts[k]->text, endX + 0.5f * L.textSize, endBase, L.textSize * 0.9f, ghosts[k]->warn ? IM_COL32(0xe5, 0x48, 0x4d, 255) : alpha(p.muted, 0.85f));
-                endX += L.textWidth(ghosts[k]->text, L.textSize * 0.9f) + L.textSize;
+                // at the cursor in Insert mode: the form Ctrl-↓ picked, and how many there are
+                bool here = vi.mode == Mode::Insert && !ed.inSlot() && int(k) == ed.lineOf(ed.cur.row) && ed.cur.i == int(row.size());
+                std::string t = here ? ghosts[k]->picked(ed.ghostPick).text : ghosts[k]->text;
+                L.drawText(t, endX + 0.5f * L.textSize, endBase, L.textSize * 0.9f, ghosts[k]->warn ? IM_COL32(0xe5, 0x48, 0x4d, 255) : alpha(p.muted, 0.85f));
+                endX += L.textWidth(t, L.textSize * 0.9f) + L.textSize;
+                if (size_t n = ghosts[k]->alts.size(); here && n > 1) {
+                    int at = ((ed.ghostPick % int(n)) + int(n)) % int(n) + 1;
+                    std::string hint = std::to_string(at) + "/" + std::to_string(n) + "  Ctrl-↓";
+                    L.drawText(hint, endX, endBase, L.textSize * 0.7f, alpha(p.muted, 0.6f));
+                    endX += L.textWidth(hint, L.textSize * 0.7f) + L.textSize;
+                }
             }
             if (kind == Line::Text && sliders && !printMode && !(k > 0 && stepBar(ed.doc[k - 1]) >= 0)) slid = slider(ed.doc[k], endX + 20, endBase, int(k)) || slid;
             maxW = std::max(maxW, endX - x0);
@@ -2288,12 +2298,13 @@ struct App {
                 ImGui::SameLine();
                 if (ImGui::RadioButton("Degrees", &ang, 1)) mathOpts.degrees = true, cfgDirty = math = true;
                 hint("Degrees: sin(30) = 1/2, arctan(1) = 45");
-                int dec = mathOpts.decimals ? 1 : 0;
-                ImGui::TextUnformatted("Live results");
+                ImGui::TextUnformatted("Results first as");
                 ImGui::SameLine(160);
-                if (ImGui::RadioButton("Exact (3/4)", &dec, 0)) mathOpts.decimals = false, cfgDirty = math = true;
-                ImGui::SameLine();
-                if (ImGui::RadioButton("Decimal (0.75)", &dec, 1)) mathOpts.decimals = true, cfgDirty = math = true;
+                ImGui::SetNextItemWidth(260);
+                const char* forms[] = {"Exact (3/4, 2√2)", "Decimal (0.75)", "Like the input (0.5 + 0.25 = 0.75)", "The steps (= 1/2 + 1/4 = 3/4)"};
+                if (ImGui::Combo("##form", &mathOpts.form, forms, 4)) cfgDirty = math = true;
+                hint("What the faint result and Tab write. Ctrl-↓ / Ctrl-↑ (Ctrl-n / Ctrl-p in vim) go through the other forms: "
+                     "exact, decimal, scientific, the steps, other units");
                 ImGui::TextUnformatted("Numbers");
                 ImGui::SameLine(160);
                 int comma = decimalComma;
@@ -2494,7 +2505,10 @@ struct App {
             {"Smaller text", "Ctrl--", [this] { run("zoom out"); }},
             {"Reset text size", "Ctrl-0", [this] { run("zoom reset"); }},
             {mathOpts.degrees ? "Angles in radians" : "Angles in degrees", "", [this] { run(mathOpts.degrees ? "set radians" : "set degrees"); }},
-            {mathOpts.decimals ? "Exact results (fractions)" : "Decimal results", "", [this] { run(mathOpts.decimals ? "set fractions" : "set decimals"); }},
+            {"Results first as exact (fractions)", "", [this] { run("set exact"); }},
+            {"Results first as decimals", "", [this] { run("set decimals"); }},
+            {"Results like the input (decimals in, decimals out)", "", [this] { run("set asinput"); }},
+            {"Results first as the steps", "", [this] { run("set steps"); }},
             {vim ? "Standard keys (no vim modes)" : "Vim keys", "", [this] { run(vim ? "set standard" : "set vim"); }},
             {results ? "Hide live results" : "Show live results", "", [this] { results = !results; mathChanged(); }},
             {"Quit", "Ctrl-q", [this] { requestQuit(); }},
