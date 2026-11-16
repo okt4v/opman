@@ -1199,6 +1199,43 @@ static void checkEngine() {
     }
 }
 
+// symbolic algebra: simplifying, cancelling, factoring, derivatives of any function
+static void checkAlgebra() {
+    auto calc = [](const std::string& typed) {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>" + typed + "<Esc>");
+        auto g = ghost(e, e.doc.back());
+        return g ? noSpaces(g->text) : std::string("-");
+    };
+    CHECK_EQ(calc("2x + 3x"), "=5x");
+    CHECK_EQ(calc("x sin(x) + 2x sin(x)"), "=3xsin(x)");
+    CHECK_EQ(calc("sin(x)^2 + cos(x)^2"), "=1");
+    CHECK_EQ(calc("x^2 - 5x + 6"), "=(x−2)(x−3)");
+    CHECK_EQ(calc("2x^2 + 4x + 2"), "=2(x+1)²");
+    CHECK_EQ(calc("2x^2 y + 4x y"), "=2xy(x+2)");
+    CHECK_EQ(calc("(x^2 - 1)/(x - 1)"), "=x+1");
+    CHECK_EQ(calc("(6x^3)/(2x)"), "=3x²");
+    CHECK_EQ(calc("sqrt(x^2)"), "=|x|");
+    CHECK_EQ(calc("ln(e^x)"), "=x");
+    CHECK_EQ(calc("x^(1/2) * x^(1/2)"), "=x");
+    CHECK_EQ(calc("(a+b)^2 - (a-b)^2"), "=4ab");
+    CHECK_EQ(calc("x^2 + 1"), "-");      // nothing to do
+    CHECK_EQ(calc("f(x) = x^2 - 1"), "-");  // a definition isn't factored unasked
+    CHECK_EQ(calc("f(x) = x^2<Right> sin(x)<CR>f'(x)"), "=x²cos(x)+2xsin(x)");
+    CHECK_EQ(calc("f(x) = e^(2x)<Right><CR>f'(x)"), "=2e^2x");
+    CHECK_EQ(calc("f(x) = 1/x<Right><CR>f'(x)"), "=−1/x²");
+    CHECK_EQ(calc("f(x) = sin(x)<CR>f'(pi)"), "=-1");
+    CHECK_EQ(calc("f(x) = x^3<Right><CR>f''(x)"), "=6x");
+    // f′(x) = 0 ⇒ solves through the symbolic derivative
+    Editor e;
+    Vi v;
+    keys(e, v, "i<C-m>f(x) = x^3 - 3x<Esc>of'(x) = 0 =>");
+    CHECK(!v.items.empty() && v.items[0].name == "x = -1, x = 1");
+    keys(e, v, "<Esc>ox^2 - 5x + 6 =");
+    CHECK(std::any_of(v.items.begin(), v.items.end(), [](auto& x) { return x.name == "Factor"; }));
+}
+
 int main() {
     // the scenarios below are corca's typing model, where text mode still reads math; checkText covers plain text
     Editor::autoMathDefault = E.autoMath = true;
@@ -1206,5 +1243,6 @@ int main() {
     checkVi();
     checkText();
     checkEngine();
+    checkAlgebra();
     std::puts("all checks passed");
 }

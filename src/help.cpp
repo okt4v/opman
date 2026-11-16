@@ -122,6 +122,10 @@ Decimals that are really roots or multiples of π show their exact form first: �
 ## Other forms of a result
 At the end of a line, Ctrl-↓ and Ctrl-↑ (Ctrl-n and Ctrl-p in vim keys) go through the other ways to write the result: exact, decimal, scientific (1.07 × 10^9), the steps, or other units (5.3 km, 5300 m). Tab writes the one shown. Settings > Math > "Results first as" picks the one shown first: exact, decimal, like the input, or the steps.
 
+## Algebra
+Expressions with unknowns are simplified as you type: 2x + 3x shows = 5x, sin(x)^2 + cos(x)^2 = 1, (x^2 − 1)/(x − 1) = x + 1, √(x^2) = |x|, ln(e^x) = x. Polynomials are factored: x^2 − 5x + 6 shows = (x − 2)(x − 3), 2x^2y + 4xy = 2xy(x + 2). After = the popup offers Simplify (or Expand and simplify) and Factor.
+Derivatives work for any function: with f(x) = x^2 sin(x), f'(x) shows = x²cos(x) + 2x·sin(x), and f'(x) = 0 ⇒ solves for the turning points. Factoring finds rational roots only: x^2 − 2 stays as it is.
+
 ## Checking answers
 A number written after = that isn't what the left side comes to is flagged in red: 3 + 4 = 8 shows ≠ 7. Decimals count to the places written, so π = 3.14 passes.
 

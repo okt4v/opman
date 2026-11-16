@@ -105,6 +105,9 @@ Also:
 - **Other forms**: at the end of a line Ctrl-↓ / Ctrl-↑ (Ctrl-n / Ctrl-p in vim) cycle the result through exact, decimal,
   scientific, the steps and other units; Tab writes the one shown. Settings > Math > *Results first as* (`:set exact|decimals|asinput|steps`)
   picks the default.
+- **Algebra**: `2x + 3x` shows `= 5x`, `sin²x + cos²x` `= 1`, `(x² − 1)/(x − 1)` `= x + 1`, `x² − 5x + 6`
+  `= (x − 2)(x − 3)`; `f′(x)` is differentiated symbolically for any function (chain, product, quotient rules), so
+  `f′(x) = 0 ⇒` finds turning points. The popup offers *Simplify* and *Factor* after `=`.
 - **Checking**: `3 + 4 = 8` is flagged `≠ 7`; decimals count to the places written.
 - **Definitions** follow the lines: a later `x = 5` changes `x` from there on, `a = a + 1` counts on, `---` and `===` start afresh.
 - **Typing**: `2 · −3`, `12%`, `17 mod 5`, `abs(` `floor(` `ceil(`; `)` closes a bracket from inside an exponent or denominator.
