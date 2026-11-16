@@ -348,7 +348,10 @@ void Vi::insertKey(Editor& ed, const Key& k) {
         } else if (LineStyle ls = ed.inSlot() ? LineStyle{} : lineStyle(*ed.cur.row); !ed.inSlot() && (isList(ls.kind) || ed.cur.i <= ls.len)) {
             int at = ed.lineOf(ed.cur.row);  // a list item, or the start of a line: nest it (Shift-Tab: back out)
             ed.indent(at, at, k.shift ? -1 : 1);
-        } else ed.exitSlot();
+        } else {
+            ed.autoConvert();  // "pi" in a limit becomes π on the way out
+            ed.exitSlot();
+        }
         return;
     case Key::Up: case Key::Down:
         if (k.shift) {  // select over lines

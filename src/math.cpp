@@ -496,6 +496,8 @@ struct Parser {
                 Ast body = parseTokens(std::vector<Tok>(t.begin() + p, t.begin() + j));
                 std::string v = t[j + 1].n;
                 p = j + 2;
+                if (n.node->s[0].empty() && n.node->s[1].empty())  // ∫ x² dx: no limits, the antiderivative
+                    return mk(Ast::Big, {var(""), var(""), std::move(body)}, v, "indef");
                 return mk(Ast::Big, {parse(n.node->s[0]), parse(n.node->s[1]), std::move(body)}, v, "int");
             }
             fail();
@@ -517,6 +519,7 @@ Value evaluate(const Ast& a, const Scope& scope = {}, int depth = 0);
 Value det(const std::vector<std::vector<Value>>& A);
 Value matOp(const std::string& op, const Value& x, const Value& y);
 Value derivative(const Ast& a, const Value& x);
+Ast integrate(const Ast& body, const std::string& x);  // ∫ body dx worked out (no + C), or Fail
 
 // ponytail: fixed-step Simpson, accurate for smooth integrands on finite bounds
 double simpson(const std::function<double(double)>& f, double lo, double hi, int n = 2000) {
@@ -672,7 +675,22 @@ Value evaluate(const Ast& a, const Scope& scope, int depth) {
             s[a.n] = x;
             return evaluate(a.a[2], s, depth + 1);
         };
-        if (a.op == "int") return nearQ(simpson([&](double x) { return val(at(Fl(x))); }, val(ev(a.a[0])), val(ev(a.a[1]))));
+        if (a.op == "int") {
+            Value lo = ev(a.a[0]), hi = ev(a.a[1]);
+            std::optional<double> numeric;
+            try { numeric = simpson([&](double x) { return val(at(Fl(x))); }, val(lo), val(hi)); } catch (...) {}
+            try {  // the antiderivative gives it exactly: ∫₀^π sin x dx = 2; checked against the numbers (1/x over 0 isn't ln)
+                Ast F = integrate(a.a[2], a.n);
+                Scope sh = scope, sl = scope;
+                sh[a.n] = hi, sl[a.n] = lo;
+                Value v = sub(evaluate(F, sh, depth + 1), evaluate(F, sl, depth + 1));
+                double d = val(v);
+                if (std::isfinite(d) && (numeric ? std::fabs(d - *numeric) <= 1e-6 * std::max(1.0, std::fabs(d)) : true))
+                    return exact(v) ? v : nearQ(d, 1e-12);
+            } catch (...) {}
+            if (!numeric) fail();
+            return nearQ(*numeric);
+        }
         Value lo = ev(a.a[0]), hi = ev(a.a[1]);
         if (!isInt(lo) || !isInt(hi) || hi.n - lo.n > 1e5) fail();
         Value acc = Q(a.op == "sum" ? 0 : 1);
@@ -746,7 +764,16 @@ void chainLeaves(const Ast& a, int p, std::vector<const Ast*>& out) {
 Ast reduce(const Ast& a) {
     auto allNum = [](auto& v) { return std::all_of(v.begin(), v.end(), [](auto& x) { return x.k == Ast::Num; }); };
     if (a.k == Ast::Num) return a;
-    if (a.k == Ast::Var || a.k == Ast::Lim || a.k == Ast::Deriv || (a.k == Ast::Big && a.op == "int")) return num(evaluate(a));
+    if (a.k == Ast::Big && a.op == "int") {
+        Value v = evaluate(a);
+        try {  // the step: F(b) − F(a)
+            Ast F = integrate(a.a[2], a.n);
+            Ast step = bin("-", subst(F, {{a.n, a.a[1]}}), subst(F, {{a.n, a.a[0]}}));
+            if (std::fabs(val(evaluate(step)) - val(v)) <= 1e-9 * std::max(1.0, std::fabs(val(v)))) return step;
+        } catch (...) {}
+        return num(v);
+    }
+    if (a.k == Ast::Var || a.k == Ast::Lim || a.k == Ast::Deriv) return num(evaluate(a));
     if (a.k == Ast::Big) {
         // short sums/products are written out term by term
         Value lo = evaluate(a.a[0]), hi = evaluate(a.a[1]);
@@ -906,6 +933,8 @@ std::string monoKey(const Mono& m) {
 Ast polyToAst(const Poly& p) {
     std::vector<std::pair<Mono, Value>> terms(p.begin(), p.end());
     std::stable_sort(terms.begin(), terms.end(), [](auto& x, auto& y) {
+        auto isC = [](const Mono& m) { return m.size() == 1 && m[0] == std::pair<std::string, int>{"C", 1}; };  // + C at the end
+        if (isC(x.first) != isC(y.first)) return isC(y.first);
         if (degree(x.first) != degree(y.first)) return degree(x.first) > degree(y.first);
         return monoKey(x.first) < monoKey(y.first);
     });
@@ -939,6 +968,7 @@ Ast polyToAst(const Poly& p) {
         };
         std::optional<Ast> t;
         if (!under.empty() && exact(ac)) t = bin("/", product(Q(ac.n), top), product(Q(ac.d), under));
+        else if (exact(ac) && ac.d != 1 && !top.empty() && ATOMIC) t = bin("/", product(Q(ac.n), top), num(Q(ac.d)));  // x³/3, not ⅓x³
         else if (!under.empty()) t = bin("/", product(ac, top), product(Q(1), under));
         else t = product(ac, top);
         out = !out ? (negative ? mk(Ast::Neg, {std::move(*t)}) : std::move(*t)) : bin(negative ? "-" : "+", std::move(*out), std::move(*t));
@@ -947,7 +977,7 @@ Ast polyToAst(const Poly& p) {
 }
 
 void freeVars(const Ast& a, const std::set<std::string>& bound, std::vector<std::string>& out) {
-    if (a.k == Ast::Var && !bound.count(a.n) && !isConst(a.n) && std::find(out.begin(), out.end(), a.n) == out.end()) out.push_back(a.n);
+    if (a.k == Ast::Var && !a.n.empty() && !bound.count(a.n) && !isConst(a.n) && std::find(out.begin(), out.end(), a.n) == out.end()) out.push_back(a.n);
     if (a.k == Ast::Mat) return;  // corca doesn't look inside matrices
     if (a.k == Ast::Lim || a.k == Ast::Big) {
         auto inner = bound;
@@ -1144,10 +1174,12 @@ Row toItems(const Ast& a, double ctx = 0) {
     }
     case Ast::Big: {
         Item b = a.op == "sum" ? big("∑", "\\sum", true) : a.op == "prod" ? big("∏", "\\prod", true) : big("∫", "\\int", false);
-        b.s[0] = a.op == "int" ? toItems(a.a[0]) : cat({named(T::Var, a.n), M("=")}, toItems(a.a[0]));
-        b.s[1] = toItems(a.a[1]);
+        if (a.op != "indef") {
+            b.s[0] = a.op == "int" ? toItems(a.a[0]) : cat({named(T::Var, a.n), M("=")}, toItems(a.a[0]));
+            b.s[1] = toItems(a.a[1]);
+        }
         out = cat({b}, toItems(a.a[2], 2));
-        if (a.op == "int") out = cat(out, {M("d"), named(T::Var, a.n)});
+        if (a.op == "int" || a.op == "indef") out = cat(out, {M("d"), named(T::Var, a.n)});
         p = 2;
         break;
     }
@@ -1203,7 +1235,7 @@ bool freeOf(const Ast& a, const std::string& x) {
     auto f = freeVars(a);
     return std::find(f.begin(), f.end(), x) == f.end();
 }
-Ast simp(const Ast& a, std::optional<Ast>* factored = nullptr);
+Ast simp(const Ast& a, std::optional<Ast>* factored = nullptr, std::optional<Ast>* combined = nullptr);
 
 // rules that need a call's or a power's shape: √(u²) = |u|, ln(eᵘ) = u, e^(ln u) = u, sin(arcsin u) = u, sin(0) = 0
 Ast rewrite(const Ast& a) {
@@ -1217,6 +1249,8 @@ Ast rewrite(const Ast& a) {
         if (a.n == "ln" && power("e")) return u.a[1];
         if ((a.n == "ln" && u.k == Ast::Call && u.n == "exp") || (a.n == "exp" && u.k == Ast::Call && u.n == "ln")) return u.a[0];
         if (u.k == Ast::Call && u.n == "arc" + a.n && !mathOpts.degrees) return u.a[0];
+        if (u.k == Ast::Neg && (a.n == "sin" || a.n == "tan" || a.n == "sinh")) return mk(Ast::Neg, {mk(Ast::Call, {u.a[0]}, a.n)});  // odd
+        if (u.k == Ast::Neg && (a.n == "cos" || a.n == "cosh" || a.n == "abs")) return mk(Ast::Call, {u.a[0]}, a.n);  // even
         return mk(Ast::Call, {u}, a.n);
     }
     if (a.k == Ast::Bin && a.op == "^") {
@@ -1224,6 +1258,11 @@ Ast rewrite(const Ast& a) {
         if (b.k == Ast::Var && b.n == "e" && e.k == Ast::Call && e.n == "ln") return e.a[0];
         return bin("^", b, e);
     }
+    if (a.k == Ast::Big && (a.op == "indef" || a.op == "int")) try {
+            Ast F = integrate(a.a[2], a.n);
+            if (a.op == "indef") return bin("+", F, var("C"));  // ∫ x dx = x²/2 + C
+            return bin("-", subst(F, {{a.n, a.a[1]}}), subst(F, {{a.n, a.a[0]}}));  // ∫₀^a x dx = a²/2
+        } catch (Fail&) {}
     Ast r = a;
     if (a.k != Ast::Big && a.k != Ast::Lim && a.k != Ast::Num)  // (their variable is bound)
         for (auto& x : r.a) x = simp(x);
@@ -1382,6 +1421,25 @@ std::optional<Ast> factorAst(const Poly& p) {
                     if (found || r.size() <= 2) break;
                 }
             }
+            if (r.size() == 3) {  // a quadratic left over with real roots: a(x − p − q√m)(x − p + q√m)
+                Value a = r[2], b = r[1], c = r[0], disc = sub(mul(b, b), mul(Q(4), mul(a, c)));
+                if (isInt(disc) && disc.n > 0 && !isqrt(disc.n)) {
+                    double k = 1, m = disc.n;  // √disc = k√m, m square-free
+                    for (double f = 2; f * f <= m; f++)
+                        while (std::fmod(m, f * f) == 0) m /= f * f, k *= f;
+                    Value center = div(neg(b), mul(Q(2), a)), q = div(Q(k), mul(Q(2), a));
+                    if (val(q) < 0) q = neg(q);
+                    Ast root = mk(Ast::Call, {num(Q(m))}, "sqrt");
+                    if (!(q == Q(1))) root = bin("*", num(q), root);
+                    for (const char* sgn : {"-", "+"}) {
+                        Ast f = var(*v);
+                        if (!isZero(center)) f = bin(val(center) > 0 ? "-" : "+", f, num(val(center) > 0 ? center : neg(center)));
+                        parts.push_back(bin(sgn, f, root));
+                    }
+                    content = mul(content, a);
+                    r = {Q(1)};
+                }
+            }
             rest = fromUP(r, *v);
         }
     if (!(rest == pconst(Q(1)))) {
@@ -1396,34 +1454,103 @@ std::optional<Ast> factorAst(const Poly& p) {
     return val(content) < 0 ? mk(Ast::Neg, {std::move(*out)}) : *out;
 }
 
-// sin²u + cos²u = 1, wherever the rest of the two terms match
-void pythagoras(Poly& p) {
+// trigonometric identities on a polynomial of atoms, where the rest of the terms match:
+// sin²u + cos²u = 1, 1 − sin²u = cos²u, sin u / cos u = tan u, tan u · cos u = sin u
+Mono bump(const Mono& m, std::initializer_list<std::pair<std::string, int>> by) {
+    std::map<std::string, int> r(m.begin(), m.end());
+    for (auto& [n, d] : by)
+        if ((r[n] += d) == 0) r.erase(n);
+    return Mono(r.begin(), r.end());
+}
+void identities(Poly& p) {
+    auto trig = [](const std::string& f, const Ast& u) { return atomName(mk(Ast::Call, {u}, f)); };
     auto once = [&] {
         for (auto& [m, c] : p)
             for (auto& [n, e] : m) {
                 auto at = ATOMS.find(n);
-                if (e < 2 || at == ATOMS.end() || at->second.k != Ast::Call || at->second.n != "sin") continue;
-                std::string cn = atomName(mk(Ast::Call, {at->second.a[0]}, "cos"));
-                if (!ATOMS.count(cn)) continue;
-                std::map<std::string, int> without(m.begin(), m.end());
-                if ((without[n] -= 2) == 0) without.erase(n);
-                auto with = without;
-                with[cn] += 2;
-                Mono a(without.begin(), without.end()), b(with.begin(), with.end());
-                auto f = p.find(b);
-                if (f == p.end() || !(f->second == c)) continue;
-                Value cc = c;
-                Mono self = m;
-                p.erase(b), p.erase(self);
-                pput(p, a, cc);
-                return true;
+                if (at == ATOMS.end() || at->second.k != Ast::Call || at->second.a.size() != 1) continue;
+                const Ast& u = at->second.a[0];
+                const std::string& f = at->second.n;
+                auto exp = [&](const std::string& k) {
+                    auto x = std::find_if(m.begin(), m.end(), [&](auto& q) { return q.first == k; });
+                    return x == m.end() ? 0 : x->second;
+                };
+                auto swap = [&](const Mono& drop1, const Mono& drop2, const Mono& add, const Value& v) {
+                    p.erase(drop1);
+                    if (!(drop2 == drop1)) p.erase(drop2);
+                    pput(p, add, v);
+                    return true;
+                };
+                if ((f == "sin" || f == "cos") && e >= 2) {
+                    std::string other = trig(f == "sin" ? "cos" : "sin", u);
+                    atomOf(mk(Ast::Call, {u}, f == "sin" ? "cos" : "sin"));
+                    Mono mm = m, rest = bump(m, {{n, -2}}), twin = bump(m, {{n, -2}, {other, 2}});
+                    Value cc = c;
+                    if (auto t = p.find(twin); t != p.end() && t->second == cc) return swap(mm, twin, rest, cc);  // s² + c² = 1
+                    if (auto t = p.find(rest); t != p.end() && t->second == neg(cc)) return swap(mm, rest, twin, neg(cc));  // 1 − s² = c²
+                }
+                if (f == "sin" && e > 0 && exp(trig("cos", u)) < 0) {  // sin/cos = tan
+                    int k = std::min(e, -exp(trig("cos", u)));
+                    atomOf(mk(Ast::Call, {u}, "tan"));
+                    Mono mm = m;
+                    Value cc = c;
+                    return swap(mm, mm, bump(mm, {{n, -k}, {trig("cos", u), k}, {trig("tan", u), k}}), cc);
+                }
+                if (f == "tan" && e > 0 && exp(trig("cos", u)) > 0) {  // tan·cos = sin
+                    int k = std::min(e, exp(trig("cos", u)));
+                    atomOf(mk(Ast::Call, {u}, "sin"));
+                    Mono mm = m;
+                    Value cc = c;
+                    return swap(mm, mm, bump(mm, {{n, -k}, {trig("cos", u), -k}, {trig("sin", u), k}}), cc);
+                }
             }
         return false;
     };
-    for (int k = 0; k < 20 && once(); k++) {}
+    for (int k = 0; k < 40 && once(); k++) {}
 }
 
-Ast simp(const Ast& a, std::optional<Ast>* factored) {
+// a sum with fractions over one denominator: 1/x + 1/(x + 1) = (2x + 1)/(x² + x); nothing if there are no fractions
+std::optional<std::pair<Poly, Poly>> togetherND(const Poly& p) {
+    if (p.size() < 2) return std::nullopt;
+    std::map<std::string, int> under;      // x⁻² …: the monomial part of the denominator
+    std::vector<std::pair<std::string, Poly>> dens;  // (atom, its denominator)
+    bool any = false;
+    for (auto& [m, c] : p)
+        for (auto& [n, e] : m) {
+            auto at = ATOMS.find(n);
+            if (at != ATOMS.end() && at->second.k == Ast::Bin && at->second.op == "/") {
+                if (e != 1) return std::nullopt;
+                if (std::none_of(dens.begin(), dens.end(), [&](auto& d) { return d.first == n; })) dens.push_back({n, poly(at->second.a[1])});
+                any = true;
+            } else if (e < 0) under[n] = std::max(under[n], -e), any = true;
+        }
+    if (!any) return std::nullopt;
+    Poly D = {{Mono(under.begin(), under.end()), Q(1)}};
+    for (auto& [n, d] : dens) D = pmul(D, d);
+    Poly N;
+    for (auto& [m, c] : p) {
+        std::map<std::string, int> ex;
+        std::string frac;
+        for (auto& [n, e] : m)
+            if (std::any_of(dens.begin(), dens.end(), [&](auto& d) { return d.first == n; })) frac = n;
+            else ex[n] = e;
+        for (auto& [n, k] : under)
+            if ((ex[n] += k) == 0) ex.erase(n);
+        Poly t = {{Mono(ex.begin(), ex.end()), c}};
+        if (!frac.empty()) t = pmul(t, poly(ATOMS.at(frac).a[0]));
+        for (auto& [n, d] : dens)
+            if (n != frac) t = pmul(t, d);
+        N = padd(N, t);
+    }
+    return std::pair{N, D};
+}
+std::optional<Poly> together(const Poly& p) {
+    auto nd = togetherND(p);
+    if (!nd) return std::nullopt;
+    return divPoly(nd->first, nd->second);
+}
+
+template <class F> auto atomic(F f) {  // runs f with atoms on; the outermost call starts a fresh atom table
     bool outer = !ATOMIC;
     if (outer) ATOMS.clear();
     ATOMIC = true;
@@ -1433,10 +1560,22 @@ Ast simp(const Ast& a, std::optional<Ast>* factored) {
             if (outer) ATOMIC = false;
         }
     } reset{outer};
-    Poly p = poly(a);
-    pythagoras(p);
-    if (factored) *factored = factorAst(p);
-    return polyToAst(p);
+    return f();
+}
+
+Ast simp(const Ast& a, std::optional<Ast>* factored, std::optional<Ast>* combined) {
+    return atomic([&] {
+        Poly p = poly(a);
+        identities(p);
+        Ast out = polyToAst(p);
+        if (factored) *factored = factorAst(p);
+        if (auto t = together(p)) {  // over one denominator: taken when it's shorter, else offered
+            Ast c = polyToAst(*t);
+            if (plain(toItems(c)).size() < plain(toItems(out)).size()) out = c;
+            else if (combined && !(c == out)) *combined = c;
+        }
+        return out;
+    });
 }
 
 // the derivative of u with respect to x, not yet simplified
@@ -1499,6 +1638,192 @@ Ast symDeriv(const Ast& node) {
     Ast body = subst(parse(d->body), {}, 0, {v});
     for (int k = 0; k < node.order; k++) body = simp(dAst(body, v));
     return subst(body, {{v, node.a[0]}});
+}
+
+// ---------- integration: ∫ u dx for the usual cases ----------
+// the slope a of u = a·x + b, if u is linear in x with a number as slope
+std::optional<Value> slope(const Ast& u, const std::string& x) {
+    Poly pu = poly(u);
+    Value a = Q(0);
+    for (auto& [m, c] : pu) {
+        if (m.empty()) continue;
+        if (m.size() != 1 || m[0].first != x || m[0].second != 1 || !exact(c)) return std::nullopt;
+        a = c;
+    }
+    return isZero(a) ? std::nullopt : std::optional(a);
+}
+Ast over(Ast a, const Value& k) { return k == Q(1) ? a : bin("/", std::move(a), num(k)); }
+Ast fn(const char* f, Ast a) { return mk(Ast::Call, {std::move(a)}, f); }
+Ast lnAbs(Ast a) { return fn("ln", fn("abs", std::move(a))); }
+
+// ∫ g dx of one atom g of a linear argument: sin, cos, tan, eᵘ, aᵘ, uʳ, ln, √, sinh, cosh, k/(ax + b), f′/f, k/(x² + q)
+std::optional<Ast> atomIntegral(const Ast& g, const std::string& x) {
+    if (g.k == Ast::Call && g.a.size() == 1) {
+        const Ast& u = g.a[0];
+        auto a = slope(u, x);
+        if (!a || (mathOpts.degrees && (isTrig(g.n) || isArc(g.n)))) return std::nullopt;
+        if (g.n == "sin") return over(mk(Ast::Neg, {fn("cos", u)}), *a);
+        if (g.n == "cos") return over(fn("sin", u), *a);
+        if (g.n == "tan") return over(mk(Ast::Neg, {lnAbs(fn("cos", u))}), *a);
+        if (g.n == "exp") return over(g, *a);
+        if (g.n == "sinh") return over(fn("cosh", u), *a);
+        if (g.n == "cosh") return over(fn("sinh", u), *a);
+        if (g.n == "sqrt") return over(bin("*", num(Q(2, 3)), bin("^", u, num(Q(3, 2)))), *a);
+        if (g.n == "ln") return over(bin("-", bin("*", u, g), u), *a);
+        return std::nullopt;
+    }
+    if (g.k == Ast::Bin && g.op == "^") {
+        const Ast &b = g.a[0], &e = g.a[1];
+        if (freeOf(b, x)) {  // eᵘ, 2ᵘ
+            auto a = slope(e, x);
+            if (!a) return std::nullopt;
+            if (b.k == Ast::Var && b.n == "e") return over(g, *a);
+            return bin("/", g, bin("*", num(*a), fn("ln", b)));
+        }
+        if (freeOf(e, x) && e.k == Ast::Num && exact(e.v)) {  // (ax + b)^r
+            auto a = slope(b, x);
+            if (!a) return std::nullopt;
+            if (e.v == Q(-1)) return over(lnAbs(b), *a);
+            Value r1 = add(e.v, Q(1));
+            return bin("/", bin("^", b, num(r1)), num(mul(r1, *a)));
+        }
+        return std::nullopt;
+    }
+    if (g.k == Ast::Bin && g.op == "/") {  // n/d
+        const Ast &n = g.a[0], &d = g.a[1];
+        if (!freeOf(n, x)) {  // f′/f = ln|f|
+            Poly pd = pderiv(poly(d), x), pn = poly(n);
+            if (pd.empty() || pd.size() != pn.size()) return std::nullopt;
+            std::optional<Value> k;
+            for (auto& [m, c] : pn) {
+                auto f = pd.find(m);
+                if (f == pd.end() || !exact(c) || !exact(f->second)) return std::nullopt;
+                Value r = div(c, f->second);
+                if (k && !(r == *k)) return std::nullopt;
+                k = r;
+            }
+            Ast l = lnAbs(d);
+            return *k == Q(1) ? l : bin("*", num(*k), l);
+        }
+        if (auto a = slope(d, x)) return bin("*", n, over(lnAbs(d), *a));  // k/(ax + b)
+        Poly pd = poly(d);  // k/(x² + q), q > 0: (k/√q)·arctan(x/√q)
+        if (pd.size() == 2 && pd.count(Mono{{x, 2}}) && pd.count(Mono{}) && pd.at(Mono{{x, 2}}) == Q(1) && exact(pd.at(Mono{})) && val(pd.at(Mono{})) > 0) {
+            Value q = pd.at(Mono{});
+            Ast rq = fn("sqrt", num(q));
+            return bin("*", bin("/", n, rq), fn("arctan", bin("/", var(x), rq)));
+        }
+    }
+    return std::nullopt;
+}
+
+Ast integrateTerm(const Mono& m, const Value& c, const std::string& x, int depth);
+Ast integratePoly(const Poly& p, const std::string& x, int depth) {
+    std::optional<Ast> sum;
+    for (auto& [m, c] : p) {
+        Ast t = integrateTerm(m, c, x, depth);
+        sum = sum ? bin("+", std::move(*sum), std::move(t)) : std::move(t);
+    }
+    return sum ? *sum : num(Q(0));
+}
+// c · (constants) · xⁿ · g: powers of x directly, an atom g by its rule, xⁿ·g by parts (n ≤ 6)
+Ast integrateTerm(const Mono& m, const Value& c, const std::string& x, int depth) {
+    if (depth > 8) fail();
+    int n = 0;
+    std::vector<std::pair<Ast, int>> withX;
+    Poly rest = pconst(c);
+    for (auto& [name, e] : m) {
+        auto at = ATOMS.find(name);
+        Ast b = at != ATOMS.end() ? at->second : var(name);
+        if (name == x) n = e;
+        else if (freeOf(b, x)) rest = pmul(rest, Poly{{Mono{{name, e}}, Q(1)}});
+        else withX.push_back({b, e});
+    }
+    Ast k = polyToAst(rest);
+    auto times = [&](Ast a) { return rest == pconst(Q(1)) ? a : bin("*", k, std::move(a)); };
+    if (withX.empty()) {
+        if (n == -1) return times(lnAbs(var(x)));
+        return times(bin("/", bin("^", var(x), num(Q(n + 1))), num(Q(n + 1))));
+    }
+    if (withX.size() != 1 || n < 0 || n > 6) fail();
+    auto [g, e] = withX[0];
+    if (e == 2 && g.k == Ast::Call && (g.n == "sin" || g.n == "cos") && n == 0) {  // sin²u = (1 ∓ cos 2u)/2
+        auto a = slope(g.a[0], x);
+        if (!a) fail();
+        Ast twice = bin("*", num(Q(2)), g.a[0]);
+        Ast half = bin("/", var(x), num(Q(2))), wave = bin("/", fn("sin", twice), num(mul(Q(4), *a)));
+        return times(bin(g.n == "sin" ? "-" : "+", half, wave));
+    }
+    if (e != 1) fail();
+    if (g.k == Ast::Call && g.n == "ln" && n > 0) {  // ∫ xⁿ ln x = xⁿ⁺¹ ln x/(n + 1) − xⁿ⁺¹/(n + 1)²
+        if (!(g.a[0].k == Ast::Var && g.a[0].n == x)) fail();
+        Ast up = bin("^", var(x), num(Q(n + 1)));
+        return times(bin("-", bin("/", bin("*", up, g), num(Q(n + 1))), bin("/", up, num(Q((n + 1) * (n + 1))))));
+    }
+    auto G = atomIntegral(g, x);
+    if (!G) fail();
+    if (n == 0) return times(*G);
+    // by parts: ∫ xⁿ g = xⁿ G − n ∫ xⁿ⁻¹ G
+    Ast xn = n == 1 ? var(x) : bin("^", var(x), num(Q(n)));
+    Poly inner = pmul(Poly{{Mono{{x, n - 1}}, Q(n)}}, poly(*G));
+    if (n == 1) inner = pmul(pconst(Q(1)), poly(*G));
+    return times(bin("-", bin("*", xn, *G), integratePoly(inner, x, depth + 1)));
+}
+
+Ast integrate(const Ast& body, const std::string& x) {
+    return atomic([&] {
+        Poly p = poly(subst(body, {}, 0, {x}));
+        return simp(integratePoly(p, x, 0));
+    });
+}
+
+// "v = s/t ⇒" solved for each letter: t = s/v, s = tv; ±√ when it's squared (E = mc² ⇒ c = ±√(E/m))
+std::optional<Row> solveFor(const Ast& diff, const std::string& w) {
+    return atomic([&]() -> std::optional<Row> {
+        Poly p = poly(diff);
+        if (auto nd = togetherND(p)) p = nd->first;  // clear the denominators: only the top has to be 0
+        auto best = [](const Poly& r) {  // −b/x − c/x² or −(bx + c)/x², whichever is shorter
+            Ast a = polyToAst(r);
+            if (auto t = together(r))
+                if (Ast c = polyToAst(*t); plain(toItems(c)).size() < plain(toItems(a)).size()) return c;
+            return a;
+        };
+        Poly A, B, C;  // A·w² + B·w + C
+        for (auto& [m, c] : p) {
+            int e = 0;
+            std::map<std::string, int> r;
+            for (auto& [n, k] : m) {
+                if (n == w) e = k;
+                else {
+                    auto at = ATOMS.find(n);
+                    if (at != ATOMS.end() && !freeOf(at->second, w)) return std::nullopt;  // w inside sin(w): not this way
+                    r[n] = k;
+                }
+            }
+            Poly t = {{Mono(r.begin(), r.end()), c}};
+            if (e == 0) C = padd(C, t);
+            else if (e == 1) B = padd(B, t);
+            else if (e == 2) A = padd(A, t);
+            else return std::nullopt;
+        }
+        Row lhs = {named(T::Var, w), M(" "), M("="), M(" ")};
+        if (A.empty()) {
+            if (B.empty()) return std::nullopt;
+            return cat(lhs, toItems(best(divPoly(padd({}, C, -1), B))));
+        }
+        if (!B.empty()) {  // w = (−B ± √(B² − 4AC))/(2A)
+            Row top = toItems(polyToAst(padd({}, B, -1)));
+            top.push_back(sym("±", "\\pm"));
+            Item sq = node(T::Sqrt);
+            sq.s[0] = toItems(polyToAst(padd(pmul(B, B), pmul(pconst(Q(4)), pmul(A, C)), -1)));
+            top.push_back(sq);
+            Item f = node(T::Frac);
+            f.s = {top, toItems(polyToAst(pmul(pconst(Q(2)), A)))};
+            return cat(lhs, {f});
+        }
+        Item sq = node(T::Sqrt);  // w² = −C/A
+        sq.s[0] = toItems(best(divPoly(padd({}, C, -1), A)));
+        return cat(lhs, {sym("±", "\\pm"), sq});
+    });
 }
 
 // ---------- definitions ----------
@@ -1868,20 +2193,48 @@ std::vector<Entry> unitSuggestions(const Row& seg, const Row& lead) {
     return out;
 }
 
+// the terms of a sum as text, in any order: a result that only reorders them says nothing new
+void sumTerms(const Ast& x, std::vector<std::string>& out, bool minus) {
+    if (x.k == Ast::Bin && (x.op == "+" || x.op == "-")) {
+        sumTerms(x.a[0], out, minus);
+        sumTerms(x.a[1], out, minus != (x.op == "-"));
+    } else if (x.k == Ast::Neg) sumTerms(x.a[0], out, !minus);
+    else {
+        std::string t = plain(toItems(x));
+        std::erase_if(t, [](char c) { return c == ' ' || c == '(' || c == ')'; });
+        out.push_back((minus ? "-" : "") + t);
+    }
+}
+std::vector<std::string> sumTerms(const Ast& x) {
+    std::vector<std::string> v;
+    sumTerms(x, v, false);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
 std::vector<Entry> expandSuggestions(const Ast& ast, const Row& lead) {
     Ast sub = subst(ast);
     bool polynomial = true;
     try { poly(sub); } catch (...) { polynomial = false; }
-    std::optional<Ast> fac;
-    Ast res = simp(sub, &fac);
+    std::optional<Ast> fac, comb;
+    Ast res = simp(sub, &fac, &comb);
+    std::function<bool(const Ast&)> integral = [&](const Ast& x) { return (x.k == Ast::Big && x.op != "sum" && x.op != "prod") || std::any_of(x.a.begin(), x.a.end(), integral); };
     std::vector<Entry> out;
-    if (!(res == ast)) out.push_back(result(polynomial ? "Expand and simplify" : "Simplify", "Algebra", cat(lead, toItems(res))));
+    if (!(res == ast) && sumTerms(res) != sumTerms(ast)) out.push_back(result(polynomial ? "Expand and simplify" : integral(ast) ? "Integrate" : "Simplify", "Algebra", cat(lead, toItems(res))));
     if (fac && !(*fac == ast) && !(*fac == res)) out.push_back(result("Factor", "Algebra", cat(lead, toItems(*fac))));
+    if (comb && !(*comb == ast)) out.push_back(result("Combine fractions", "Algebra", cat(lead, toItems(*comb))));
     if (!out.empty() && !(sub == ast) && !(sub == res)) out.push_back(result("Fill in the steps", "Steps", cat(lead, join({toItems(sub), toItems(res)}, EQ))));
     return out;
 }
 
+std::vector<Entry> solveOne(const Row& seg, const Row& lead, std::vector<Entry>& formula);
 std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
+    std::vector<Entry> formula;
+    auto out = solveOne(seg, lead, formula);
+    out.insert(out.end(), formula.begin(), formula.end());
+    return out;
+}
+std::vector<Entry> solveOne(const Row& seg, const Row& lead, std::vector<Entry>& formula) {
     int eq = -1;
     for (size_t k = 0; k < seg.size(); k++)
         if (isRel(&seg[k])) { eq = int(k); break; }
@@ -1891,7 +2244,25 @@ std::vector<Entry> solveSuggestions(const Row& seg, const Row& lead) {
     try { diff = subst(written); } catch (...) {}  // a name above that has no value (x = 1 ± 2)
     auto vars = freeVars(diff);
     if (vars.empty()) diff = written, vars = freeVars(diff);  // "x = 2" above: ⇒ still means x is the unknown here
-    if (vars.size() != 1) return {};
+    // a formula, names as written: solved for each of its letters (v = s/t ⇒ t = s/v, s = tv)
+    if (auto names = freeVars(written); names.size() >= 2) {
+        std::set<std::string> all(names.begin(), names.end());
+        Ast d = written;
+        try { d = subst(written, {}, 0, all); } catch (...) {}
+        std::string typed = plain(seg);
+        std::erase(typed, ' ');
+        Ast left = parse(Row(seg.begin(), seg.begin() + eq));
+        for (auto& w : names) try {
+                if (left.k == Ast::Var && left.n == w) continue;  // E = mc² is already solved for E
+                if (auto r = solveFor(d, w)) {
+                    std::string name = plain(*r), flat = name;
+                    std::erase(flat, ' ');
+                    if (flat == typed) continue;  // v = s/t solved for v is what's written
+                    formula.push_back(result(name, "Solve", cat(lead, *r)));
+                }
+            } catch (...) {}
+    }
+    if (vars.size() != 1) return std::exchange(formula, {});
     std::string v = vars[0];
     auto answerAs = [&](const std::vector<Value>& roots, bool decimal) {
         if (roots.empty()) return result("No real solution", "Solve", cat(lead, {M("∅")}));
@@ -2434,9 +2805,10 @@ std::string compact(const std::string& s) {  // what's written, ignoring spacing
 }
 std::optional<Ghost> symbolicGhost(const Row& row, const Row& seg, int start) {
     Ast ast = parse(seg);
-    std::optional<Ast> fac;
-    Ast res = simp(subst(ast), &fac);
-    if (freeVars(ast).empty()) return std::nullopt;  // numbers: the plain result's job
+    std::optional<Ast> fac, comb;
+    Ast res = simp(subst(ast), &fac, &comb);
+    std::function<bool(const Ast&)> big = [&](const Ast& x) { return x.k == Ast::Big || std::any_of(x.a.begin(), x.a.end(), big); };
+    if (freeVars(ast).empty() && !big(ast)) return std::nullopt;  // numbers: the plain result's job (∫ x dx has none either)
     // "f(x) = x² − 1": the line already says what the right side is
     int s0 = start;
     while (s0 > 0 && isSpace(row[s0 - 1])) s0--;
@@ -2452,17 +2824,19 @@ std::optional<Ghost> symbolicGhost(const Row& row, const Row& seg, int start) {
     }
     if (defining) fac.reset();
     std::string typed = compact(plain(seg));
+    auto was = sumTerms(ast);
     Ghost g;
     auto add = [&](const Ast& a) {
         Row r = toItems(a);
         std::string t = plain(r);
-        if (compact(t) == typed) return;
+        if (compact(t) == typed || sumTerms(a) == was) return;
         for (auto& [x, _] : g.alts)
             if (x == "= " + t) return;
         g.alts.push_back({"= " + t, cat({M(" "), M("="), M(" ")}, r)});
     };
     add(res);
     if (fac) add(*fac);
+    if (comb && !g.alts.empty()) add(*comb);  // one fraction is a choice, not news by itself
     if (g.alts.empty()) return std::nullopt;
     return g.picked(0);
 }

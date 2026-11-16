@@ -140,9 +140,9 @@ struct Editor {
     Row selectedItems() const;
     bool deleteSelection();
     void insertItems(const Row& items);
+    Item* autoConvert();  // a math word typed before the cursor becomes its node (sin, pi, sqrt)
 
 private:
-    Item* autoConvert();
     bool openIntegral(const Row& row, int i) const;
     void combine();
     std::optional<std::tuple<Item*, int, int>> matrixCell();

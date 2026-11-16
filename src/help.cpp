@@ -124,7 +124,15 @@ At the end of a line, Ctrl-↓ and Ctrl-↑ (Ctrl-n and Ctrl-p in vim keys) go t
 
 ## Algebra
 Expressions with unknowns are simplified as you type: 2x + 3x shows = 5x, sin(x)^2 + cos(x)^2 = 1, (x^2 − 1)/(x − 1) = x + 1, √(x^2) = |x|, ln(e^x) = x. Polynomials are factored: x^2 − 5x + 6 shows = (x − 2)(x − 3), 2x^2y + 4xy = 2xy(x + 2). After = the popup offers Simplify (or Expand and simplify) and Factor.
-Derivatives work for any function: with f(x) = x^2 sin(x), f'(x) shows = x²cos(x) + 2x·sin(x), and f'(x) = 0 ⇒ solves for the turning points. Factoring finds rational roots only: x^2 − 2 stays as it is.
+Derivatives work for any function: with f(x) = x^2 sin(x), f'(x) shows = x²cos(x) + 2x·sin(x), and f'(x) = 0 ⇒ solves for the turning points. Factoring finds roots with square roots too: x^2 − 2 = (x − √2)(x + √2).
+Fractions: x/(x + 1) + 1/(x + 1) = 1; after = the popup offers Combine fractions, 1/x + 1/(x + 1) = (2x + 1)/(x² + x).
+Trigonometry: sin/cos = tan, tan·cos = sin, 1 − sin² = cos², sin(−x) = −sin(x), cos(−x) = cos(x).
+
+## Integrals
+Pick integral from the popup. Leave both limits empty for the antiderivative: ∫ x e^x dx shows = x·e^x − e^x + C. With limits the answer is exact where the antiderivative is known: ∫ from 0 to π of sin(x) dx = 2, and Fill in the steps shows F(b) − F(a). Known: powers, polynomials, sin cos tan e^x a^x ln √ sinh cosh of ax + b, 1/(ax + b), f′/f, 1/(x² + a²), sin² and cos², and x^n times those (by parts). Anything else is still worked out numerically.
+
+## Formulas
+After a formula with several letters, ⇒ offers it solved for each one: v = s/t ⇒ t = s/v, s = tv; E = mc² ⇒ m = E/c², c = ±√(E/m). Squared letters give ±√, and a letter both squared and alone the quadratic formula.
 
 ## Checking answers
 A number written after = that isn't what the left side comes to is flagged in red: 3 + 4 = 8 shows ≠ 7. Decimals count to the places written, so π = 3.14 passes.

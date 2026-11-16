@@ -961,7 +961,7 @@ static void checkVi() {
         CHECK_EQ(next("3x + 1 = 7 |−1"), "3x = 6");
         CHECK_EQ(next("x/2 = 3 |*2"), "x = 6");
         CHECK_EQ(next("x + 2 = 2x |−x"), "2 = x");
-        CHECK_EQ(next("x^2<Right> = 9 |sqrt<Tab>"), "-");
+        CHECK_EQ(next("x^2<Right> = 9 |sqrt<Tab>"), "x = ±3");  // Tab turns sqrt into the √ step
         auto rows = [&](const std::string& a, const std::string& b) {
             Editor f;
             Vi w;
@@ -1236,6 +1236,52 @@ static void checkAlgebra() {
     CHECK(std::any_of(v.items.begin(), v.items.end(), [](auto& x) { return x.name == "Factor"; }));
 }
 
+// integrals, more factoring, fractions, trigonometry, formulas solved for any letter
+static void checkCalculus() {
+    auto calc = [](const std::string& typed) {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>" + typed + "<Esc>");
+        auto g = ghost(e, e.doc.back());
+        return g ? noSpaces(g->text) : std::string("-");
+    };
+    auto integral = [&](const std::string& body) { return calc("int<CR><Tab><Tab>" + body + " dx"); };
+    CHECK_EQ(integral("x^2<Right>"), "=x³/3+C");
+    CHECK_EQ(integral("x e^x<Right>"), "=xe^x−e^x+C");      // by parts
+    CHECK_EQ(integral("cos(2x)"), "=sin(2x)/2+C");          // a linear argument
+    CHECK_EQ(integral("1/x<Right>"), "=ln(|x|)+C");
+    CHECK_EQ(integral("2x/(x^2<Right> + 1)<Right>"), "=ln(|x²+1|)+C");  // f′/f
+    CHECK_EQ(integral("1/(x^2<Right> + 4)<Right>"), "=arctan(x/2)/2+C");
+    CHECK_EQ(integral("sin(x)^2<Right>"), "=x/2−sin(2x)/4+C");
+    CHECK_EQ(integral("ln(x)"), "=xln(x)−x+C");
+    CHECK_EQ(calc("int<CR>0<Tab>a<Tab>x dx"), "=a²/2");     // symbolic limits
+    {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>int<CR>0<Tab>pi<Tab>sin(x) dx =");  // exact, through the antiderivative
+        CHECK(!v.items.empty() && v.items[0].name == "= 2");
+    }
+    CHECK_EQ(calc("x^2 - 2"), "=(x−√2)(x+√2)");
+    CHECK_EQ(calc("x^2<Right> + 2x - 1"), "=(x+1−√2)(x+1+√2)");
+    CHECK_EQ(calc("x/(x+1)<Right> + 1/(x+1)<Right>"), "=1");
+    CHECK_EQ(calc("1/x<Right> + 1/(x+1)<Right>"), "-");     // only offered after =, as Combine fractions
+    CHECK_EQ(calc("sin(x)/cos(x)"), "=tan(x)");
+    CHECK_EQ(calc("tan(x) cos(x)"), "=sin(x)");
+    CHECK_EQ(calc("1 - sin(x)^2<Right>"), "=cos(x)²");
+    CHECK_EQ(calc("sin(-x) + sin(x)"), "=0");
+    auto solve = [](const std::string& typed) {
+        Editor e;
+        Vi v;
+        keys(e, v, "i<C-m>" + typed + " =>");
+        std::vector<std::string> out;
+        for (auto& x : v.items) out.push_back(noSpaces(x.name));
+        return out;
+    };
+    CHECK_EQ(solve("v = s/t<Right>"), (std::vector<std::string>{"s=tv", "t=s/v"}));
+    CHECK_EQ(solve("E = m c^2<Right>"), (std::vector<std::string>{"m=E/c²", "c=±√E/m"}));
+    CHECK_EQ(solve("x^2<Right> - 4 = 0")[0], "x=-2,x=2");  // one unknown: solved as before
+}
+
 int main() {
     // the scenarios below are corca's typing model, where text mode still reads math; checkText covers plain text
     Editor::autoMathDefault = E.autoMath = true;
@@ -1244,5 +1290,6 @@ int main() {
     checkText();
     checkEngine();
     checkAlgebra();
+    checkCalculus();
     std::puts("all checks passed");
 }

@@ -107,7 +107,11 @@ Also:
   picks the default.
 - **Algebra**: `2x + 3x` shows `= 5x`, `sin²x + cos²x` `= 1`, `(x² − 1)/(x − 1)` `= x + 1`, `x² − 5x + 6`
   `= (x − 2)(x − 3)`; `f′(x)` is differentiated symbolically for any function (chain, product, quotient rules), so
-  `f′(x) = 0 ⇒` finds turning points. The popup offers *Simplify* and *Factor* after `=`.
+  `f′(x) = 0 ⇒` finds turning points. The popup offers *Simplify*, *Factor* and *Combine fractions* after `=`.
+  Factoring includes roots like `√2`; `sin/cos = tan` and other basic identities apply.
+- **Integrals**: `∫ x eˣ dx` (no limits) shows `= x·eˣ − eˣ + C`; definite integrals are exact where the
+  antiderivative is known (`∫₀^π sin x dx = 2`), numeric otherwise.
+- **Formulas**: `v = s/t ⇒` offers `t = s/v` and `s = tv`; `E = mc² ⇒` gives `c = ±√(E/m)`.
 - **Checking**: `3 + 4 = 8` is flagged `≠ 7`; decimals count to the places written.
 - **Definitions** follow the lines: a later `x = 5` changes `x` from there on, `a = a + 1` counts on, `---` and `===` start afresh.
 - **Typing**: `2 · −3`, `12%`, `17 mod 5`, `abs(` `floor(` `ceil(`; `)` closes a bracket from inside an exponent or denominator.
